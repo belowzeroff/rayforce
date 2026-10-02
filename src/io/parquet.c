@@ -10,6 +10,7 @@
 #include "core/platform.h"
 #include "core/pool.h"
 #include "core/crc32.h"
+#include "core/snappy.h"
 #include "mem/heap.h"
 #include "table/sym.h"
 #include "table/domain.h"
@@ -168,45 +169,7 @@ static bool pq_element(pq_cur* c, uint8_t t, pq_span* s) {
 static ray_t* pq_error(const char* msg) { return ray_error("parquet", "%s", msg); }
 
 bool ray_parquet_snappy(const uint8_t* src, size_t len, uint8_t* dst, size_t size) {
-    pq_cur c = {src, src+len, false}; uint64_t expected = pq_var(&c); size_t at = 0;
-    if (c.bad || expected != size) return false;
-    while (c.p < c.end && at < size) {
-        uint8_t tag = pq_byte(&c); size_t n, off;
-        if (!(tag&3)) {
-            n = tag>>2;
-            if (n < 60) n++;
-            else {
-                unsigned nb = (unsigned)n-59; const uint8_t* p;
-                if (!pq_take(&c, nb, &p)) return false;
-                uint32_t x = 0;
-                for (unsigned i = 0; i < nb; i++) x |= (uint32_t)p[i] << (8*i);
-                n = (size_t)x+1;
-            }
-            const uint8_t* p;
-            if (n > size-at || !pq_take(&c, n, &p)) return false;
-            memcpy(dst+at, p, n); at += n;
-        } else {
-            if ((tag&3) == 1) { n = 4+((tag>>2)&7); off = ((size_t)(tag&224)<<3) | pq_byte(&c); }
-            else {
-                const uint8_t* p; unsigned nb = (tag&3) == 2 ? 2 : 4;
-                if (!pq_take(&c, nb, &p)) return false;
-                off = nb == 2 ? (size_t)p[0] | (size_t)p[1]<<8 : pq_u32(p);
-                n = 1+(tag>>2);
-            }
-            if (c.bad || !off || off > at || n > size-at) return false;
-            /* Copy only initialized, nonoverlapping spans. Small offsets grow
-             * geometrically, allowing libc's vector copy even for repeats. */
-            size_t copied = 0;
-            while (copied < n) {
-                size_t step = n-copied < off ? n-copied : off;
-                memcpy(dst+at+copied,dst+at+copied-off,step);
-                copied += step;
-                if (copied >= off) off += off;
-            }
-            at += n;
-        }
-    }
-    return !c.bad && at == size && c.p == c.end;
+    return ray_snappy_decompress(src, len, dst, size);
 }
 
 /* Hybrid RLE/bit-packed streams, resumed across batch boundaries. */
