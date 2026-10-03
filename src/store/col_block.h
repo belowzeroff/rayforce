@@ -52,6 +52,25 @@ ray_t* ray_col_block_materialize(const ray_col_block_reader_t* reader,
                                 size_t payload_limit, void* scratch,
                                 size_t scratch_capacity);
 
+/* Owning file handle. Open requires *out == NULL; failures leave it NULL.
+ * Close clears the caller's pointer and accepts NULL. The borrowed reader is
+ * valid until close; do not copy it past the handle lifetime or mutate it.
+ * Uses the platform file mapper. The inode must remain immutable: this is NOT
+ * a generation lease or protection against concurrent in-place truncation.
+ * Callers synchronize close with all reads. No runtime heap is needed here. */
+typedef struct ray_col_block_file_s ray_col_block_file_t;
+ray_err_t ray_col_block_file_open(const char* path, ray_col_block_file_t** out);
+const ray_col_block_reader_t* ray_col_block_file_reader(const ray_col_block_file_t* file);
+void ray_col_block_file_close(ray_col_block_file_t** file);
+
+/* Explicit major-2-only path load, with owned output. Opens/maps once and
+ * always closes before returning, including on errors. Budgets cover logical
+ * output payload and scratch separately, not mappings/allocator overhead/RSS.
+ * Requires initialized runtime heap. Legacy files return a version error;
+ * existing raw load/mmap dispatch is deliberately unchanged. */
+ray_t* ray_col_block_load_range(const char* path, uint64_t start, uint64_t count,
+                               size_t payload_limit, size_t scratch_limit);
+
 typedef struct {
     FILE *output, *directory;
     void* scratch;

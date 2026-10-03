@@ -50,10 +50,10 @@ static uint32_t header_crc(const uint8_t* h) {
 ray_err_t ray_col_block_open(ray_col_block_reader_t* r, const void* data, size_t size) {
     if (!r) return RAY_ERR_DOMAIN;
     memset(r, 0, sizeof(*r));
-    if (!data || size < RAY_COL_BLOCK_HEADER + RAY_COL_BLOCK_FOOTER)
-        return RAY_ERR_CORRUPT;
+    if (!data || size < 32) return RAY_ERR_CORRUPT;
     const uint8_t* h = data;
     if (h[17] != 2) return RAY_ERR_VERSION;
+    if (size < RAY_COL_BLOCK_HEADER + RAY_COL_BLOCK_FOOTER) return RAY_ERR_CORRUPT;
     if (!little_endian()) return RAY_ERR_NYI;
     unsigned w = width(h[18]);
     uint32_t limit = (uint32_t)get_le(h + 44, 4);
