@@ -23,6 +23,14 @@ static void exercise(const uint8_t* data, size_t size) {
         (void)ray_col_block_read(&r, b, output, r.block_bytes, &row, &count);
         (void)ray_col_block_read(&r, b, output, 0, &row, &count);
     }
+    uint64_t start = r.rows ? get(data + size - 8) % r.rows : 0;
+    uint64_t count = r.rows - start < 128 ? r.rows - start : 128;
+    uint8_t range[128 * 16];
+    size_t bytes, scratch;
+    if (ray_col_block_range_size(&r, start, count, &bytes, &scratch) != RAY_OK ||
+        bytes > sizeof(range) || scratch > r.block_bytes) abort();
+    (void)ray_col_block_read_range(&r, start, count, range, bytes, output, scratch);
+    (void)ray_col_block_read_range(&r, start, UINT64_MAX, range, bytes, output, scratch);
     free(output);
 }
 int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {

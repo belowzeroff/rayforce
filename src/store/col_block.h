@@ -31,6 +31,27 @@ ray_err_t ray_col_block_read(const ray_col_block_reader_t* reader, uint64_t bloc
                              void* output, size_t capacity,
                              uint64_t* row_start, uint64_t* row_count);
 
+/* Range [start, start + count). Empty ranges at EOF are valid. Reports exact
+ * output bytes and scratch required for partial boundary blocks. No allocation
+ * or payload access. All APIs require an unchanged reader returned by open. */
+ray_err_t ray_col_block_range_size(const ray_col_block_reader_t* reader,
+                                  uint64_t start, uint64_t count,
+                                  size_t* output_bytes, size_t* scratch_bytes);
+/* Buffers must not overlap each other or the mapping. Capacities are checked
+ * before any output write. CRC/decode errors may leave partial output. */
+ray_err_t ray_col_block_read_range(const ray_col_block_reader_t* reader,
+                                  uint64_t start, uint64_t count,
+                                  void* output, size_t capacity,
+                                  void* scratch, size_t scratch_capacity);
+/* Explicit native-vector adapter; requires initialized runtime heap. Limit
+ * applies to logical output payload, NOT allocator rounding/header or RSS.
+ * Scratch is caller-owned and separately bounded. No implicit full-column
+ * materialization, mapping ownership, or change to existing load/mmap APIs. */
+ray_t* ray_col_block_materialize(const ray_col_block_reader_t* reader,
+                                uint64_t start, uint64_t count,
+                                size_t payload_limit, void* scratch,
+                                size_t scratch_capacity);
+
 typedef struct {
     FILE *output, *directory;
     void* scratch;

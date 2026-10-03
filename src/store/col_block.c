@@ -111,6 +111,72 @@ ray_err_t ray_col_block_read(const ray_col_block_reader_t* r, uint64_t block,
     return RAY_OK;
 }
 
+/* Find the block containing an existing row (row < reader->rows). */
+static uint64_t block_for_row(const ray_col_block_reader_t* r, uint64_t row) {
+    uint64_t lo = 0, hi = r->blocks;
+    while (lo < hi) {
+        uint64_t mid = lo + (hi - lo) / 2;
+        const uint8_t* e = r->data + r->directory + mid * RAY_COL_BLOCK_ENTRY;
+        if (get_le(e, 8) <= row) lo = mid + 1;
+        else hi = mid;
+    }
+    return lo - 1;
+}
+
+ray_err_t ray_col_block_range_size(const ray_col_block_reader_t* r,
+                                  uint64_t start, uint64_t count,
+                                  size_t* output_bytes, size_t* scratch_bytes) {
+    if (!r || !r->data || !output_bytes || !scratch_bytes) return RAY_ERR_DOMAIN;
+    unsigned esz = width(r->type);
+    if (!esz) return RAY_ERR_TYPE;
+    if (start > r->rows || count > r->rows - start) return RAY_ERR_RANGE;
+    if (count > SIZE_MAX / esz) return RAY_ERR_LIMIT;
+    size_t scratch = 0;
+    if (count) {
+        uint64_t boundary[2] = {block_for_row(r, start), block_for_row(r, start + count - 1)};
+        for (unsigned i = 0; i < 2; i++) {
+            const uint8_t* e = r->data + r->directory + boundary[i] * RAY_COL_BLOCK_ENTRY;
+            uint64_t row = get_le(e, 8), rows = get_le(e + 8, 8);
+            if (start > row || start + count < row + rows) {
+                size_t decoded = (size_t)get_le(e + 28, 4);
+                if (scratch < decoded) scratch = decoded;
+            }
+        }
+    }
+    *output_bytes = (size_t)count * esz;
+    *scratch_bytes = scratch;
+    return RAY_OK;
+}
+
+ray_err_t ray_col_block_read_range(const ray_col_block_reader_t* r,
+                                  uint64_t start, uint64_t count,
+                                  void* output, size_t capacity,
+                                  void* scratch, size_t scratch_capacity) {
+    size_t bytes, needed;
+    ray_err_t err = ray_col_block_range_size(r, start, count, &bytes, &needed);
+    if (err) return err;
+    if (capacity < bytes || scratch_capacity < needed) return RAY_ERR_LIMIT;
+    if ((bytes && !output) || (needed && !scratch)) return RAY_ERR_DOMAIN;
+    if (!count) return RAY_OK;
+    unsigned esz = width(r->type);
+    uint64_t block = block_for_row(r, start), end = start + count;
+    uint8_t* dst = output;
+    while (start < end) {
+        const uint8_t* e = r->data + r->directory + block * RAY_COL_BLOCK_ENTRY;
+        uint64_t row = get_le(e, 8), rows = get_le(e + 8, 8);
+        uint64_t stop = row + rows < end ? row + rows : end;
+        bool whole = start == row && stop == row + rows;
+        size_t n = (size_t)(stop - start) * esz;
+        uint64_t ignored_row, ignored_count;
+        err = ray_col_block_read(r, block, whole ? dst : scratch,
+            whole ? n : scratch_capacity, &ignored_row, &ignored_count);
+        if (err) return err;
+        if (!whole) memcpy(dst, (uint8_t*)scratch + (size_t)(start - row) * esz, n);
+        dst += n; start = stop; block++;
+    }
+    return RAY_OK;
+}
+
 void ray_col_block_abort(ray_col_block_writer_t* w) {
     if (!w) return;
     if (w->directory) fclose(w->directory);

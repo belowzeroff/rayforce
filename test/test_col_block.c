@@ -82,6 +82,12 @@ static test_result_t roundtrip(void) {
                 total += count;
             }
             TEST_ASSERT_EQ_I(total, 513);
+            uint8_t scratch[64];
+            ray_t* vec = ray_col_block_materialize(&r, 2, 509, 509 * width, scratch, sizeof(scratch));
+            TEST_ASSERT_FALSE(RAY_IS_ERR(vec));
+            TEST_ASSERT_EQ_I(vec->type, type); TEST_ASSERT_EQ_I(vec->len, 509);
+            TEST_ASSERT_TRUE(memcmp(ray_data(vec), input + 2 * width, 509 * width) == 0);
+            ray_release(vec);
             /* Existing loaders must not interpret compressed bytes as vectors. */
             ray_t* old = ray_col_load(path);
             TEST_ASSERT_TRUE(RAY_IS_ERR(old));
@@ -109,6 +115,10 @@ static test_result_t empty_and_bounds(void) {
     ray_col_block_reader_t r;
     TEST_ASSERT_EQ_I(ray_col_block_open(&r, bytes, file_size), RAY_OK);
     TEST_ASSERT_EQ_I(r.rows, 0); TEST_ASSERT_EQ_I(r.blocks, 0);
+    TEST_ASSERT_EQ_I(ray_col_block_read_range(&r, 0, 0, NULL, 0, NULL, 0), RAY_OK);
+    ray_t* empty = ray_col_block_materialize(&r, 0, 0, 0, NULL, 0);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(empty)); TEST_ASSERT_EQ_I(empty->len, 0);
+    TEST_ASSERT_EQ_I(empty->type, RAY_I64); ray_release(empty);
     uint64_t row = 99, count = 99;
     TEST_ASSERT_EQ_I(ray_col_block_read(&r, 0, output, sizeof(output), &row, &count), RAY_ERR_RANGE);
     TEST_ASSERT_EQ_I(ray_col_block_begin(&writer, file, RAY_I64, 64, 0, 0), RAY_ERR_IO);
@@ -201,6 +211,11 @@ static test_result_t fallback_and_bits(void) {
         TEST_ASSERT_EQ_I(row, i); TEST_ASSERT_EQ_I(count, 1);
         TEST_ASSERT_TRUE(memcmp(output, values + i, 8) == 0);
     }
+    ray_t* vec = ray_col_block_materialize(&r, 0, 4, sizeof(values), NULL, 0);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(vec));
+    TEST_ASSERT_TRUE(memcmp(ray_data(vec), values, sizeof(values)) == 0);
+    TEST_ASSERT_FALSE(ray_vec_is_null(vec, 0)); TEST_ASSERT_TRUE(ray_vec_is_null(vec, 1));
+    ray_release(vec);
     reset_file();
     TEST_ASSERT_EQ_I(ray_col_block_begin(&writer, file, RAY_U8, 1, 1, 0), RAY_OK);
     TEST_ASSERT_EQ_I(ray_col_block_append(&writer, values, 8), RAY_OK);
@@ -212,11 +227,91 @@ static test_result_t fallback_and_bits(void) {
     PASS();
 }
 
+static test_result_t ranges(void) {
+    int64_t values[24];
+    uint8_t scratch[65];
+    for (unsigned i = 0; i < 24; i++) values[i] = i * 100;
+    for (uint8_t codec = 0; codec < 2; codec++) {
+        reset_file();
+        TEST_ASSERT_EQ_I(ray_col_block_begin(&writer, file, RAY_I64, 64, codec, 0), RAY_OK);
+        TEST_ASSERT_EQ_I(ray_col_block_append(&writer, values, 3), RAY_OK);
+        TEST_ASSERT_EQ_I(ray_col_block_append(&writer, values + 3, 21), RAY_OK);
+        TEST_ASSERT_EQ_I(ray_col_block_finish(&writer), RAY_OK);
+        snapshot();
+        ray_col_block_reader_t r;
+        TEST_ASSERT_EQ_I(ray_col_block_open(&r, bytes, file_size), RAY_OK);
+        for (uint64_t start = 0; start <= 24; start++) {
+            for (uint64_t count = 0; count <= 24 - start; count++) {
+                size_t out_bytes, scratch_bytes;
+                TEST_ASSERT_EQ_I(ray_col_block_range_size(&r, start, count, &out_bytes, &scratch_bytes), RAY_OK);
+                TEST_ASSERT_EQ_I(out_bytes, count * 8);
+                TEST_ASSERT_TRUE(scratch_bytes <= 64);
+                memset(output, 0xa5, sizeof(output)); memset(scratch, 0xa5, sizeof(scratch));
+                TEST_ASSERT_EQ_I(ray_col_block_read_range(&r, start, count, output, out_bytes,
+                    scratch_bytes ? scratch : NULL, scratch_bytes), RAY_OK);
+                TEST_ASSERT_TRUE(memcmp(output, values + start, out_bytes) == 0);
+                TEST_ASSERT_EQ_I(output[out_bytes], 0xa5);
+                TEST_ASSERT_EQ_I(scratch[scratch_bytes], 0xa5);
+            }
+        }
+        TEST_ASSERT_EQ_I(ray_col_block_read_range(&r, 0, 24, output, 192, NULL, 0), RAY_OK);
+        TEST_ASSERT_EQ_I(ray_col_block_read_range(&r, 24, 0, NULL, 0, NULL, 0), RAY_OK);
+        TEST_ASSERT_EQ_I(ray_col_block_read_range(&r, 25, 0, NULL, 0, NULL, 0), RAY_ERR_RANGE);
+        TEST_ASSERT_EQ_I(ray_col_block_read_range(&r, 1, UINT64_MAX, output, sizeof(output), scratch, 64), RAY_ERR_RANGE);
+        memset(output, 0xa5, sizeof(output));
+        TEST_ASSERT_EQ_I(ray_col_block_read_range(&r, 2, 16, output, sizeof(output), scratch, 63), RAY_ERR_LIMIT);
+        TEST_ASSERT_EQ_I(output[0], 0xa5);
+        TEST_ASSERT_EQ_I(ray_col_block_read_range(&r, 2, 16, output, 127, scratch, 64), RAY_ERR_LIMIT);
+        TEST_ASSERT_EQ_I(output[0], 0xa5);
+        TEST_ASSERT_EQ_I(ray_col_block_read_range(&r, 2, 16, output, 128, NULL, 64), RAY_ERR_DOMAIN);
+        /* A damaged unselected block must not be touched, even at its boundary. */
+        bytes[RAY_COL_BLOCK_HEADER] ^= 1;
+        TEST_ASSERT_EQ_I(ray_col_block_read_range(&r, 3, 8, output, 64, NULL, 0), RAY_OK);
+        TEST_ASSERT_EQ_I(ray_col_block_read_range(&r, 2, 1, output, 8, scratch, 64), RAY_ERR_CORRUPT);
+    }
+    PASS();
+}
+
+static test_result_t materialize(void) {
+    const int64_t values[] = {1, INT64_MIN, 3, 4, 5, 6, 7, 8};
+    uint8_t scratch[64];
+    TEST_ASSERT_EQ_I(ray_col_block_begin(&writer, file, RAY_I64, 64, 1, 0), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_block_append(&writer, values, 8), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_block_finish(&writer), RAY_OK);
+    snapshot();
+    ray_col_block_reader_t r;
+    TEST_ASSERT_EQ_I(ray_col_block_open(&r, bytes, file_size), RAY_OK);
+    ray_t* v = ray_col_block_materialize(&r, 1, 2, 15, scratch, sizeof(scratch));
+    TEST_ASSERT_TRUE(RAY_IS_ERR(v)); TEST_ASSERT_STR_EQ(ray_err_code(v), "limit"); ray_error_free(v);
+    v = ray_col_block_materialize(&r, 1, 2, 16, scratch, 63);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(v)); TEST_ASSERT_STR_EQ(ray_err_code(v), "limit"); ray_error_free(v);
+    v = ray_col_block_materialize(&r, 1, 2, 16, NULL, 64);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(v)); TEST_ASSERT_STR_EQ(ray_err_code(v), "domain"); ray_error_free(v);
+    v = ray_col_block_materialize(&r, 9, 0, 0, NULL, 0);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(v)); TEST_ASSERT_STR_EQ(ray_err_code(v), "range"); ray_error_free(v);
+    v = ray_col_block_materialize(&r, 8, 0, 0, NULL, 0);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(v)); TEST_ASSERT_EQ_I(v->len, 0); ray_release(v);
+    v = ray_col_block_materialize(&r, 1, 2, 16, scratch, 64);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(v));
+    TEST_ASSERT_TRUE(ray_vec_is_null(v, 0)); TEST_ASSERT_FALSE(ray_vec_is_null(v, 1));
+    memset(bytes, 0, file_size); memset(scratch, 0, sizeof(scratch));
+    TEST_ASSERT_TRUE(memcmp(ray_data(v), values + 1, 16) == 0);
+    ray_release(v);
+    snapshot();
+    TEST_ASSERT_EQ_I(ray_col_block_open(&r, bytes, file_size), RAY_OK);
+    bytes[RAY_COL_BLOCK_HEADER] ^= 1;
+    v = ray_col_block_materialize(&r, 0, 8, 64, NULL, 0);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(v)); TEST_ASSERT_STR_EQ(ray_err_code(v), "corrupt"); ray_error_free(v);
+    PASS();
+}
+
 const test_entry_t col_block_entries[] = {
     {"col_block/roundtrip", roundtrip, setup, teardown},
     {"col_block/empty_and_bounds", empty_and_bounds, setup, teardown},
     {"col_block/corruption", corruption, setup, teardown},
     {"col_block/fallback_and_bits", fallback_and_bits, setup, teardown},
     {"col_block/io_failure", io_failure, setup, teardown},
+    {"col_block/ranges", ranges, setup, teardown},
+    {"col_block/materialize", materialize, setup, teardown},
     {NULL, NULL, NULL, NULL},
 };
