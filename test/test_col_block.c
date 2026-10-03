@@ -5,6 +5,7 @@
 #include "store/col.h"
 #include "core/crc32.h"
 #include "mem/heap.h"
+#include "mem/sys.h"
 #include "table/sym.h"
 #include <stdlib.h>
 #include <unistd.h>
@@ -14,6 +15,7 @@ static char path[64];
 static ray_col_block_writer_t writer;
 static uint8_t bytes[65536], copy[65536], input[16384], output[16384];
 static size_t file_size;
+static ray_col_block_file_t* owned_file;
 
 static void setup(void) {
     ray_heap_init(); ray_sym_init();
@@ -25,6 +27,7 @@ static void setup(void) {
     memset(&writer, 0, sizeof(writer));
 }
 static void teardown(void) {
+    ray_col_block_file_close(&owned_file);
     ray_col_block_abort(&writer);
     if (file) fclose(file);
     file = NULL; unlink(path);
@@ -305,6 +308,97 @@ static test_result_t materialize(void) {
     PASS();
 }
 
+static int64_t mapped_bytes(void) {
+    int64_t current, peak;
+    ray_sys_get_mapped(&current, &peak);
+    return current;
+}
+
+static test_result_t file_lifetime(void) {
+    const int64_t values[] = {1, INT64_MIN, 3, 4, 5, 6, 7, 8};
+    TEST_ASSERT_EQ_I(ray_col_block_begin(&writer, file, RAY_I64, 64, 1, 0), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_block_append(&writer, values, 8), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_block_finish(&writer), RAY_OK);
+    snapshot();
+    int64_t baseline = mapped_bytes();
+    TEST_ASSERT_EQ_I(ray_col_block_file_open(path, &owned_file), RAY_OK);
+    TEST_ASSERT_EQ_I(mapped_bytes(), baseline + (int64_t)file_size);
+    const ray_col_block_reader_t* r = ray_col_block_file_reader(owned_file);
+    TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_EQ_I(r->rows, 8);
+    TEST_ASSERT_EQ_I(ray_col_block_file_open(path, &owned_file), RAY_ERR_DOMAIN);
+    TEST_ASSERT_TRUE(ray_col_block_file_reader(owned_file) == r);
+    ray_t* v = ray_col_block_load_range(path, 1, 2, 16, 64);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(v)); TEST_ASSERT_TRUE(ray_vec_is_null(v, 0));
+    TEST_ASSERT_EQ_I(mapped_bytes(), baseline + (int64_t)file_size);
+    ray_col_block_file_close(&owned_file);
+    TEST_ASSERT_TRUE(owned_file == NULL);
+    TEST_ASSERT_EQ_I(mapped_bytes(), baseline);
+    ray_col_block_file_close(&owned_file); ray_col_block_file_close(NULL);
+    TEST_ASSERT_TRUE(ray_col_block_file_reader(NULL) == NULL);
+    TEST_ASSERT_TRUE(memcmp(ray_data(v), values + 1, 16) == 0); ray_release(v);
+
+    /* On POSIX an unlinked inode stays alive through its mapping. A new file
+     * at the same path must not change a previously opened handle's data. */
+    TEST_ASSERT_EQ_I(ray_col_block_file_open(path, &owned_file), RAY_OK);
+    TEST_ASSERT_EQ_I(unlink(path), 0);
+    TEST_ASSERT_EQ_I(fclose(file), 0); file = fopen(path, "w+b");
+    TEST_ASSERT_NOT_NULL(file);
+    int64_t replacement[8] = {0};
+    TEST_ASSERT_EQ_I(ray_col_block_begin(&writer, file, RAY_I64, 64, 1, 1), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_block_append(&writer, replacement, 8), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_block_finish(&writer), RAY_OK);
+    r = ray_col_block_file_reader(owned_file);
+    v = ray_col_block_materialize(r, 0, 8, 64, NULL, 0);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(v)); TEST_ASSERT_TRUE(memcmp(ray_data(v), values, 64) == 0);
+    ray_release(v);
+    v = ray_col_block_load_range(path, 0, 8, 64, 0);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(v)); TEST_ASSERT_TRUE(memcmp(ray_data(v), replacement, 64) == 0);
+    ray_release(v); ray_col_block_file_close(&owned_file);
+    TEST_ASSERT_EQ_I(mapped_bytes(), baseline);
+    PASS();
+}
+
+static test_result_t file_errors(void) {
+    int64_t baseline = mapped_bytes();
+    TEST_ASSERT_EQ_I(ray_col_block_file_open(NULL, &owned_file), RAY_ERR_DOMAIN);
+    TEST_ASSERT_EQ_I(ray_col_block_file_open("", &owned_file), RAY_ERR_DOMAIN);
+    TEST_ASSERT_EQ_I(ray_col_block_file_open(path, NULL), RAY_ERR_DOMAIN);
+    TEST_ASSERT_EQ_I(ray_col_block_file_open(path, &owned_file), RAY_ERR_IO); /* empty file */
+    const int64_t values[8] = {0};
+    TEST_ASSERT_EQ_I(ray_col_block_begin(&writer, file, RAY_I64, 64, 1, 0), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_block_append(&writer, values, 8), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_block_finish(&writer), RAY_OK);
+    const uint64_t starts[] = {0, 1, 9};
+    const size_t payloads[] = {7, 8, 8}, scratches[] = {64, 63, 64};
+    const char* errors[] = {"limit", "limit", "range"};
+    for (unsigned i = 0; i < 3; i++) {
+        ray_t* v = ray_col_block_load_range(path, starts[i], 1, payloads[i], scratches[i]);
+        TEST_ASSERT_TRUE(RAY_IS_ERR(v)); TEST_ASSERT_STR_EQ(ray_err_code(v), errors[i]);
+        ray_error_free(v); TEST_ASSERT_EQ_I(mapped_bytes(), baseline);
+    }
+    /* Valid metadata, damaged compressed data: load must release its mapping. */
+    TEST_ASSERT_EQ_I(fseek(file, RAY_COL_BLOCK_HEADER, SEEK_SET), 0);
+    TEST_ASSERT_TRUE(fputc(0, file) != EOF); TEST_ASSERT_EQ_I(fflush(file), 0);
+    ray_t* v = ray_col_block_load_range(path, 0, 8, 64, 0);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(v)); TEST_ASSERT_STR_EQ(ray_err_code(v), "corrupt");
+    ray_error_free(v); TEST_ASSERT_EQ_I(mapped_bytes(), baseline);
+    TEST_ASSERT_EQ_I(fseek(file, 0, SEEK_SET), 0);
+    TEST_ASSERT_TRUE(fputc(1, file) != EOF); TEST_ASSERT_EQ_I(fflush(file), 0);
+    TEST_ASSERT_EQ_I(ray_col_block_file_open(path, &owned_file), RAY_ERR_CORRUPT);
+    TEST_ASSERT_TRUE(owned_file == NULL); TEST_ASSERT_EQ_I(mapped_bytes(), baseline);
+    ray_t* raw = ray_vec_new(RAY_I64, 8);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(raw)); raw->len = 8; memcpy(ray_data(raw), values, 64);
+    TEST_ASSERT_EQ_I(ray_col_save(raw, path), RAY_OK); ray_release(raw);
+    v = ray_col_block_load_range(path, 0, 8, 64, 0);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(v)); TEST_ASSERT_STR_EQ(ray_err_code(v), "version");
+    ray_error_free(v); TEST_ASSERT_EQ_I(mapped_bytes(), baseline);
+    TEST_ASSERT_EQ_I(unlink(path), 0);
+    v = ray_col_block_load_range(path, 0, 1, 8, 64);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(v)); TEST_ASSERT_STR_EQ(ray_err_code(v), "io");
+    ray_error_free(v); TEST_ASSERT_EQ_I(mapped_bytes(), baseline);
+    PASS();
+}
+
 const test_entry_t col_block_entries[] = {
     {"col_block/roundtrip", roundtrip, setup, teardown},
     {"col_block/empty_and_bounds", empty_and_bounds, setup, teardown},
@@ -313,5 +407,7 @@ const test_entry_t col_block_entries[] = {
     {"col_block/io_failure", io_failure, setup, teardown},
     {"col_block/ranges", ranges, setup, teardown},
     {"col_block/materialize", materialize, setup, teardown},
+    {"col_block/file_lifetime", file_lifetime, setup, teardown},
+    {"col_block/file_errors", file_errors, setup, teardown},
     {NULL, NULL, NULL, NULL},
 };
