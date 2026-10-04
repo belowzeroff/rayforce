@@ -1,0 +1,24 @@
+/* Copyright (c) 2026 Anton Kundenko. MIT license; see LICENSE. */
+#ifndef RAY_BLOCK_STORE_H
+#define RAY_BLOCK_STORE_H
+#include <rayforce.h>
+
+typedef struct {
+    uint32_t block_bytes;
+    uint8_t codec; /* 0 raw blocks, 1 Snappy with raw fallback */
+    bool durable;
+} ray_block_store_options_t;
+
+/* Explicit whole-table major-2 save; existing save APIs remain raw.
+ * Accepts rectangular, nonempty-schema tables with BOOL..GUID columns only.
+ * Rejects column attrs except HAS_NULLS (including views/indexes/links/sorted)
+ * rather than silently dropping metadata. Input must remain unchanged during
+ * the call. Options/types/names/shape are checked before filesystem mutation.
+ * Always stages, including first save; .current is the publication point.
+ * Pre-publication errors leave the previous table readable. As with splay,
+ * a post-rename fsync failure may report IO although the new generation is
+ * already visible. Failed initial saves can leave empty infrastructure dirs.
+ * Requires runtime heap/symbol table. Caller owns the input table. */
+ray_err_t ray_block_store_save(ray_t* table, const char* root,
+                               const ray_block_store_options_t* options);
+#endif

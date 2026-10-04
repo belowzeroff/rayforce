@@ -2,6 +2,7 @@
 #define _POSIX_C_SOURCE 200809L
 #include "test.h"
 #include "store/block_scan.h"
+#include "store/block_store.h"
 #include "store/col_block.h"
 #include "store/col.h"
 #include "store/splay.h"
@@ -314,6 +315,139 @@ static test_result_t schema_limits(void) {
     PASS();
 }
 
+static ray_t* store_table(unsigned epoch, unsigned rows) {
+    ray_t* t = ray_table_new(2);
+    for (unsigned c = 0; c < 2; c++) {
+        ray_t* col = ray_vec_new(c ? RAY_I32 : RAY_I64, rows);
+        if (!col || RAY_IS_ERR(col)) ray_test_fatal("store table allocation");
+        for (unsigned i = 0; i < rows; i++) {
+            if (c) ((int32_t*)ray_data(col))[i] = epoch * 1000 + i;
+            else ((int64_t*)ray_data(col))[i] = i == 1 ? INT64_MIN : epoch * 100 + i;
+        }
+        col->len = rows;
+        if (!c) col->attrs |= RAY_ATTR_HAS_NULLS;
+        t = ray_table_add_col(t, ray_sym_intern(names[c], 1), col); ray_release(col);
+        if (!t || RAY_IS_ERR(t)) ray_test_fatal("store table assembly");
+    }
+    return t;
+}
+
+static test_result_t store_roundtrip(void) {
+    char target[128], path[1300], pinned[1024];
+    snprintf(target, sizeof(target), "%s/new/table", root);
+    ray_block_store_options_t options = {64, 1, true};
+    ray_t* table = store_table(1, 16);
+    TEST_ASSERT_EQ_I(ray_block_store_save(table, target, &options), RAY_OK);
+    ray_release(table);
+    snprintf(path, sizeof(path), "%s/.d", target); TEST_ASSERT_EQ_I(access(path, F_OK), -1);
+    TEST_ASSERT_EQ_I(ray_splay_resolve_dir(target, pinned, sizeof(pinned)), RAY_OK);
+    TEST_ASSERT_TRUE(strcmp(pinned, target) != 0);
+    ray_block_scan_options_t scan_options = {0, UINT64_MAX, 5, 60, 64};
+    TEST_ASSERT_EQ_I(ray_block_scan_open(target, names, 2, &scan_options, &scan), RAY_OK);
+    ray_t* first = ray_block_scan_next(scan);
+    TEST_ASSERT_NOT_NULL(first); TEST_ASSERT_FALSE(RAY_IS_ERR(first));
+    TEST_ASSERT_TRUE(ray_vec_is_null(ray_table_get_col_idx(first, 0), 1));
+    for (unsigned e = 2; e <= 4; e++) {
+        table = store_table(e, 16);
+        options.codec = e % 2; options.durable = false;
+        TEST_ASSERT_EQ_I(ray_block_store_save(table, target, &options), RAY_OK);
+        ray_release(table);
+    }
+    TEST_ASSERT_EQ_I(access(pinned, F_OK), 0);
+    unsigned row = 5;
+    ray_t* batch;
+    while ((batch = ray_block_scan_next(scan))) {
+        TEST_ASSERT_FALSE(RAY_IS_ERR(batch));
+        ray_t* x = ray_table_get_col_idx(batch, 0);
+        for (int64_t i = 0; i < x->len; i++)
+            TEST_ASSERT_EQ_I(((int64_t*)ray_data(x))[i], 100 + row + i);
+        row += (unsigned)x->len; ray_release(batch);
+    }
+    TEST_ASSERT_EQ_I(row, 16); ray_block_scan_close(&scan);
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(ray_table_get_col_idx(first, 0)))[0], 100);
+    ray_release(first);
+    table = store_table(5, 0);
+    TEST_ASSERT_EQ_I(ray_block_store_save(table, target, &options), RAY_OK); ray_release(table);
+    TEST_ASSERT_EQ_I(access(pinned, F_OK), -1);
+    TEST_ASSERT_EQ_I(ray_block_scan_open(target, names, 2, &scan_options, &scan), RAY_OK);
+    TEST_ASSERT_TRUE(ray_block_scan_next(scan) == NULL); ray_block_scan_close(&scan);
+    PASS();
+}
+
+static test_result_t store_preflight(void) {
+    char target[128]; snprintf(target, sizeof(target), "%s/preflight", root);
+    ray_block_store_options_t options = {64, 1, false};
+    ray_t* table = store_table(1, 16);
+    ray_t* x = ray_table_get_col_idx(table, 0);
+    ray_t* y = ray_table_get_col_idx(table, 1);
+    y->len--;
+    TEST_ASSERT_EQ_I(ray_block_store_save(table, target, &options), RAY_ERR_LENGTH); y->len++;
+    x->attrs |= RAY_ATTR_SORTED;
+    TEST_ASSERT_EQ_I(ray_block_store_save(table, target, &options), RAY_ERR_NYI);
+    x->attrs &= (uint8_t)~RAY_ATTR_SORTED;
+    ray_table_set_col_name(table, 1, ray_sym_intern("../bad", 6));
+    TEST_ASSERT_EQ_I(ray_block_store_save(table, target, &options), RAY_ERR_DOMAIN);
+    ray_table_set_col_name(table, 1, ray_sym_intern("x", 1));
+    TEST_ASSERT_EQ_I(ray_block_store_save(table, target, &options), RAY_ERR_DOMAIN);
+    ray_table_set_col_name(table, 1, ray_sym_intern("y", 1));
+    options.block_bytes = 7;
+    TEST_ASSERT_EQ_I(ray_block_store_save(table, target, &options), RAY_ERR_RANGE);
+    options.block_bytes = 64; options.codec = 2;
+    TEST_ASSERT_EQ_I(ray_block_store_save(table, target, &options), RAY_ERR_DOMAIN);
+    options.codec = 1;
+    TEST_ASSERT_EQ_I(ray_block_store_save(x, target, &options), RAY_ERR_TYPE);
+    ray_t* unsupported = ray_table_new(1);
+    ray_t* str = ray_vec_new(RAY_STR, 0);
+    unsupported = ray_table_add_col(unsupported, ray_sym_intern("s", 1), str); ray_release(str);
+    TEST_ASSERT_EQ_I(ray_block_store_save(unsupported, target, &options), RAY_ERR_TYPE);
+    ray_release(unsupported);
+    TEST_ASSERT_EQ_I(access(target, F_OK), -1);
+    TEST_ASSERT_EQ_I(ray_block_store_save(table, target, &options), RAY_OK);
+    char before[1024], after[1024];
+    TEST_ASSERT_EQ_I(ray_splay_resolve_dir(target, before, sizeof(before)), RAY_OK);
+    x->attrs |= RAY_ATTR_SORTED;
+    TEST_ASSERT_EQ_I(ray_block_store_save(table, target, &options), RAY_ERR_NYI);
+    x->attrs &= (uint8_t)~RAY_ATTR_SORTED;
+    TEST_ASSERT_EQ_I(ray_splay_resolve_dir(target, after, sizeof(after)), RAY_OK);
+    TEST_ASSERT_STR_EQ(before, after); ray_release(table);
+    PASS();
+}
+
+static test_result_t store_rollback(void) {
+    char target[128], manifest[140], staged[1024];
+    snprintf(target, sizeof(target), "%s/rollback", root);
+    snprintf(manifest, sizeof(manifest), "%s/.current", target);
+    ray_splay_write_t write;
+    TEST_ASSERT_EQ_I(ray_splay_write_begin_staged(target, &write), RAY_OK);
+    TEST_ASSERT_TRUE(write.staged); snprintf(staged, sizeof(staged), "%s", write.dir);
+    TEST_ASSERT_EQ_I(access(manifest, F_OK), -1);
+    TEST_ASSERT_EQ_I(ray_splay_write_finish(&write, RAY_ERR_IO, false), RAY_ERR_IO);
+    TEST_ASSERT_EQ_I(access(staged, F_OK), -1); TEST_ASSERT_EQ_I(access(manifest, F_OK), -1);
+    /* Obstruct the final rename, after the whole new generation is written. */
+    TEST_ASSERT_EQ_I(ray_test_mkdir_p(manifest), 0);
+    ray_t* table = store_table(1, 16);
+    ray_block_store_options_t options = {64, 1, false};
+    TEST_ASSERT_EQ_I(ray_block_store_save(table, target, &options), RAY_ERR_IO);
+    TEST_ASSERT_EQ_I(rmdir(manifest), 0);
+    TEST_ASSERT_EQ_I(ray_block_store_save(table, target, &options), RAY_OK);
+    char before[1024], after[1024], column[1100];
+    TEST_ASSERT_EQ_I(ray_splay_resolve_dir(target, before, sizeof(before)), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_splay_write_begin_staged(target, &write), RAY_OK);
+    snprintf(staged, sizeof(staged), "%s", write.dir);
+    snprintf(column, sizeof(column), "%s/x", write.dir);
+    TEST_ASSERT_EQ_I(ray_col_save(ray_table_get_col_idx(table, 0), column), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_splay_write_finish(&write, RAY_ERR_IO, false), RAY_ERR_IO);
+    TEST_ASSERT_EQ_I(access(staged, F_OK), -1);
+    TEST_ASSERT_EQ_I(ray_splay_resolve_dir(target, after, sizeof(after)), RAY_OK);
+    TEST_ASSERT_STR_EQ(before, after);
+    ray_block_scan_options_t scan_options = {0, UINT64_MAX, 5, 60, 64};
+    TEST_ASSERT_EQ_I(ray_block_scan_open(target, names, 2, &scan_options, &scan), RAY_OK);
+    ray_t* batch = ray_block_scan_next(scan);
+    TEST_ASSERT_NOT_NULL(batch); TEST_ASSERT_FALSE(RAY_IS_ERR(batch)); ray_release(batch);
+    ray_block_scan_close(&scan); ray_release(table);
+    PASS();
+}
+
 const test_entry_t block_scan_entries[] = {
     {"block_scan/batches", batches, setup, teardown},
     {"block_scan/failures", failures, setup, teardown},
@@ -322,5 +456,8 @@ const test_entry_t block_scan_entries[] = {
     {"block_scan/schema_membership", schema_membership, setup, teardown},
     {"block_scan/schema_corruption", schema_corruption, setup, teardown},
     {"block_scan/schema_limits", schema_limits, setup, teardown},
+    {"block_scan/store_roundtrip", store_roundtrip, setup, teardown},
+    {"block_scan/store_preflight", store_preflight, setup, teardown},
+    {"block_scan/store_rollback", store_rollback, setup, teardown},
     {NULL, NULL, NULL, NULL},
 };

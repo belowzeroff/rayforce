@@ -627,7 +627,8 @@ ray_err_t ray_splay_write_finish(ray_splay_write_t* write, ray_err_t result,
     return result;
 }
 
-ray_err_t ray_splay_write_begin(const char* dir, ray_splay_write_t* write) {
+static ray_err_t splay_write_begin_impl(const char* dir, ray_splay_write_t* write,
+                                       bool force_staged) {
     memset(write, 0, sizeof(*write));
     write->lock = RAY_FD_INVALID;
     if (!dir || !*dir) return RAY_ERR_IO;
@@ -650,7 +651,7 @@ ray_err_t ray_splay_write_begin(const char* dir, ray_splay_write_t* write) {
     err = splay_has_file(write->root, ".d", &schema);
     if (err == RAY_OK) err = splay_has_file(write->root, ".current", &current);
     if (err != RAY_OK) return ray_splay_write_finish(write, err, false);
-    write->staged = schema || current;
+    write->staged = force_staged || schema || current;
     if (!write->staged) {
         memcpy(write->dir, write->root, len + 1);
         return RAY_OK;
@@ -686,6 +687,14 @@ ray_err_t ray_splay_write_begin(const char* dir, ray_splay_write_t* write) {
         return ray_splay_write_finish(write, RAY_ERR_IO, false);
     ray_file_close(lease_file);
     return RAY_OK;
+}
+
+ray_err_t ray_splay_write_begin(const char* dir, ray_splay_write_t* write) {
+    return splay_write_begin_impl(dir, write, false);
+}
+
+ray_err_t ray_splay_write_begin_staged(const char* dir, ray_splay_write_t* write) {
+    return splay_write_begin_impl(dir, write, true);
 }
 
 static ray_err_t splay_save_impl(ray_t* tbl, const char* dir,

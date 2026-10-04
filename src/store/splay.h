@@ -43,6 +43,8 @@ typedef struct {
 } ray_splay_write_t;
 
 ray_err_t ray_splay_write_begin(const char* dir, ray_splay_write_t* write);
+/* Always stage, including the first publication; never writes columns at root. */
+ray_err_t ray_splay_write_begin_staged(const char* dir, ray_splay_write_t* write);
 ray_err_t ray_splay_write_finish(ray_splay_write_t* write, ray_err_t result,
                                   bool durable);
 /* Write only to a fresh/unpublished directory owned by the caller. */
