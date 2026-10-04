@@ -3,6 +3,9 @@
 #define RAY_BLOCK_SCAN_H
 #include <rayforce.h>
 
+#define RAY_BLOCK_SCAN_MAX_COLUMNS 1024u
+#define RAY_BLOCK_SCAN_SCHEMA_MAX_BYTES (1024u * 1024u)
+
 typedef struct ray_block_scan_s ray_block_scan_t;
 typedef struct {
     uint64_t start, count; /* count == UINT64_MAX means through EOF */
@@ -11,8 +14,10 @@ typedef struct {
 } ray_block_scan_options_t;
 
 /* Internal fixed-width major-2 named-column scan, not yet a query source.
- * Explicit projection: 1..1024 unique, safe column filenames. Does not parse
- * .d or validate unselected columns. Selected columns must have equal row
+ * Explicit projection: 1..1024 unique, safe column filenames declared by .d.
+ * Validates the complete name schema but not unselected column files. Schema
+ * is limited to 1 MiB on disk, 1024 entries, and 255 bytes per name. Selected
+ * columns must have equal row
  * counts and generation tokens. Acquires a generation lease before mapping.
  * Requires initialized runtime heap/symbol table. *out must initially be NULL.
  * Names are interned; caller may discard options/name strings after open.
