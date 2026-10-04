@@ -3,6 +3,7 @@
 #include "test.h"
 #include "store/block_scan.h"
 #include "store/col_block.h"
+#include "store/col.h"
 #include "store/splay.h"
 #include "mem/heap.h"
 #include "mem/sys.h"
@@ -128,7 +129,7 @@ static test_result_t failures(void) {
     options.batch_rows = 5;
     TEST_ASSERT_EQ_I(ray_block_scan_open(root, invalid, 2, &options, &scan), RAY_ERR_DOMAIN);
     TEST_ASSERT_EQ_I(ray_block_scan_open(root, duplicates, 2, &options, &scan), RAY_ERR_DOMAIN);
-    TEST_ASSERT_EQ_I(ray_block_scan_open(root, missing, 2, &options, &scan), RAY_ERR_IO);
+    TEST_ASSERT_EQ_I(ray_block_scan_open(root, missing, 2, &options, &scan), RAY_ERR_SCHEMA);
     TEST_ASSERT_TRUE(scan == NULL); TEST_ASSERT_EQ_I(mapped(), baseline);
     for (unsigned kind = 0; kind < 3; kind++) {
         options.payload_limit = kind == 0 ? 59 : 60;
@@ -203,10 +204,123 @@ static test_result_t projection(void) {
     PASS();
 }
 
+static void schema_path(char* path, size_t capacity) {
+    char dir[1024];
+    if (ray_splay_resolve_dir(root, dir, sizeof(dir))) ray_test_fatal("schema fixture resolve");
+    int n = snprintf(path, capacity, "%s/.d", dir);
+    if (n < 0 || (size_t)n >= capacity) ray_test_fatal("schema fixture path");
+}
+static void write_schema(ray_t* schema) {
+    if (!schema || RAY_IS_ERR(schema)) ray_test_fatal("schema fixture allocation");
+    char path[1100]; schema_path(path, sizeof(path));
+    ray_err_t err = ray_col_save(schema, path);
+    ray_release(schema);
+    if (err) ray_test_fatal("schema fixture save");
+}
+
+static test_result_t schema_membership(void) {
+    publish(1, 16, 16, 1);
+    ray_block_scan_options_t options = {0, UINT64_MAX, 5, 60, 64};
+    int64_t baseline = mapped();
+    char dir[1024], from[1100], to[1100];
+    TEST_ASSERT_EQ_I(ray_splay_resolve_dir(root, dir, sizeof(dir)), RAY_OK);
+    snprintf(from, sizeof(from), "%s/x", dir); snprintf(to, sizeof(to), "%s/rogue", dir);
+    TEST_ASSERT_EQ_I(rename(from, to), 0);
+    const char* const rogue[] = {"rogue"};
+    TEST_ASSERT_EQ_I(ray_block_scan_open(root, rogue, 1, &options, &scan), RAY_ERR_SCHEMA);
+    TEST_ASSERT_TRUE(scan == NULL); TEST_ASSERT_EQ_I(mapped(), baseline);
+    TEST_ASSERT_EQ_I(rename(to, from), 0);
+    /* Declaration without a selected data file is an I/O failure, not a schema failure. */
+    const char* schema_names[] = {"x", "ghost"};
+    const uint32_t lengths[] = {1, 5};
+    write_schema(ray_str_vec_from_parts(schema_names, lengths, NULL, 2));
+    const char* const ghost[] = {"ghost"};
+    TEST_ASSERT_EQ_I(ray_block_scan_open(root, ghost, 1, &options, &scan), RAY_ERR_IO);
+    TEST_ASSERT_EQ_I(ray_block_scan_open(root, names, 1, &options, &scan), RAY_OK);
+    ray_t* batch = ray_block_scan_next(scan);
+    TEST_ASSERT_NOT_NULL(batch); TEST_ASSERT_FALSE(RAY_IS_ERR(batch)); ray_release(batch);
+    ray_block_scan_close(&scan);
+    TEST_ASSERT_EQ_I(mapped(), baseline);
+    /* No failed open retained a lease: this generation may be pruned. */
+    publish(2, 16, 16, 2); publish(3, 16, 16, 3);
+    TEST_ASSERT_EQ_I(access(dir, F_OK), -1);
+    PASS();
+}
+
+static test_result_t schema_corruption(void) {
+    publish(1, 16, 16, 1);
+    ray_block_scan_options_t options = {0, UINT64_MAX, 5, 60, 64};
+    int64_t baseline = mapped();
+    const char* bad[] = {"", ".hidden", "../y", "a/b", "a\\b", "y\0tail", "x"};
+    const uint32_t sizes[] = {0, 7, 4, 3, 3, 6, 1};
+    for (size_t i = 0; i < sizeof(sizes) / sizeof(*sizes); i++) {
+        const char* entries[] = {"x", bad[i]};
+        uint32_t lengths[] = {1, sizes[i]};
+        write_schema(ray_str_vec_from_parts(entries, lengths, NULL, 2));
+        TEST_ASSERT_EQ_I(ray_block_scan_open(root, names, 1, &options, &scan), RAY_ERR_CORRUPT);
+        TEST_ASSERT_TRUE(scan == NULL); TEST_ASSERT_EQ_I(mapped(), baseline);
+    }
+    write_schema(ray_vec_new(RAY_I64, 0));
+    TEST_ASSERT_EQ_I(ray_block_scan_open(root, names, 1, &options, &scan), RAY_ERR_CORRUPT);
+    write_schema(ray_vec_new(RAY_STR, 0));
+    TEST_ASSERT_EQ_I(ray_block_scan_open(root, names, 1, &options, &scan), RAY_ERR_SCHEMA);
+    char path[1100]; schema_path(path, sizeof(path));
+    TEST_ASSERT_EQ_I(unlink(path), 0);
+    TEST_ASSERT_EQ_I(ray_block_scan_open(root, names, 1, &options, &scan), RAY_ERR_IO);
+    FILE* f = fopen(path, "wb"); TEST_ASSERT_NOT_NULL(f); TEST_ASSERT_EQ_I(fclose(f), 0);
+    TEST_ASSERT_EQ_I(ray_block_scan_open(root, names, 1, &options, &scan), RAY_ERR_CORRUPT);
+    f = fopen(path, "wb"); TEST_ASSERT_NOT_NULL(f);
+    int truncated = ftruncate(fileno(f), RAY_BLOCK_SCAN_SCHEMA_MAX_BYTES + 1);
+    TEST_ASSERT_EQ_I(fclose(f), 0); TEST_ASSERT_EQ_I(truncated, 0);
+    TEST_ASSERT_EQ_I(ray_block_scan_open(root, names, 1, &options, &scan), RAY_ERR_LIMIT);
+    TEST_ASSERT_EQ_I(mapped(), baseline);
+    PASS();
+}
+
+static test_result_t schema_limits(void) {
+    publish(1, 16, 16, 1);
+    ray_block_scan_options_t options = {0, UINT64_MAX, 5, 60, 64};
+    int64_t baseline = mapped();
+    ray_t* schema = ray_vec_new(RAY_STR, RAY_BLOCK_SCAN_MAX_COLUMNS);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(schema));
+    for (unsigned i = 0; i < RAY_BLOCK_SCAN_MAX_COLUMNS; i++) {
+        char name[32];
+        int n = i ? snprintf(name, sizeof(name), "column%u", i) : snprintf(name, sizeof(name), "x");
+        schema = ray_str_vec_append(schema, name, (size_t)n);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(schema));
+    }
+    char path[1100]; schema_path(path, sizeof(path));
+    TEST_ASSERT_EQ_I(ray_col_save(schema, path), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_block_scan_open(root, names, 1, &options, &scan), RAY_OK);
+    ray_block_scan_close(&scan);
+    schema = ray_str_vec_append(schema, "extra", 5);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(schema)); write_schema(schema);
+    TEST_ASSERT_EQ_I(ray_block_scan_open(root, names, 1, &options, &scan), RAY_ERR_LIMIT);
+    char long_name[256]; memset(long_name, 'a', sizeof(long_name));
+    const char* entries[] = {"x", long_name};
+    uint32_t lengths[] = {1, 255};
+    write_schema(ray_str_vec_from_parts(entries, lengths, NULL, 2));
+    TEST_ASSERT_EQ_I(ray_block_scan_open(root, names, 1, &options, &scan), RAY_OK);
+    ray_block_scan_close(&scan);
+    lengths[1] = 256;
+    write_schema(ray_str_vec_from_parts(entries, lengths, NULL, 2));
+    TEST_ASSERT_EQ_I(ray_block_scan_open(root, names, 1, &options, &scan), RAY_ERR_CORRUPT);
+    /* Truncated serialized schema must fail in the existing column decoder. */
+    FILE* f = fopen(path, "r+b"); TEST_ASSERT_NOT_NULL(f);
+    int truncated = ftruncate(fileno(f), 31);
+    TEST_ASSERT_EQ_I(fclose(f), 0); TEST_ASSERT_EQ_I(truncated, 0);
+    TEST_ASSERT_EQ_I(ray_block_scan_open(root, names, 1, &options, &scan), RAY_ERR_CORRUPT);
+    TEST_ASSERT_TRUE(scan == NULL); TEST_ASSERT_EQ_I(mapped(), baseline);
+    PASS();
+}
+
 const test_entry_t block_scan_entries[] = {
     {"block_scan/batches", batches, setup, teardown},
     {"block_scan/failures", failures, setup, teardown},
     {"block_scan/projection", projection, setup, teardown},
     {"block_scan/cancel_after_batch", cancel_after_batch, setup, teardown},
+    {"block_scan/schema_membership", schema_membership, setup, teardown},
+    {"block_scan/schema_corruption", schema_corruption, setup, teardown},
+    {"block_scan/schema_limits", schema_limits, setup, teardown},
     {NULL, NULL, NULL, NULL},
 };

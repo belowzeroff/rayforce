@@ -1,10 +1,12 @@
 /* Copyright (c) 2026 Anton Kundenko. MIT license; see LICENSE. */
 #include "block_scan.h"
 #include "col_block.h"
+#include "col.h"
 #include "splay.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <sys/stat.h>
 
 typedef struct {
     ray_col_block_file_t* file;
@@ -30,16 +32,65 @@ void ray_block_scan_close(ray_block_scan_t** scan) {
     *scan = NULL;
 }
 
+static bool scan_name_safe(const char* name, size_t len) {
+    return name && len && len <= 255 && name[0] != '.' &&
+        !memchr(name, '/', len) && !memchr(name, '\\', len) && !memchr(name, '\0', len);
+}
+
+/* The lease prevents prune across stat/load; immutability is a writer contract.
+ * Use the normal .d decoder, with an on-disk cap before allocating vectors. */
+static ray_err_t scan_check_schema(const char* dir, const char* const* columns, size_t count) {
+    char path[1100];
+    int n = snprintf(path, sizeof(path), "%s/.d", dir);
+    if (n < 0 || (size_t)n >= sizeof(path)) return RAY_ERR_RANGE;
+    struct stat st;
+    if (stat(path, &st) != 0) return RAY_ERR_IO;
+    if (!S_ISREG(st.st_mode) || st.st_size <= 0) return RAY_ERR_CORRUPT;
+    if ((uint64_t)st.st_size > RAY_BLOCK_SCAN_SCHEMA_MAX_BYTES) return RAY_ERR_LIMIT;
+    ray_t* schema = ray_col_load(path);
+    if (!schema) return RAY_ERR_OOM;
+    if (RAY_IS_ERR(schema)) {
+        const char* code = ray_err_code(schema);
+        ray_err_t err = !strcmp(code, "oom") ? RAY_ERR_OOM :
+            !strcmp(code, "io") ? RAY_ERR_IO :
+            !strcmp(code, "version") ? RAY_ERR_VERSION : RAY_ERR_CORRUPT;
+        ray_error_free(schema);
+        return err;
+    }
+    ray_err_t err = RAY_OK;
+    if (schema->type != RAY_STR || schema->len < 0) err = RAY_ERR_CORRUPT;
+    else if ((uint64_t)schema->len > RAY_BLOCK_SCAN_MAX_COLUMNS) err = RAY_ERR_LIMIT;
+    bool found[RAY_BLOCK_SCAN_MAX_COLUMNS] = {false};
+    for (int64_t i = 0; !err && i < schema->len; i++) {
+        size_t len = 0;
+        const char* name = ray_str_vec_get(schema, i, &len);
+        if (!scan_name_safe(name, len)) { err = RAY_ERR_CORRUPT; break; }
+        for (int64_t j = 0; j < i; j++) {
+            size_t previous_len = 0;
+            const char* previous = ray_str_vec_get(schema, j, &previous_len);
+            if (previous_len == len && !memcmp(previous, name, len)) {
+                err = RAY_ERR_CORRUPT; break;
+            }
+        }
+        for (size_t j = 0; j < count; j++)
+            if (strlen(columns[j]) == len && !memcmp(columns[j], name, len)) found[j] = true;
+    }
+    for (size_t j = 0; !err && j < count; j++)
+        if (!found[j]) err = RAY_ERR_SCHEMA;
+    ray_release(schema);
+    return err;
+}
+
 ray_err_t ray_block_scan_open(const char* root, const char* const* columns,
                               size_t count, const ray_block_scan_options_t* options,
                               ray_block_scan_t** out) {
     if (!out || *out || !options || !options->batch_rows || !columns || !count)
         return RAY_ERR_DOMAIN;
-    if (count > 1024) return RAY_ERR_LIMIT;
+    if (count > RAY_BLOCK_SCAN_MAX_COLUMNS) return RAY_ERR_LIMIT;
     for (size_t i = 0; i < count; i++) {
-        if (!columns[i] || !*columns[i] || columns[i][0] == '.' ||
-            strchr(columns[i], '/') || strchr(columns[i], '\\')) return RAY_ERR_DOMAIN;
+        if (!columns[i]) return RAY_ERR_DOMAIN;
         if (strlen(columns[i]) > 255) return RAY_ERR_RANGE;
+        if (!scan_name_safe(columns[i], strlen(columns[i]))) return RAY_ERR_DOMAIN;
         for (size_t j = 0; j < i; j++)
             if (!strcmp(columns[i], columns[j])) return RAY_ERR_DOMAIN;
     }
@@ -50,6 +101,7 @@ ray_err_t ray_block_scan_open(const char* root, const char* const* columns,
     if (!s->columns) { free(s); return RAY_ERR_OOM; }
     s->count = count;
     ray_err_t err = ray_splay_lease_acquire(root, &s->lease);
+    if (!err) err = scan_check_schema(ray_splay_lease_dir(s->lease), columns, count);
     uint64_t rows = 0, generation = 0;
     for (size_t i = 0; !err && i < count; i++) {
         char path[1300];
