@@ -115,6 +115,7 @@ extern const test_entry_t csv_entries[];
 extern const test_entry_t parquet_entries[];
 extern const test_entry_t snappy_entries[];
 extern const test_entry_t col_block_entries[];
+extern const test_entry_t block_scan_entries[];
 extern const test_entry_t datalog_entries[];
 extern const test_entry_t dict_entries[];
 extern const test_entry_t domain_entries[];
@@ -180,7 +181,7 @@ extern const test_entry_t window_entries[];
 static const test_entry_t* const compiled_groups[] = {
     err_entries,      aof_entries,      arena_entries,    atom_entries,     audit_entries,
     block_entries,    buddy_entries,    compile_entries,  cow_entries,      csr_entries,
-    parquet_entries, snappy_entries, col_block_entries,
+    parquet_entries, snappy_entries, col_block_entries, block_scan_entries,
     csv_entries, datalog_entries, dict_entries, domain_entries,
     dump_entries,
     embedding_entries, exec_entries,   expr_null_entries,
