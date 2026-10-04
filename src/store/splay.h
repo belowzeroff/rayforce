@@ -31,8 +31,9 @@ struct ray_sym_domain_s;
 
 /* Internal publication protocol shared by the table and streaming CSV writers.
  * begin serializes writers; finish publishes only on success and always unlocks.
- * Publication keeps only the current generation; the others, and the first
- * write's root columns, are removed best-effort after each successful publish. */
+ * Publication keeps only the current generation plus generations pinned by
+ * reader leases. Others and the first write's root columns are removed
+ * best-effort after each successful publish. */
 typedef struct {
     ray_fd_t lock;
     bool locked;
@@ -59,6 +60,18 @@ ray_err_t ray_splay_write_table(ray_t* tbl, const char* dir,
 ray_err_t ray_splay_resolve_dir(const char* dir, char* out, size_t out_sz);
 /* Does dir hold a published table (a schema in its selected generation)? */
 bool ray_splay_has_schema(const char* dir);
+
+/* Pin the current immutable staged generation against cooperating writers'
+ * pruning. Acquire briefly takes the root shared writer lock; a held lease
+ * never blocks publication. Requires existing .write.lock and generation
+ * .lease files; legacy/uninstrumented generations return NYI. Read-only opens.
+ * *out must start NULL. dir() is borrowed until release, which clears *lease.
+ * Not protection against old writers, external deletion or in-place edits;
+ * existing eager loaders do not acquire this lease automatically. */
+typedef struct ray_splay_lease_s ray_splay_lease_t;
+ray_err_t ray_splay_lease_acquire(const char* root, ray_splay_lease_t** out);
+const char* ray_splay_lease_dir(const ray_splay_lease_t* lease);
+void ray_splay_lease_release(ray_splay_lease_t** lease);
 
 /* Splayed table I/O.
  *
