@@ -47,6 +47,9 @@ ray_fd_t  ray_file_open(const char* path, int flags);
 void     ray_file_close(ray_fd_t fd);
 ray_err_t ray_file_lock_ex(ray_fd_t fd);
 ray_err_t ray_file_lock_sh(ray_fd_t fd);
+/* Nonblocking exclusive lock: OK with acquired=false when another owner holds
+ * it. Errors never grant ownership. Caller unlocks only when acquired=true. */
+ray_err_t ray_file_try_lock_ex(ray_fd_t fd, bool* acquired);
 ray_err_t ray_file_unlock(ray_fd_t fd);
 ray_err_t ray_file_sync(ray_fd_t fd);
 ray_err_t ray_file_sync_dir(const char* path);

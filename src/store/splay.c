@@ -203,6 +203,60 @@ ray_err_t ray_splay_resolve_dir(const char* dir, char* out, size_t out_sz) {
     return n < 0 || (size_t)n >= out_sz ? RAY_ERR_RANGE : RAY_OK;
 }
 
+struct ray_splay_lease_s {
+    ray_fd_t lock;
+    char dir[1024];
+};
+
+ray_err_t ray_splay_lease_acquire(const char* root, ray_splay_lease_t** out) {
+    if (!root || !*root || !out || *out) return RAY_ERR_DOMAIN;
+    char path[1100];
+    int n = snprintf(path, sizeof(path), "%s/.write.lock", root);
+    if (n < 0 || (size_t)n >= sizeof(path)) return RAY_ERR_RANGE;
+    ray_fd_t root_lock = ray_file_open(path, RAY_OPEN_READ);
+    if (root_lock == RAY_FD_INVALID) return errno == ENOENT ? RAY_ERR_NYI : RAY_ERR_IO;
+    ray_err_t err = ray_file_lock_sh(root_lock);
+    if (err) { ray_file_close(root_lock); return err; }
+    ray_splay_lease_t* lease = calloc(1, sizeof(*lease));
+    if (!lease) err = RAY_ERR_OOM;
+    else {
+        lease->lock = RAY_FD_INVALID;
+        bool active = false;
+        err = splay_current_dir(root, lease->dir, sizeof(lease->dir), &active);
+        if (!err && !active) err = RAY_ERR_NYI;
+        if (!err) {
+            n = snprintf(path, sizeof(path), "%s/.lease", lease->dir);
+            if (n < 0 || (size_t)n >= sizeof(path)) err = RAY_ERR_RANGE;
+            else {
+                lease->lock = ray_file_open(path, RAY_OPEN_READ);
+                if (lease->lock == RAY_FD_INVALID)
+                    err = errno == ENOENT ? RAY_ERR_NYI : RAY_ERR_IO;
+                else err = ray_file_lock_sh(lease->lock);
+            }
+        }
+    }
+    (void)ray_file_unlock(root_lock);
+    ray_file_close(root_lock);
+    if (err) {
+        if (lease) { ray_file_close(lease->lock); free(lease); }
+        return err;
+    }
+    *out = lease;
+    return RAY_OK;
+}
+
+const char* ray_splay_lease_dir(const ray_splay_lease_t* lease) {
+    return lease ? lease->dir : NULL;
+}
+
+void ray_splay_lease_release(ray_splay_lease_t** lease) {
+    if (!lease || !*lease) return;
+    (void)ray_file_unlock((*lease)->lock);
+    ray_file_close((*lease)->lock);
+    free(*lease);
+    *lease = NULL;
+}
+
 static ray_err_t splay_publish_generation(const char* dir, const char* gen,
                                           bool durable) {
     char manifest[1024], tmp[1024];
@@ -314,6 +368,24 @@ static void splay_prune_generations(const char* root, const char* current,
         if ((current && strcmp(rel, current) == 0) ||
             (previous && strcmp(full, previous) == 0))
             continue;
+        /* The root exclusive writer lock prevents new lease acquisitions
+         * between this nonblocking probe and removal. Never wait for readers. */
+#ifndef RAY_OS_WINDOWS
+        struct stat st;
+        if (lstat(full, &st) != 0) continue;
+        if (S_ISLNK(st.st_mode)) { (void)unlink(full); continue; }
+#endif
+        char lease_path[1100];
+        int ln = snprintf(lease_path, sizeof(lease_path), "%s/.lease", full);
+        if (ln < 0 || (size_t)ln >= sizeof(lease_path)) continue;
+        ray_fd_t lease_lock = ray_file_open(lease_path, RAY_OPEN_READ);
+        if (lease_lock != RAY_FD_INVALID) {
+            bool acquired;
+            ray_err_t err = ray_file_try_lock_ex(lease_lock, &acquired);
+            if (err || !acquired) { ray_file_close(lease_lock); continue; }
+            (void)ray_file_unlock(lease_lock);
+            ray_file_close(lease_lock);
+        } else if (errno != ENOENT) continue; /* Conservative on lock I/O errors. */
         splay_remove_tree_best_effort(full);
     }
     closedir(d);
@@ -606,6 +678,13 @@ ray_err_t ray_splay_write_begin(const char* dir, ray_splay_write_t* write) {
             return ray_splay_write_finish(write, RAY_ERR_IO, false);
         /* Never reuse an existing generation, including after PID reuse. */
     }
+    n = snprintf(path, sizeof(path), "%s/.lease", write->dir);
+    if (n < 0 || (size_t)n >= sizeof(path))
+        return ray_splay_write_finish(write, RAY_ERR_RANGE, false);
+    ray_fd_t lease_file = ray_file_open(path, RAY_OPEN_READ | RAY_OPEN_WRITE | RAY_OPEN_CREATE);
+    if (lease_file == RAY_FD_INVALID)
+        return ray_splay_write_finish(write, RAY_ERR_IO, false);
+    ray_file_close(lease_file);
     return RAY_OK;
 }
 

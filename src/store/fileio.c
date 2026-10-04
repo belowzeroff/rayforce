@@ -100,6 +100,18 @@ ray_err_t ray_file_lock_sh(ray_fd_t fd) {
     return RAY_OK;
 }
 
+ray_err_t ray_file_try_lock_ex(ray_fd_t fd, bool* acquired) {
+    if (!acquired) return RAY_ERR_DOMAIN;
+    *acquired = false;
+    if (fd == RAY_FD_INVALID) return RAY_ERR_IO;
+    OVERLAPPED ov = {0};
+    if (!LockFileEx(fd, LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+                    0, MAXDWORD, MAXDWORD, &ov))
+        return GetLastError() == ERROR_LOCK_VIOLATION ? RAY_OK : RAY_ERR_IO;
+    *acquired = true;
+    return RAY_OK;
+}
+
 ray_err_t ray_file_unlock(ray_fd_t fd) {
     if (fd == RAY_FD_INVALID) return RAY_OK;
     OVERLAPPED ov = {0};
@@ -208,6 +220,18 @@ ray_err_t ray_file_lock_ex(ray_fd_t fd) {
 ray_err_t ray_file_lock_sh(ray_fd_t fd) {
     if (fd == RAY_FD_INVALID) return RAY_ERR_IO;
     if (flock(fd, LOCK_SH) != 0) return RAY_ERR_IO;
+    return RAY_OK;
+}
+
+ray_err_t ray_file_try_lock_ex(ray_fd_t fd, bool* acquired) {
+    if (!acquired) return RAY_ERR_DOMAIN;
+    *acquired = false;
+    if (fd == RAY_FD_INVALID) return RAY_ERR_IO;
+    int result;
+    do { result = flock(fd, LOCK_EX | LOCK_NB); } while (result != 0 && errno == EINTR);
+    if (result != 0)
+        return errno == EWOULDBLOCK || errno == EAGAIN ? RAY_OK : RAY_ERR_IO;
+    *acquired = true;
     return RAY_OK;
 }
 
