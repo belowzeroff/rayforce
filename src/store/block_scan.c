@@ -3,6 +3,8 @@
 #include "col_block.h"
 #include "col.h"
 #include "splay.h"
+#include "block_sym.h"
+#include "table/domain.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -15,6 +17,7 @@ typedef struct {
 
 struct ray_block_scan_s {
     ray_splay_lease_t* lease;
+    ray_sym_domain_t* domain;
     scan_column_t* columns;
     size_t count;
     ray_block_scan_options_t options;
@@ -27,6 +30,7 @@ void ray_block_scan_close(ray_block_scan_t** scan) {
     ray_block_scan_t* s = *scan;
     for (size_t i = 0; i < s->count; i++) ray_col_block_file_close(&s->columns[i].file);
     free(s->columns);
+    if (s->domain) ray_sym_domain_release(s->domain);
     ray_splay_lease_release(&s->lease);
     free(s);
     *scan = NULL;
@@ -102,7 +106,8 @@ ray_err_t ray_block_scan_open(const char* root, const char* const* columns,
     s->count = count;
     ray_err_t err = ray_splay_lease_acquire(root, &s->lease);
     if (!err) err = scan_check_schema(ray_splay_lease_dir(s->lease), columns, count);
-    uint64_t rows = 0, generation = 0;
+    uint64_t rows = 0, generation = 0, sym_count = 0;
+    uint32_t sym_crc = 0;
     for (size_t i = 0; !err && i < count; i++) {
         char path[1300];
         int n = snprintf(path, sizeof(path), "%s/%s", ray_splay_lease_dir(s->lease), columns[i]);
@@ -112,8 +117,27 @@ ray_err_t ray_block_scan_open(const char* root, const char* const* columns,
         const ray_col_block_reader_t* r = ray_col_block_file_reader(s->columns[i].file);
         if (!i) { rows = r->rows; generation = r->generation; }
         else if (r->rows != rows || r->generation != generation) { err = RAY_ERR_SCHEMA; break; }
+        if (r->type == RAY_SYM) {
+            if (sym_count && (sym_count != r->sym_count || sym_crc != r->sym_crc)) {
+                err = RAY_ERR_SCHEMA; break;
+            }
+            sym_count = r->sym_count; sym_crc = r->sym_crc;
+        }
         s->columns[i].name = ray_sym_intern(columns[i], strlen(columns[i]));
         if (s->columns[i].name < 0) err = RAY_ERR_OOM;
+    }
+    if (!err && sym_count) {
+        char path[1100];
+        snprintf(path, sizeof(path), "%s/.sym", ray_splay_lease_dir(s->lease));
+        uint64_t actual_count;
+        uint32_t actual_crc;
+        err = ray_block_sym_checksum(path, &actual_count, &actual_crc);
+        if (!err && (actual_count != sym_count || actual_crc != sym_crc)) err = RAY_ERR_CORRUPT;
+        if (!err) {
+            s->domain = ray_sym_domain_open(path);
+            if (!s->domain || (uint64_t)ray_sym_domain_count(s->domain) != sym_count)
+                err = RAY_ERR_CORRUPT;
+        }
     }
     if (!err) {
         if (options->start > rows ||
@@ -134,7 +158,7 @@ ray_t* ray_block_scan_schema(const ray_block_scan_t* s) {
     if (!schema) return ray_error("oom", "block scan schema allocation failed");
     for (size_t i = 0; !RAY_IS_ERR(schema) && i < s->count; i++) {
         const ray_col_block_reader_t* r = ray_col_block_file_reader(s->columns[i].file);
-        ray_t* col = ray_col_block_materialize(r, 0, 0, 0, NULL, 0);
+        ray_t* col = ray_col_block_materialize_dom(r, 0, 0, 0, NULL, 0, s->domain);
         if (RAY_IS_ERR(col)) { ray_release(schema); return col; }
         schema = ray_table_add_col(schema, s->columns[i].name, col);
         ray_release(col);
@@ -176,8 +200,8 @@ ray_t* ray_block_scan_next(ray_block_scan_t* s) {
     if (!batch) { free(scratch); return scan_error(s, RAY_ERR_OOM); }
     for (size_t i = 0; !RAY_IS_ERR(batch) && i < s->count; i++) {
         const ray_col_block_reader_t* r = ray_col_block_file_reader(s->columns[i].file);
-        ray_t* col = ray_col_block_materialize(r, s->cursor, rows,
-            s->options.payload_limit, scratch, scratch_bytes);
+        ray_t* col = ray_col_block_materialize_dom(r, s->cursor, rows,
+            s->options.payload_limit, scratch, scratch_bytes, s->domain);
         if (RAY_IS_ERR(col)) { ray_release(batch); batch = col; break; }
         batch = ray_table_add_col(batch, s->columns[i].name, col);
         ray_release(col);
