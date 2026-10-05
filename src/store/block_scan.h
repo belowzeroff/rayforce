@@ -40,6 +40,23 @@ ray_t* ray_block_scan_schema(const ray_block_scan_t* scan);
  * advancement until a complete batch succeeds. Cancel is checked at next(),
  * not mid-decode. All calls, including cancel/close, require caller serialization. */
 ray_t* ray_block_scan_next(ray_block_scan_t* scan);
+/* Subset indices refer to the original open projection, in requested order.
+ * NULL indices selects its first count columns. count must be nonzero; indices
+ * must be distinct and in range. The subset alone consumes the payload/scratch
+ * budgets; other mapped columns' payloads are not read or checked.
+ * Advances the shared row cursor exactly as next(); optional row_start receives
+ * the absolute first row only on success (unchanged on EOF or error).
+ * No ownership of indices or row_start is retained. */
+ray_t* ray_block_scan_next_columns(ray_block_scan_t* scan, const size_t* indices,
+                                   size_t count, uint64_t* row_start);
+/* Read from the same pinned generation without moving the shared row cursor,
+ * including after EOF. Range must lie within the configured start/count, with
+ * rows <= batch_rows. Zero rows returns an owned typed empty table without
+ * payload reads. Same subset rules, budgets, cancellation and terminal errors
+ * as next_columns(). Used for late materialization after a filter-only batch;
+ * repeated small ranges may decode the same boundary block again. */
+ray_t* ray_block_scan_read_columns(ray_block_scan_t* scan, const size_t* indices,
+                                   size_t count, uint64_t start, uint64_t rows);
 void ray_block_scan_cancel(ray_block_scan_t* scan);
 void ray_block_scan_close(ray_block_scan_t** scan);
 #endif
