@@ -177,22 +177,32 @@ static ray_t* scan_error(ray_block_scan_t* s, ray_err_t err) {
     return ray_error(ray_err_code_str(err), "block scan failed");
 }
 
-ray_t* ray_block_scan_next(ray_block_scan_t* s) {
-    if (!s) return ray_error("domain", "null block scan");
-    if (s->failed) return ray_error("domain", "block scan is terminal; close it");
-    if (s->cancelled) return scan_error(s, RAY_ERR_CANCEL);
-    if (s->cursor == s->end) return NULL;
-    uint64_t rows = s->end - s->cursor;
-    if (rows > s->options.batch_rows) rows = s->options.batch_rows;
+static ray_err_t scan_validate_columns(const ray_block_scan_t* s,
+                                      const size_t* indices, size_t count) {
+    if (!count || count > s->count) return RAY_ERR_DOMAIN;
+    if (!indices) return RAY_OK;
+    bool seen[RAY_BLOCK_SCAN_MAX_COLUMNS] = {false};
+    for (size_t i = 0; i < count; i++) {
+        size_t index = indices[i];
+        if (index >= s->count) return RAY_ERR_RANGE;
+        if (seen[index]) return RAY_ERR_DOMAIN;
+        seen[index] = true;
+    }
+    return RAY_OK;
+}
+
+static ray_t* scan_materialize(ray_block_scan_t* s, const size_t* indices,
+                              size_t count, uint64_t start, uint64_t rows) {
     size_t total = 0, scratch_bytes = 0;
-    for (size_t i = 0; i < s->count; i++) {
-        const ray_col_block_reader_t* r = ray_col_block_file_reader(s->columns[i].file);
+    for (size_t i = 0; i < count; i++) {
+        scan_column_t* column = &s->columns[indices ? indices[i] : i];
+        const ray_col_block_reader_t* r = ray_col_block_file_reader(column->file);
         size_t bytes, scratch;
-        ray_err_t err = ray_col_block_range_size(r, s->cursor, rows, &bytes, &scratch);
+        ray_err_t err = ray_col_block_range_size(r, start, rows, &bytes, &scratch);
         if (err) return scan_error(s, err);
         if (bytes > s->options.payload_limit - total || scratch > s->options.scratch_limit)
             return scan_error(s, RAY_ERR_LIMIT);
-        s->columns[i].payload_bytes = bytes;
+        column->payload_bytes = bytes;
         total += bytes;
         if (scratch_bytes < scratch) scratch_bytes = scratch;
     }
@@ -201,33 +211,68 @@ ray_t* ray_block_scan_next(ray_block_scan_t* s) {
     /* STR sizes depend on decoded lengths. Check the entire batch's exact
      * descriptor/pool sum before allocating any output column. */
     total = 0;
-    for (size_t i = 0; i < s->count; i++) {
-        const ray_col_block_reader_t* r = ray_col_block_file_reader(s->columns[i].file);
-        size_t bytes = s->columns[i].payload_bytes;
+    for (size_t i = 0; i < count; i++) {
+        scan_column_t* column = &s->columns[indices ? indices[i] : i];
+        const ray_col_block_reader_t* r = ray_col_block_file_reader(column->file);
+        size_t bytes = column->payload_bytes;
         ray_err_t err = RAY_OK;
         if (r->type == RAY_STR)
-            err = ray_col_block_payload_size(r, s->cursor, rows, scratch, scratch_bytes, &bytes);
+            err = ray_col_block_payload_size(r, start, rows, scratch, scratch_bytes, &bytes);
         if (!err && bytes > s->options.payload_limit - total) err = RAY_ERR_LIMIT;
         if (err) { free(scratch); return scan_error(s, err); }
-        s->columns[i].payload_bytes = bytes;
+        column->payload_bytes = bytes;
         total += bytes;
     }
-    ray_t* batch = ray_table_new((int64_t)s->count);
+    ray_t* batch = ray_table_new((int64_t)count);
     if (!batch) { free(scratch); return scan_error(s, RAY_ERR_OOM); }
-    for (size_t i = 0; !RAY_IS_ERR(batch) && i < s->count; i++) {
-        const ray_col_block_reader_t* r = ray_col_block_file_reader(s->columns[i].file);
+    for (size_t i = 0; !RAY_IS_ERR(batch) && i < count; i++) {
+        scan_column_t* column = &s->columns[indices ? indices[i] : i];
+        const ray_col_block_reader_t* r = ray_col_block_file_reader(column->file);
         ray_t* col = r->type == RAY_STR ?
-            ray_col_block_materialize_str(r, s->cursor, rows,
-                s->columns[i].payload_bytes, scratch, scratch_bytes) :
-            ray_col_block_materialize_dom(r, s->cursor, rows,
+            ray_col_block_materialize_str(r, start, rows,
+                column->payload_bytes, scratch, scratch_bytes) :
+            ray_col_block_materialize_dom(r, start, rows,
                 s->options.payload_limit, scratch, scratch_bytes, s->domain);
         if (RAY_IS_ERR(col)) { ray_release(batch); batch = col; break; }
-        batch = ray_table_add_col(batch, s->columns[i].name, col);
+        batch = ray_table_add_col(batch, column->name, col);
         ray_release(col);
         if (!batch) { batch = ray_error("oom", "block scan batch allocation failed"); break; }
     }
     free(scratch);
     if (RAY_IS_ERR(batch)) s->failed = true;
-    else s->cursor += rows;
     return batch;
+}
+
+ray_t* ray_block_scan_read_columns(ray_block_scan_t* s, const size_t* indices,
+                                   size_t count, uint64_t start, uint64_t rows) {
+    if (!s) return ray_error("domain", "null block scan");
+    if (s->failed) return ray_error("domain", "block scan is terminal; close it");
+    if (s->cancelled) return scan_error(s, RAY_ERR_CANCEL);
+    ray_err_t err = scan_validate_columns(s, indices, count);
+    if (err) return scan_error(s, err);
+    if (start < s->options.start || start > s->end || rows > s->end - start ||
+        rows > s->options.batch_rows) return scan_error(s, RAY_ERR_RANGE);
+    return scan_materialize(s, indices, count, start, rows);
+}
+
+ray_t* ray_block_scan_next_columns(ray_block_scan_t* s, const size_t* indices,
+                                   size_t count, uint64_t* row_start) {
+    if (!s) return ray_error("domain", "null block scan");
+    if (s->failed) return ray_error("domain", "block scan is terminal; close it");
+    if (s->cancelled) return scan_error(s, RAY_ERR_CANCEL);
+    ray_err_t err = scan_validate_columns(s, indices, count);
+    if (err) return scan_error(s, err);
+    if (s->cursor == s->end) return NULL;
+    uint64_t rows = s->end - s->cursor;
+    if (rows > s->options.batch_rows) rows = s->options.batch_rows;
+    ray_t* batch = scan_materialize(s, indices, count, s->cursor, rows);
+    if (!RAY_IS_ERR(batch)) {
+        if (row_start) *row_start = s->cursor;
+        s->cursor += rows;
+    }
+    return batch;
+}
+
+ray_t* ray_block_scan_next(ray_block_scan_t* s) {
+    return ray_block_scan_next_columns(s, NULL, s ? s->count : 0, NULL);
 }
