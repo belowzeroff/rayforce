@@ -1,7 +1,7 @@
 /* Copyright (c) 2026 Anton Kundenko. MIT license; see LICENSE. */
 /* Link against the engine objects, then run write ROOT and read ROOT as
  * separate processes. The reader deliberately interns symbols in a different
- * order. This also verifies that output vectors retain their dictionary. */
+ * order. Also checks STR inline/pool/NUL bytes and output ownership after close. */
 #include "store/block_scan.h"
 #include "store/block_store.h"
 #include "mem/heap.h"
@@ -17,6 +17,8 @@ int main(int argc, char** argv) {
     }
     ray_heap_init(); ray_sym_init();
     const char* values[] = {"", "ALPHA", "BETA", "ALPHA", "", "BETA"};
+    const char* strings[] = {"", "abcdefghijkl", "abcdefghijklm", "x\0y", "abcdefghijklmnopqrstuvwx", "BETA"};
+    uint32_t lengths[] = {0, 12, 13, 3, 24, 4};
     if (!strcmp(argv[1], "write")) {
         assert(ray_sym_intern("writer-only", 11) >= 0);
         ray_t* v = ray_sym_vec_new(RAY_SYM_W64, 6);
@@ -27,9 +29,14 @@ int main(int argc, char** argv) {
             ray_write_sym(ray_data(v), i, (uint64_t)id, RAY_SYM, v->attrs);
         }
         v->len = 6;
-        ray_t* table = ray_table_new(1);
+        ray_t* table = ray_table_new(2);
         assert(table && !RAY_IS_ERR(table));
         table = ray_table_add_col(table, ray_sym_intern("s", 1), v);
+        ray_release(v);
+        assert(table && !RAY_IS_ERR(table));
+        v = ray_str_vec_from_parts(strings, lengths, NULL, 6);
+        assert(v && !RAY_IS_ERR(v));
+        table = ray_table_add_col(table, ray_sym_intern("text", 4), v);
         ray_release(v);
         assert(table && !RAY_IS_ERR(table));
         ray_block_store_options_t options = {32, 1, true};
@@ -38,10 +45,10 @@ int main(int argc, char** argv) {
     } else {
         assert(ray_sym_intern("BETA", 4) == 1);
         assert(ray_sym_intern("reader-only", 11) >= 0);
-        const char* columns[] = {"s"};
-        ray_block_scan_options_t options = {0, UINT64_MAX, 6, 48, 32};
+        const char* columns[] = {"s", "text"};
+        ray_block_scan_options_t options = {0, UINT64_MAX, 6, 181, 32};
         ray_block_scan_t* scan = NULL;
-        assert(ray_block_scan_open(argv[2], columns, 1, &options, &scan) == RAY_OK);
+        assert(ray_block_scan_open(argv[2], columns, 2, &options, &scan) == RAY_OK);
         ray_t* batch = ray_block_scan_next(scan);
         assert(batch && !RAY_IS_ERR(batch));
         assert(ray_block_scan_next(scan) == NULL);
@@ -52,6 +59,9 @@ int main(int argc, char** argv) {
             ray_t* s = ray_sym_vec_cell(v, i);
             assert(s && ray_str_len(s) == strlen(values[i]));
             assert(!memcmp(ray_str_ptr(s), values[i], strlen(values[i])));
+            size_t len;
+            const char* text = ray_str_vec_get(ray_table_get_col_idx(batch, 1), i, &len);
+            assert(text && len == lengths[i] && !memcmp(text, strings[i], len));
         }
         ray_release(batch);
     }

@@ -10,7 +10,9 @@
 #define RAY_COL_BLOCK_ENTRY 64u
 #define RAY_COL_BLOCK_FOOTER 32u
 
-/* Experimental major-2 fixed-width container. No attrs, STR or indexes.
+/* Experimental major-2 block container. No semantic attrs or indexes.
+ * STR blocks contain repeated [u32 byte length, bytes], with zero length
+ * representing the canonical empty/null string. No runtime descriptors persist.
  * SYM payloads are uint64 positions in a generation-local dictionary, bound
  * by count and file CRC. They are never process-local symbol identifiers.
  * Payload is little-endian; callers supply native values on little-endian
@@ -35,14 +37,29 @@ ray_err_t ray_col_block_read(const ray_col_block_reader_t* reader, uint64_t bloc
                              void* output, size_t capacity,
                              uint64_t* row_start, uint64_t* row_count);
 
-/* Range [start, start + count). Empty ranges at EOF are valid. Reports exact
- * output bytes and scratch required for partial boundary blocks. No allocation
+/* Range [start, start + count). Empty ranges at EOF are valid. Fixed width:
+ * exact output bytes and scratch for partial boundary blocks. STR: minimum
+ * descriptor bytes (16 per row), scratch for the largest selected block;
+ * payload_size below adds the exact pool bytes by decoding selected blocks.
+ * No allocation
  * or payload access. All APIs require an unchanged reader returned by open. */
 ray_err_t ray_col_block_range_size(const ray_col_block_reader_t* reader,
                                   uint64_t start, uint64_t count,
                                   size_t* output_bytes, size_t* scratch_bytes);
+/* Half-open block interval covering a row range; empty ranges return [0,0). */
+ray_err_t ray_col_block_range_blocks(const ray_col_block_reader_t* reader,
+                                    uint64_t start, uint64_t count,
+                                    uint64_t* first, uint64_t* end);
+/* Exact native payload (STR descriptors + pooled bytes, fixed width otherwise).
+ * STR validates/decodes selected blocks with caller scratch, without allocation.
+ * Pool > UINT32_MAX returns range, matching the native STR representation. */
+ray_err_t ray_col_block_payload_size(const ray_col_block_reader_t* reader,
+                                    uint64_t start, uint64_t count,
+                                    void* scratch, size_t scratch_capacity,
+                                    size_t* payload_bytes);
 /* Buffers must not overlap each other or the mapping. Capacities are checked
- * before any output write. CRC/decode errors may leave partial output. */
+ * before any output write. CRC/decode errors may leave partial output.
+ * Fixed-width only; STR uses materialization below. */
 ray_err_t ray_col_block_read_range(const ray_col_block_reader_t* reader,
                                   uint64_t start, uint64_t count,
                                   void* output, size_t capacity,
@@ -64,6 +81,13 @@ ray_t* ray_col_block_materialize_dom(const ray_col_block_reader_t* reader,
                                     size_t payload_limit, void* scratch,
                                     size_t scratch_capacity,
                                     struct ray_sym_domain_s* domain);
+/* STR-only second pass after payload_size on the same immutable range.
+ * measured_bytes includes descriptors and pool; caller checks its budget.
+ * A mismatched size returns an error without publishing a partial vector. */
+ray_t* ray_col_block_materialize_str(const ray_col_block_reader_t* reader,
+                                    uint64_t start, uint64_t count,
+                                    size_t measured_bytes, void* scratch,
+                                    size_t scratch_capacity);
 
 /* Owning file handle. Open requires *out == NULL; failures leave it NULL.
  * Close clears the caller's pointer and accepts NULL. The borrowed reader is
@@ -114,6 +138,14 @@ ray_err_t ray_col_block_begin_sym(ray_col_block_writer_t* writer, FILE* output,
                                   uint32_t sym_crc);
 ray_err_t ray_col_block_append(ray_col_block_writer_t* writer,
                                const void* values, uint64_t rows);
+/* Append one pre-encoded STR block. Validates lengths and exact consumption;
+ * encoded_size <= block_bytes. Each string stays in a single block. */
+ray_err_t ray_col_block_append_str(ray_col_block_writer_t* writer,
+                                   const void* encoded, size_t encoded_size,
+                                   uint64_t rows);
+/* Native STR adapter. Uses one block buffer; caller retains the stable vector.
+ * A single string larger than block_bytes - 4 returns range. */
+ray_err_t ray_col_block_append_str_vec(ray_col_block_writer_t* writer, ray_t* strings);
 ray_err_t ray_col_block_finish(ray_col_block_writer_t* writer);
 void ray_col_block_abort(ray_col_block_writer_t* writer);
 

@@ -6,21 +6,26 @@ import struct
 import zlib
 
 
-def container(compressed=False, empty=False, symbols=False):
+def container(compressed=False, empty=False, symbols=False, strings=False):
     header = bytearray(128)
-    header[17:19] = bytes((2, 12 if symbols else 2))  # major 2, SYM or U8
+    header[17:19] = bytes((2, 13 if strings else 12 if symbols else 2))
     header[32:40] = b"RAYHDB2\0"
     payload = bytearray()
     directory = bytearray()
-    rows_per_block = 32 if symbols else 256
+    rows_per_block = (64 if compressed else 4) if strings else 32 if symbols else 256
     for block in range(0 if empty else 4):
         raw = bytes(256)
+        if strings and not compressed:
+            values = (b"", b"abcdefghijkl", b"hello\0world!!", b"x" * 215)
+            raw = b"".join(struct.pack("<I", len(s)) + s for s in values)
+            assert len(raw) == 256
         # Length 256, one literal zero, overlapping COPY_2 spans: 64,64,64,63.
         stored = b"\x80\x02\x00\x00" + b"\xfe\x01\x00" * 3 + b"\xfa\x01\x00" if compressed else raw
         entry = bytearray(64)
         struct.pack_into("<QQQII", entry, 0, block * rows_per_block, rows_per_block,
                          128 + len(payload), len(stored), 256)
         entry[32] = int(compressed)
+        entry[33] = int(strings)
         struct.pack_into("<II", entry, 40, zlib.crc32(stored), zlib.crc32(raw))
         directory.extend(entry)
         payload.extend(stored)
@@ -45,6 +50,7 @@ def main():
     for name, compressed, empty in (("raw", False, False), ("snappy", True, False), ("empty", False, True)):
         (args.directory / name).write_bytes(container(compressed, empty))
         (args.directory / ("sym-" + name)).write_bytes(container(compressed, empty, symbols=True))
+        (args.directory / ("str-" + name)).write_bytes(container(compressed, empty, strings=True))
 
 
 if __name__ == "__main__":

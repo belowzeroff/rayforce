@@ -13,6 +13,7 @@
 typedef struct {
     ray_col_block_file_t* file;
     int64_t name;
+    size_t payload_bytes;
 } scan_column_t;
 
 struct ray_block_scan_s {
@@ -191,17 +192,35 @@ ray_t* ray_block_scan_next(ray_block_scan_t* s) {
         if (err) return scan_error(s, err);
         if (bytes > s->options.payload_limit - total || scratch > s->options.scratch_limit)
             return scan_error(s, RAY_ERR_LIMIT);
+        s->columns[i].payload_bytes = bytes;
         total += bytes;
         if (scratch_bytes < scratch) scratch_bytes = scratch;
     }
     void* scratch = scratch_bytes ? malloc(scratch_bytes) : NULL;
     if (scratch_bytes && !scratch) return scan_error(s, RAY_ERR_OOM);
+    /* STR sizes depend on decoded lengths. Check the entire batch's exact
+     * descriptor/pool sum before allocating any output column. */
+    total = 0;
+    for (size_t i = 0; i < s->count; i++) {
+        const ray_col_block_reader_t* r = ray_col_block_file_reader(s->columns[i].file);
+        size_t bytes = s->columns[i].payload_bytes;
+        ray_err_t err = RAY_OK;
+        if (r->type == RAY_STR)
+            err = ray_col_block_payload_size(r, s->cursor, rows, scratch, scratch_bytes, &bytes);
+        if (!err && bytes > s->options.payload_limit - total) err = RAY_ERR_LIMIT;
+        if (err) { free(scratch); return scan_error(s, err); }
+        s->columns[i].payload_bytes = bytes;
+        total += bytes;
+    }
     ray_t* batch = ray_table_new((int64_t)s->count);
     if (!batch) { free(scratch); return scan_error(s, RAY_ERR_OOM); }
     for (size_t i = 0; !RAY_IS_ERR(batch) && i < s->count; i++) {
         const ray_col_block_reader_t* r = ray_col_block_file_reader(s->columns[i].file);
-        ray_t* col = ray_col_block_materialize_dom(r, s->cursor, rows,
-            s->options.payload_limit, scratch, scratch_bytes, s->domain);
+        ray_t* col = r->type == RAY_STR ?
+            ray_col_block_materialize_str(r, s->cursor, rows,
+                s->columns[i].payload_bytes, scratch, scratch_bytes) :
+            ray_col_block_materialize_dom(r, s->cursor, rows,
+                s->options.payload_limit, scratch, scratch_bytes, s->domain);
         if (RAY_IS_ERR(col)) { ray_release(batch); batch = col; break; }
         batch = ray_table_add_col(batch, s->columns[i].name, col);
         ray_release(col);

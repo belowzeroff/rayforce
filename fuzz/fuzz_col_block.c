@@ -48,6 +48,22 @@ int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
         put_crc(copy + 84, 0);
         put_crc(copy + 84, ray_crc32(0, copy, RAY_COL_BLOCK_HEADER));
         exercise(copy, size);
+        /* Reach STR length validation even when mutations change raw payloads.
+         * Open first so every offset/length used for CRC repair is bounded. */
+        ray_col_block_reader_t r;
+        if (ray_col_block_open(&r, copy, size) == RAY_OK && r.type == RAY_STR) {
+            for (uint64_t b = 0; b < r.blocks; b++) {
+                uint8_t* e = copy + r.directory + b * RAY_COL_BLOCK_ENTRY;
+                if (e[32]) continue;
+                size_t n = (size_t)(get(e + 24) & UINT32_MAX);
+                uint32_t crc = ray_crc32(0, copy + get(e + 16), n);
+                put_crc(e + 40, crc); put_crc(e + 44, crc);
+            }
+            put_crc(copy + 80, ray_crc32(0, copy + dir, (size_t)blocks * RAY_COL_BLOCK_ENTRY));
+            put_crc(copy + 84, 0);
+            put_crc(copy + 84, ray_crc32(0, copy, RAY_COL_BLOCK_HEADER));
+            exercise(copy, size);
+        }
     }
     free(copy);
     return 0;
