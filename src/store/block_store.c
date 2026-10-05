@@ -1,13 +1,17 @@
 /* Copyright (c) 2026 Anton Kundenko. MIT license; see LICENSE. */
 #include "block_store.h"
 #include "block_scan.h"
+#include "block_sym.h"
 #include "col_block.h"
 #include "col.h"
 #include "splay.h"
 #include "core/types.h"
 #include "mem/heap.h"
 #include "ops/hash.h"
+#include "table/sym.h"
+#include "table/domain.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 static ray_err_t store_preflight(ray_t* table, const ray_block_store_options_t* o,
@@ -25,13 +29,20 @@ static ray_err_t store_preflight(ray_t* table, const ray_block_store_options_t* 
     /* Validation precedes schema allocation as well as any output mutation. */
     for (int64_t i = 0; i < count; i++) {
         ray_t* col = ray_table_get_col_idx(table, i);
-        if (!col || RAY_IS_ERR(col) || col->type < RAY_BOOL || col->type > RAY_GUID)
+        if (!col || RAY_IS_ERR(col) || col->type < RAY_BOOL || col->type > RAY_SYM)
             return RAY_ERR_TYPE;
-        if (col->attrs & ~RAY_ATTR_HAS_NULLS) return RAY_ERR_NYI;
+        uint8_t allowed = RAY_ATTR_HAS_NULLS | (col->type == RAY_SYM ? RAY_SYM_W_MASK : 0);
+        if (col->attrs & ~allowed) return RAY_ERR_NYI;
         if (col->len != rows) return RAY_ERR_LENGTH;
-        unsigned width = ray_elem_size(col->type);
+        unsigned width = col->type == RAY_SYM ? 8 : ray_elem_size(col->type);
         if (o->block_bytes < width || o->block_bytes % width) return RAY_ERR_RANGE;
         if ((uint64_t)rows > SIZE_MAX / width) return RAY_ERR_LIMIT;
+        if (col->type == RAY_SYM) {
+            uint64_t symbols = (uint64_t)ray_sym_domain_count(ray_sym_vec_domain(col));
+            for (int64_t j = 0; j < rows; j++)
+                if ((uint64_t)ray_read_sym(ray_data(col), j, RAY_SYM, col->attrs) >= symbols)
+                    return RAY_ERR_CORRUPT;
+        }
         ray_t* name = ray_sym_str(ray_table_col_name(table, i));
         if (!name || RAY_IS_ERR(name)) return RAY_ERR_DOMAIN;
         size_t len = ray_str_len(name);
@@ -46,6 +57,66 @@ static ray_err_t store_preflight(ray_t* table, const ray_block_store_options_t* 
     if (!schema || RAY_IS_ERR(schema)) { ray_error_free(schema); return RAY_ERR_OOM; }
     *schema_out = schema;
     return RAY_OK;
+}
+
+/* Only the vocabulary grows with the number of distinct symbols. Row codes
+ * are translated one block at a time, never as a whole-column temporary. */
+static ray_err_t store_symbols(ray_t* table, const char* dir, bool durable,
+                                ray_sym_domain_t** out, uint32_t* crc) {
+    ray_sym_domain_t* dom = NULL;
+    char path[1100];
+    snprintf(path, sizeof(path), "%s/.sym", dir);
+    size_t file_bytes = 16; /* STRL header and the reserved empty entry */
+    for (int64_t i = 0; i < ray_table_ncols(table); i++) {
+        ray_t* col = ray_table_get_col_idx(table, i);
+        if (col->type != RAY_SYM) continue;
+        if (!dom) {
+            dom = ray_sym_domain_open_or_create(path);
+            if (!dom) return RAY_ERR_IO;
+            *out = dom;
+            if (ray_sym_domain_intern(dom, "", 0) != 0) return RAY_ERR_OOM;
+        }
+        for (int64_t j = 0; j < col->len; j++) {
+            ray_t* s = ray_sym_vec_cell(col, j);
+            if (!s) return RAY_ERR_OOM;
+            size_t len = ray_str_len(s);
+            if (len > RAY_BLOCK_SYM_MAX_BYTES - 20) return RAY_ERR_LIMIT;
+            int64_t pos = ray_sym_domain_find(dom, ray_str_ptr(s), len);
+            if (pos >= 0) continue;
+            if (len + 4 > RAY_BLOCK_SYM_MAX_BYTES - file_bytes) return RAY_ERR_LIMIT;
+            if (ray_sym_domain_intern(dom, ray_str_ptr(s), len) < 0) return RAY_ERR_OOM;
+            file_bytes += len + 4;
+        }
+    }
+    if (!dom) return RAY_OK;
+    ray_err_t err = ray_sym_domain_flush(dom, durable);
+    uint64_t count;
+    if (!err) err = ray_block_sym_checksum(path, &count, crc);
+    if (!err && count != (uint64_t)ray_sym_domain_count(dom)) err = RAY_ERR_CORRUPT;
+    return err;
+}
+
+static ray_err_t append_symbols(ray_col_block_writer_t* w, ray_t* col,
+                                 ray_sym_domain_t* dom) {
+    if (!col->len) return RAY_OK;
+    uint64_t* codes = malloc(w->block_bytes);
+    if (!codes) return RAY_ERR_OOM;
+    ray_err_t err = RAY_OK;
+    for (int64_t off = 0; !err && off < col->len;) {
+        int64_t n = col->len - off;
+        if (n > w->block_bytes / 8) n = w->block_bytes / 8;
+        for (int64_t j = 0; j < n; j++) {
+            ray_t* s = ray_sym_vec_cell(col, off + j);
+            if (!s) { err = RAY_ERR_OOM; break; }
+            int64_t pos = ray_sym_domain_find(dom, ray_str_ptr(s), ray_str_len(s));
+            if (pos < 0) { err = RAY_ERR_CORRUPT; break; }
+            codes[j] = (uint64_t)pos;
+        }
+        if (!err) err = ray_col_block_append(w, codes, (uint64_t)n);
+        off += n;
+    }
+    free(codes);
+    return err;
 }
 
 static ray_err_t sync_file(const char* path) {
@@ -79,6 +150,9 @@ ray_err_t ray_block_store_save(ray_t* table, const char* root,
     ray_splay_write_t write;
     err = ray_splay_write_begin_staged(root, &write);
     if (err) { ray_release(schema); return err; }
+    ray_sym_domain_t* domain = NULL;
+    uint32_t sym_crc = 0;
+    err = store_symbols(table, write.dir, options->durable, &domain, &sym_crc);
     /* A consistency token shared by these columns, not a globally unique ID.
      * Directory ownership/lease provides the actual snapshot identity. */
     uint64_t token = ray_hash_bytes(write.generation, strlen(write.generation));
@@ -92,8 +166,13 @@ ray_err_t ray_block_store_save(ray_t* table, const char* root,
         if (!f) { err = RAY_ERR_IO; break; }
         ray_t* col = ray_table_get_col_idx(table, i);
         ray_col_block_writer_t w;
-        err = ray_col_block_begin(&w, f, (uint8_t)col->type, options->block_bytes, options->codec, token);
-        if (!err) err = ray_col_block_append(&w, ray_data(col), (uint64_t)col->len);
+        if (col->type == RAY_SYM)
+            err = ray_col_block_begin_sym(&w, f, options->block_bytes, options->codec,
+                token, (uint64_t)ray_sym_domain_count(domain), sym_crc);
+        else err = ray_col_block_begin(&w, f, (uint8_t)col->type,
+            options->block_bytes, options->codec, token);
+        if (!err) err = col->type == RAY_SYM ? append_symbols(&w, col, domain) :
+            ray_col_block_append(&w, ray_data(col), (uint64_t)col->len);
         if (!err) err = ray_col_block_finish(&w);
         else ray_col_block_abort(&w);
         if (fclose(f) && !err) err = RAY_ERR_IO;
@@ -110,5 +189,6 @@ ray_err_t ray_block_store_save(ray_t* table, const char* root,
         }
     }
     ray_release(schema);
+    if (domain) ray_sym_domain_release(domain);
     return ray_splay_write_finish(&write, err, options->durable);
 }
