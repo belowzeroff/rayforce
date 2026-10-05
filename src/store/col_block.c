@@ -8,7 +8,8 @@
 /* All integers are little-endian. Header: compatibility prefix [0,32),
  * magic[32,40), header size@40, block limit@44, block count@48, directory@56,
  * file size@64, generation@72, directory CRC@80, header CRC@84 (zeroed when
- * computing), reserved[88,128). Prefix: major@17, type@18, row count@24.
+ * computing), SYM dictionary count@88, dictionary CRC@96, reserved[100,128).
+ * Dictionary fields must be zero for non-SYM. Prefix: major@17, type@18, row count@24.
  * Entry: row@0, count@8, payload offset@16, stored size@24, decoded size@28,
  * codec@32, encoding@33 (0), reserved[34,40), stored CRC@40, decoded CRC@44,
  * reserved[48,64). Footer: magic[0,8), blocks@8, directory@16, file size@24.
@@ -35,7 +36,7 @@ static unsigned width(uint8_t type) {
     case RAY_BOOL: case RAY_U8: return 1;
     case RAY_I16: return 2;
     case RAY_I32: case RAY_F32: case RAY_DATE: case RAY_TIME: return 4;
-    case RAY_I64: case RAY_F64: case RAY_TIMESTAMP: return 8;
+    case RAY_I64: case RAY_F64: case RAY_TIMESTAMP: case RAY_SYM: return 8;
     case RAY_GUID: return 16;
     default: return 0;
     }
@@ -59,8 +60,11 @@ ray_err_t ray_col_block_open(ray_col_block_reader_t* r, const void* data, size_t
     uint32_t limit = (uint32_t)get_le(h + 44, 4);
     uint64_t rows = get_le(h + 24, 8), blocks = get_le(h + 48, 8);
     uint64_t dir = get_le(h + 56, 8);
+    uint64_t sym_count = get_le(h + 88, 8);
+    uint32_t sym_crc = (uint32_t)get_le(h + 96, 4);
     if (memcmp(h + 32, "RAYHDB2", 8) || !zero(h, 17) ||
-        !zero(h + 19, 5) || !zero(h + 88, 40) ||
+        !zero(h + 19, 5) || !zero(h + 100, 28) ||
+        (h[18] == RAY_SYM ? (!sym_count || sym_count > INT64_MAX) : (sym_count || sym_crc)) ||
         get_le(h + 40, 4) != RAY_COL_BLOCK_HEADER ||
         get_le(h + 84, 4) != header_crc(h) || !w ||
         limit < w || limit > RAY_COL_BLOCK_MAX || limit % w ||
@@ -90,7 +94,7 @@ ray_err_t ray_col_block_open(ray_col_block_reader_t* r, const void* data, size_t
     }
     if (row != rows || offset != dir) return RAY_ERR_CORRUPT;
     *r = (ray_col_block_reader_t){h, size, rows, blocks, dir,
-        get_le(h + 72, 8), limit, h[18]};
+        get_le(h + 72, 8), limit, h[18], sym_count, sym_crc};
     return RAY_OK;
 }
 
@@ -184,7 +188,7 @@ void ray_col_block_abort(ray_col_block_writer_t* w) {
     memset(w, 0, sizeof(*w));
 }
 
-ray_err_t ray_col_block_begin(ray_col_block_writer_t* w, FILE* output,
+static ray_err_t block_begin(ray_col_block_writer_t* w, FILE* output,
                               uint8_t type, uint32_t block_bytes,
                               uint8_t codec, uint64_t generation) {
     if (!w) return RAY_ERR_DOMAIN;
@@ -212,6 +216,30 @@ ray_err_t ray_col_block_begin(ray_col_block_writer_t* w, FILE* output,
     return RAY_OK;
 }
 
+ray_err_t ray_col_block_begin(ray_col_block_writer_t* w, FILE* output,
+                              uint8_t type, uint32_t block_bytes,
+                              uint8_t codec, uint64_t generation) {
+    if (type == RAY_SYM) {
+        if (w) memset(w, 0, sizeof(*w));
+        return RAY_ERR_TYPE;
+    }
+    return block_begin(w, output, type, block_bytes, codec, generation);
+}
+
+ray_err_t ray_col_block_begin_sym(ray_col_block_writer_t* w, FILE* output,
+                                  uint32_t block_bytes, uint8_t codec,
+                                  uint64_t generation, uint64_t sym_count,
+                                  uint32_t sym_crc) {
+    if (!w) return RAY_ERR_DOMAIN;
+    if (!sym_count || sym_count > INT64_MAX) {
+        memset(w, 0, sizeof(*w));
+        return RAY_ERR_RANGE;
+    }
+    ray_err_t err = block_begin(w, output, RAY_SYM, block_bytes, codec, generation);
+    if (!err) { w->sym_count = sym_count; w->sym_crc = sym_crc; }
+    return err;
+}
+
 ray_err_t ray_col_block_append(ray_col_block_writer_t* w, const void* values, uint64_t rows) {
     if (!w || !w->output) return RAY_ERR_DOMAIN;
     if (w->error) return w->error;
@@ -220,6 +248,10 @@ ray_err_t ray_col_block_append(ray_col_block_writer_t* w, const void* values, ui
     if ((!values && rows) || rows > (uint64_t)INT64_MAX - w->rows || rows > SIZE_MAX / esz)
         return w->error = RAY_ERR_RANGE;
     const uint8_t* p = values;
+    if (w->type == RAY_SYM) {
+        for (uint64_t i = 0; i < rows; i++)
+            if (get_le(p + i * 8, 8) >= w->sym_count) return w->error = RAY_ERR_CORRUPT;
+    }
     while (rows) {
         uint64_t count = rows < w->block_bytes / esz ? rows : w->block_bytes / esz;
         size_t bytes = (size_t)count * esz, stored = bytes;
@@ -277,6 +309,7 @@ ray_err_t ray_col_block_finish(ray_col_block_writer_t* w) {
     put_le(header + 44, w->block_bytes, 4); put_le(header + 48, w->blocks, 8);
     put_le(header + 56, w->offset, 8); put_le(header + 64, size, 8);
     put_le(header + 72, w->generation, 8); put_le(header + 80, crc, 4);
+    put_le(header + 88, w->sym_count, 8); put_le(header + 96, w->sym_crc, 4);
     put_le(header + 84, header_crc(header), 4);
     if (!err && (fwrite(footer, 1, sizeof(footer), w->output) != sizeof(footer) ||
         fseek(w->output, 0, SEEK_SET) ||
