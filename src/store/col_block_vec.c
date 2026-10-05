@@ -1,6 +1,7 @@
 /* Copyright (c) 2026 Anton Kundenko. MIT license; see LICENSE. */
 #include "col_block.h"
 #include "mem/heap.h"
+#include "table/domain.h"
 #include <stdlib.h>
 
 static ray_t* block_error(ray_err_t err) {
@@ -17,25 +18,50 @@ static ray_t* block_error(ray_err_t err) {
     }
 }
 
-ray_t* ray_col_block_materialize(const ray_col_block_reader_t* r,
+ray_t* ray_col_block_materialize_dom(const ray_col_block_reader_t* r,
                                 uint64_t start, uint64_t count,
                                 size_t payload_limit, void* scratch,
-                                size_t scratch_capacity) {
+                                size_t scratch_capacity, ray_sym_domain_t* domain) {
+    if (!r) return block_error(RAY_ERR_DOMAIN);
+    if (r->type == RAY_SYM && (!domain ||
+        domain == ray_sym_runtime_domain())) return block_error(RAY_ERR_DOMAIN);
+    if (r->type == RAY_SYM &&
+        (uint64_t)ray_sym_domain_count(domain) != r->sym_count) return block_error(RAY_ERR_CORRUPT);
     size_t bytes, needed;
     ray_err_t err = ray_col_block_range_size(r, start, count, &bytes, &needed);
     if (err) return block_error(err);
     if (bytes > payload_limit || needed > scratch_capacity) return block_error(RAY_ERR_LIMIT);
     if (needed && !scratch) return block_error(RAY_ERR_DOMAIN);
-    ray_t* result = ray_vec_new((int8_t)r->type, (int64_t)count);
+    ray_t* result = r->type == RAY_SYM ? ray_sym_vec_new(RAY_SYM_W64, (int64_t)count) :
+        ray_vec_new((int8_t)r->type, (int64_t)count);
+    if (!result) return block_error(RAY_ERR_OOM);
     if (RAY_IS_ERR(result)) return result;
     err = ray_col_block_read_range(r, start, count, ray_data(result), bytes, scratch, scratch_capacity);
     if (err) { ray_release(result); return block_error(err); }
     result->len = (int64_t)count;
+    if (r->type == RAY_SYM) {
+        const uint64_t* positions = ray_data(result);
+        for (uint64_t i = 0; i < count; i++) {
+            if (positions[i] >= r->sym_count) {
+                ray_release(result); return block_error(RAY_ERR_CORRUPT);
+            }
+        }
+        result->sym_domain = domain;
+        ray_sym_domain_retain(domain);
+    }
     /* A conservative null hint is safe; omitting it hides integer/GUID nulls.
      * BOOL/U8 cannot carry nulls. No persisted indexes or sorted hints exist. */
     if (count && r->type != RAY_BOOL && r->type != RAY_U8)
         result->attrs |= RAY_ATTR_HAS_NULLS;
     return result;
+}
+
+ray_t* ray_col_block_materialize(const ray_col_block_reader_t* r,
+                                uint64_t start, uint64_t count,
+                                size_t payload_limit, void* scratch,
+                                size_t scratch_capacity) {
+    return ray_col_block_materialize_dom(r, start, count, payload_limit,
+                                         scratch, scratch_capacity, NULL);
 }
 
 ray_t* ray_col_block_load_range(const char* path, uint64_t start, uint64_t count,

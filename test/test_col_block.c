@@ -7,6 +7,7 @@
 #include "mem/heap.h"
 #include "mem/sys.h"
 #include "table/sym.h"
+#include "table/domain.h"
 #include <stdlib.h>
 #include <unistd.h>
 
@@ -399,7 +400,59 @@ static test_result_t file_errors(void) {
     PASS();
 }
 
+static test_result_t symbols(void) {
+    ray_sym_domain_t* dom = ray_sym_domain_new();
+    TEST_ASSERT_NOT_NULL(dom);
+    TEST_ASSERT_EQ_I(ray_sym_domain_intern(dom, "value", 5), 1);
+    uint64_t values[24];
+    for (unsigned i = 0; i < 24; i++) values[i] = i % 3 ? 1 : 0;
+    uint8_t scratch[64];
+    ray_col_block_reader_t r;
+    TEST_ASSERT_EQ_I(ray_col_block_begin_sym(&writer, file, 64, 1, 7, 0, 99), RAY_ERR_RANGE);
+    for (uint8_t codec = 0; codec <= 1; codec++) {
+        reset_file();
+        TEST_ASSERT_EQ_I(ray_col_block_begin_sym(&writer, file, 64, codec, 7, 2, 99), RAY_OK);
+        TEST_ASSERT_EQ_I(ray_col_block_append(&writer, values, 24), RAY_OK);
+        TEST_ASSERT_EQ_I(ray_col_block_finish(&writer), RAY_OK);
+        snapshot();
+        TEST_ASSERT_EQ_I(ray_col_block_open(&r, bytes, file_size), RAY_OK);
+        TEST_ASSERT_EQ_I(r.sym_count, 2); TEST_ASSERT_EQ_I(r.sym_crc, 99);
+        ray_t* v = ray_col_block_materialize(&r, 2, 13, 104, scratch, 64);
+        TEST_ASSERT_TRUE(RAY_IS_ERR(v)); TEST_ASSERT_STR_EQ(ray_err_code(v), "domain"); ray_release(v);
+        v = ray_col_block_materialize_dom(&r, 2, 13, 104, scratch, 64, dom);
+        TEST_ASSERT_NOT_NULL(v); TEST_ASSERT_FALSE(RAY_IS_ERR(v));
+        TEST_ASSERT_TRUE(ray_sym_vec_domain(v) == dom);
+        TEST_ASSERT_EQ_I(v->attrs & RAY_SYM_W_MASK, RAY_SYM_W64);
+        for (int64_t i = 0; i < v->len; i++) {
+            TEST_ASSERT_EQ_I(ray_read_sym(ray_data(v), i, RAY_SYM, v->attrs), values[i + 2]);
+            TEST_ASSERT_EQ_I(ray_str_len(ray_sym_vec_cell(v, i)), values[i + 2] ? 5 : 0);
+        }
+        ray_release(v);
+        /* Metadata must bind a nonempty vocabulary even for an empty range. */
+        memcpy(copy, bytes, file_size); put(copy + 88, 0, 8); rechecksum(copy);
+        TEST_ASSERT_EQ_I(ray_col_block_open(&r, copy, file_size), RAY_ERR_CORRUPT);
+        if (!codec) {
+            /* Valid CRCs cannot make an out-of-domain cell safe to materialize. */
+            memcpy(copy, bytes, file_size); put(copy + RAY_COL_BLOCK_HEADER, 2, 8);
+            uint8_t* e = copy + get(copy + 56, 8);
+            uint32_t crc = ray_crc32(0, copy + RAY_COL_BLOCK_HEADER, 64);
+            put(e + 40, crc, 4); put(e + 44, crc, 4); rechecksum(copy);
+            TEST_ASSERT_EQ_I(ray_col_block_open(&r, copy, file_size), RAY_OK);
+            v = ray_col_block_materialize_dom(&r, 0, 8, 64, NULL, 0, dom);
+            TEST_ASSERT_TRUE(RAY_IS_ERR(v)); TEST_ASSERT_STR_EQ(ray_err_code(v), "corrupt"); ray_release(v);
+        }
+    }
+    reset_file();
+    TEST_ASSERT_EQ_I(ray_col_block_begin_sym(&writer, file, 64, 1, 7, 2, 99), RAY_OK);
+    values[0] = UINT64_MAX;
+    TEST_ASSERT_EQ_I(ray_col_block_append(&writer, values, 24), RAY_ERR_CORRUPT);
+    TEST_ASSERT_EQ_I(ray_col_block_finish(&writer), RAY_ERR_CORRUPT);
+    ray_sym_domain_release(dom);
+    PASS();
+}
+
 const test_entry_t col_block_entries[] = {
+    {"col_block/symbols", symbols, setup, teardown},
     {"col_block/roundtrip", roundtrip, setup, teardown},
     {"col_block/empty_and_bounds", empty_and_bounds, setup, teardown},
     {"col_block/corruption", corruption, setup, teardown},

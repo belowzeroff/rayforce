@@ -10,7 +10,9 @@
 #define RAY_COL_BLOCK_ENTRY 64u
 #define RAY_COL_BLOCK_FOOTER 32u
 
-/* Experimental major-2 fixed-width container. No attrs, SYM/STR or indexes.
+/* Experimental major-2 fixed-width container. No attrs, STR or indexes.
+ * SYM payloads are uint64 positions in a generation-local dictionary, bound
+ * by count and file CRC. They are never process-local symbol identifiers.
  * Payload is little-endian; callers supply native values on little-endian
  * hosts only. The mapped bytes must remain immutable and alive until the
  * reader is discarded. Opening checks all metadata, not payload CRCs. */
@@ -20,6 +22,8 @@ typedef struct {
     uint64_t rows, blocks, directory, generation;
     uint32_t block_bytes;
     uint8_t type;
+    uint64_t sym_count;
+    uint32_t sym_crc;
 } ray_col_block_reader_t;
 
 ray_err_t ray_col_block_open(ray_col_block_reader_t* reader,
@@ -51,6 +55,15 @@ ray_t* ray_col_block_materialize(const ray_col_block_reader_t* reader,
                                 uint64_t start, uint64_t count,
                                 size_t payload_limit, void* scratch,
                                 size_t scratch_capacity);
+/* SYM requires an explicitly supplied dictionary already verified against
+ * sym_crc by the caller. Decoded positions are bounds checked. Output retains
+ * the domain; its vocabulary allocation is outside the batch payload budget.
+ * The ordinary materialize/load_range APIs reject SYM without a domain. */
+ray_t* ray_col_block_materialize_dom(const ray_col_block_reader_t* reader,
+                                    uint64_t start, uint64_t count,
+                                    size_t payload_limit, void* scratch,
+                                    size_t scratch_capacity,
+                                    struct ray_sym_domain_s* domain);
 
 /* Owning file handle. Open requires *out == NULL; failures leave it NULL.
  * Close clears the caller's pointer and accepts NULL. The borrowed reader is
@@ -78,6 +91,8 @@ typedef struct {
     uint32_t block_bytes;
     uint8_t type, codec;
     ray_err_t error;
+    uint64_t sym_count;
+    uint32_t sym_crc;
 } ray_col_block_writer_t;
 
 /* output must be a new, empty, seekable binary file. Caller owns output and
@@ -91,6 +106,12 @@ typedef struct {
 ray_err_t ray_col_block_begin(ray_col_block_writer_t* writer, FILE* output,
                               uint8_t type, uint32_t block_bytes,
                               uint8_t codec, uint64_t generation);
+/* SYM-only variant; count includes the reserved empty symbol at position 0.
+ * Dictionary bytes must be persisted before publishing the column. */
+ray_err_t ray_col_block_begin_sym(ray_col_block_writer_t* writer, FILE* output,
+                                  uint32_t block_bytes, uint8_t codec,
+                                  uint64_t generation, uint64_t sym_count,
+                                  uint32_t sym_crc);
 ray_err_t ray_col_block_append(ray_col_block_writer_t* writer,
                                const void* values, uint64_t rows);
 ray_err_t ray_col_block_finish(ray_col_block_writer_t* writer);

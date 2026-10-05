@@ -3,12 +3,14 @@
 #include "test.h"
 #include "store/block_scan.h"
 #include "store/block_store.h"
+#include "store/block_sym.h"
 #include "store/col_block.h"
 #include "store/col.h"
 #include "store/splay.h"
 #include "mem/heap.h"
 #include "mem/sys.h"
 #include "table/sym.h"
+#include "table/domain.h"
 #include <stdlib.h>
 #include <unistd.h>
 
@@ -448,7 +450,140 @@ static test_result_t store_rollback(void) {
     PASS();
 }
 
+/* Reversed local dictionaries deliberately give equal strings different IDs. */
+static ray_t* symbol_table(uint8_t width, unsigned rows) {
+    ray_t* table = store_table(1, rows);
+    ray_sym_domain_t* dom = ray_sym_domain_new();
+    if (!dom || ray_sym_domain_intern(dom, "beta", 4) != 1 ||
+        ray_sym_domain_intern(dom, "alpha", 5) != 2) ray_test_fatal("symbol fixture domain");
+    const char* text[] = {"", "alpha", "beta"};
+    for (unsigned c = 0; c < 2; c++) {
+        ray_t* v = ray_sym_vec_new(width, rows);
+        if (!v || RAY_IS_ERR(v)) ray_test_fatal("symbol fixture vector");
+        if (c) { v->sym_domain = dom; ray_sym_domain_retain(dom); }
+        for (unsigned i = 0; i < rows; i++) {
+            unsigned which = i % 3;
+            int64_t pos = c ? (which ? 3 - which : 0) : ray_sym_intern(text[which], strlen(text[which]));
+            ray_write_sym(ray_data(v), i, (uint64_t)pos, RAY_SYM, width);
+        }
+        v->len = rows; v->attrs |= RAY_ATTR_HAS_NULLS;
+        table = ray_table_add_col(table, ray_sym_intern(c ? "local" : "global", c ? 5 : 6), v);
+        ray_release(v);
+        if (!table || RAY_IS_ERR(table)) ray_test_fatal("symbol fixture table");
+    }
+    ray_sym_domain_release(dom);
+    return table;
+}
+
+static test_result_t store_symbols(void) {
+    const char* projection[] = {"global", "local", "x"};
+    const char* text[] = {"", "alpha", "beta"};
+    ray_block_store_options_t options = {64, 1, true};
+    ray_block_scan_options_t read = {1, 15, 5, 120, 64};
+    for (uint8_t width = RAY_SYM_W8; width <= RAY_SYM_W64; width++) {
+        ray_t* table = symbol_table(width, 16);
+        options.codec = width % 2;
+        TEST_ASSERT_EQ_I(ray_block_store_save(table, root, &options), RAY_OK); ray_release(table);
+        TEST_ASSERT_EQ_I(ray_block_scan_open(root, projection, 3, &read, &scan), RAY_OK);
+        ray_t* schema = ray_block_scan_schema(scan);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(schema));
+        TEST_ASSERT_EQ_I(ray_table_get_col_idx(schema, 0)->type, RAY_SYM);
+        TEST_ASSERT_EQ_I(ray_table_nrows(schema), 0); ray_release(schema);
+        unsigned row = 1;
+        ray_t* batch;
+        while ((batch = ray_block_scan_next(scan))) {
+            TEST_ASSERT_FALSE(RAY_IS_ERR(batch));
+            ray_t* a = ray_table_get_col_idx(batch, 0);
+            ray_t* b = ray_table_get_col_idx(batch, 1);
+            TEST_ASSERT_TRUE(ray_sym_vec_domain(a) == ray_sym_vec_domain(b));
+            TEST_ASSERT_TRUE(ray_sym_vec_domain(a) != ray_sym_runtime_domain());
+            for (int64_t j = 0; j < a->len; j++) {
+                const char* expected = text[(row + j) % 3];
+                ray_t* sa = ray_sym_vec_cell(a, j); ray_t* sb = ray_sym_vec_cell(b, j);
+                TEST_ASSERT_NOT_NULL(sa); TEST_ASSERT_NOT_NULL(sb);
+                TEST_ASSERT_EQ_I(ray_str_len(sa), strlen(expected));
+                TEST_ASSERT_TRUE(!memcmp(ray_str_ptr(sa), expected, strlen(expected)));
+                TEST_ASSERT_TRUE(sa == sb);
+                TEST_ASSERT_EQ_I(ray_vec_is_null(a, j), (row + j) % 3 == 0);
+            }
+            row += (unsigned)a->len; ray_release(batch);
+        }
+        TEST_ASSERT_EQ_I(row, 16); ray_block_scan_close(&scan);
+    }
+    /* Release all inputs, then rebuild runtime IDs in a different order. */
+    ray_sym_destroy(); ray_sym_init();
+    TEST_ASSERT_TRUE(ray_sym_intern("unrelated", 9) >= 0);
+    TEST_ASSERT_TRUE(ray_sym_intern("beta", 4) >= 0);
+    TEST_ASSERT_EQ_I(ray_block_scan_open(root, projection, 3, &read, &scan), RAY_OK);
+    ray_t* retained = ray_block_scan_next(scan);
+    TEST_ASSERT_NOT_NULL(retained); TEST_ASSERT_FALSE(RAY_IS_ERR(retained));
+    ray_block_scan_close(&scan);
+    char pinned[1024]; TEST_ASSERT_EQ_I(ray_splay_resolve_dir(root, pinned, sizeof(pinned)), RAY_OK);
+    for (unsigned i = 0; i < 3; i++) {
+        ray_t* replacement = store_table(i, 0);
+        TEST_ASSERT_EQ_I(ray_block_store_save(replacement, root, &options), RAY_OK); ray_release(replacement);
+    }
+    TEST_ASSERT_EQ_I(access(pinned, F_OK), -1);
+    ray_t* v = ray_table_get_col_idx(retained, 0);
+    ray_t* s = ray_sym_vec_cell(v, 0);
+    TEST_ASSERT_EQ_I(ray_str_len(s), 5); TEST_ASSERT_TRUE(!memcmp(ray_str_ptr(s), "alpha", 5));
+    char other[128]; snprintf(other, sizeof(other), "%s/resave", root);
+    TEST_ASSERT_EQ_I(ray_block_store_save(retained, other, &options), RAY_OK);
+    ray_release(retained);
+    read.start = 0; read.count = UINT64_MAX;
+    ray_t* empty = symbol_table(RAY_SYM_W8, 0);
+    TEST_ASSERT_EQ_I(ray_block_store_save(empty, root, &options), RAY_OK); ray_release(empty);
+    TEST_ASSERT_EQ_I(ray_block_scan_open(root, projection, 3, &read, &scan), RAY_OK);
+    TEST_ASSERT_TRUE(ray_block_scan_next(scan) == NULL); ray_block_scan_close(&scan);
+    PASS();
+}
+
+static test_result_t symbol_failures(void) {
+    const char* projection[] = {"global", "local"};
+    ray_block_store_options_t options = {64, 1, false};
+    ray_block_scan_options_t read = {0, UINT64_MAX, 5, 80, 64};
+    ray_t* table = symbol_table(RAY_SYM_W64, 16);
+    ray_t* col = ray_table_get_col_idx(table, 2);
+    ((uint64_t*)ray_data(col))[0] = UINT64_MAX;
+    char target[128]; snprintf(target, sizeof(target), "%s/invalid", root);
+    TEST_ASSERT_EQ_I(ray_block_store_save(table, target, &options), RAY_ERR_CORRUPT);
+    TEST_ASSERT_EQ_I(access(target, F_OK), -1);
+    ((uint64_t*)ray_data(col))[0] = 0;
+    TEST_ASSERT_EQ_I(ray_block_store_save(table, root, &options), RAY_OK); ray_release(table);
+    int64_t baseline = mapped();
+    read.payload_limit--;
+    TEST_ASSERT_EQ_I(ray_block_scan_open(root, projection, 2, &read, &scan), RAY_OK);
+    ray_t* error = ray_block_scan_next(scan);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(error)); TEST_ASSERT_STR_EQ(ray_err_code(error), "limit"); ray_release(error);
+    ray_block_scan_close(&scan); TEST_ASSERT_EQ_I(mapped(), baseline); read.payload_limit++;
+    damage(".sym", 20);
+    TEST_ASSERT_EQ_I(ray_block_scan_open(root, projection, 2, &read, &scan), RAY_ERR_CORRUPT);
+    TEST_ASSERT_TRUE(scan == NULL); TEST_ASSERT_EQ_I(mapped(), baseline);
+    /* A numeric projection is independent of an unselected symbol dictionary. */
+    TEST_ASSERT_EQ_I(ray_block_scan_open(root, names, 1, &read, &scan), RAY_OK);
+    ray_block_scan_close(&scan);
+    char dir[1024], path[1100];
+    TEST_ASSERT_EQ_I(ray_splay_resolve_dir(root, dir, sizeof(dir)), RAY_OK);
+    snprintf(path, sizeof(path), "%s/.sym", dir);
+    FILE* f = fopen(path, "r+b"); TEST_ASSERT_NOT_NULL(f);
+    TEST_ASSERT_EQ_I(fseek(f, 4, SEEK_SET), 0);
+    uint64_t forged_count = UINT64_MAX, checked_count;
+    uint32_t checked_crc;
+    TEST_ASSERT_EQ_I(fwrite(&forged_count, 8, 1, f), 1);
+    TEST_ASSERT_EQ_I(fflush(f), 0);
+    TEST_ASSERT_EQ_I(ray_block_sym_checksum(path, &checked_count, &checked_crc), RAY_ERR_CORRUPT);
+    int truncated = ftruncate(fileno(f), RAY_BLOCK_SYM_MAX_BYTES + 1);
+    TEST_ASSERT_EQ_I(fclose(f), 0); TEST_ASSERT_EQ_I(truncated, 0);
+    TEST_ASSERT_EQ_I(ray_block_scan_open(root, projection, 2, &read, &scan), RAY_ERR_LIMIT);
+    TEST_ASSERT_EQ_I(unlink(path), 0);
+    TEST_ASSERT_EQ_I(ray_block_scan_open(root, projection, 2, &read, &scan), RAY_ERR_IO);
+    TEST_ASSERT_TRUE(scan == NULL); TEST_ASSERT_EQ_I(mapped(), baseline);
+    PASS();
+}
+
 const test_entry_t block_scan_entries[] = {
+    {"block_scan/store_symbols", store_symbols, setup, teardown},
+    {"block_scan/symbol_failures", symbol_failures, setup, teardown},
     {"block_scan/batches", batches, setup, teardown},
     {"block_scan/failures", failures, setup, teardown},
     {"block_scan/projection", projection, setup, teardown},

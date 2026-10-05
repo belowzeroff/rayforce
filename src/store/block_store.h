@@ -10,8 +10,11 @@ typedef struct {
 } ray_block_store_options_t;
 
 /* Explicit whole-table major-2 save; existing save APIs remain raw.
- * Accepts rectangular, nonempty-schema tables with BOOL..GUID columns only.
- * Rejects column attrs except HAS_NULLS (including views/indexes/links/sorted)
+ * Accepts rectangular, nonempty-schema tables with BOOL..SYM columns only.
+ * SYM is re-encoded as uint64 positions over an immutable generation-local
+ * .sym dictionary (STRL), capped at 64 MiB on disk. Vocabulary memory grows
+ * with distinct symbols; row translation uses one block of extra scratch.
+ * Rejects column attrs except HAS_NULLS and SYM width bits (views/indexes/links/sorted)
  * rather than silently dropping metadata. Input must remain unchanged during
  * the call. Options/types/names/shape are checked before filesystem mutation.
  * Always stages, including first save; .current is the publication point.

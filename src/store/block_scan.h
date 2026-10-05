@@ -19,10 +19,14 @@ typedef struct {
  * is limited to 1 MiB on disk, 1024 entries, and 255 bytes per name. Selected
  * columns must have equal row
  * counts and generation tokens. Acquires a generation lease before mapping.
+ * SYM uses the generation's .sym vocabulary, verified by count and CRC before
+ * attaching its retained domain to each output vector. Selected SYM columns
+ * must reference the same dictionary; numeric-only projections do not open it.
  * Requires initialized runtime heap/symbol table. *out must initially be NULL.
  * Names are interned; caller may discard options/name strings after open.
  * Limits cover logical payload of one batch and temporary decode scratch,
- * not mapping/metadata/allocator overhead or batches retained by the caller. */
+ * not mapping/metadata/allocator overhead, symbol vocabulary, or retained batches.
+ * The dictionary file is capped at 64 MiB; this is not a vocabulary heap cap. */
 ray_err_t ray_block_scan_open(const char* root, const char* const* columns,
                               size_t count, const ray_block_scan_options_t* options,
                               ray_block_scan_t** out);
