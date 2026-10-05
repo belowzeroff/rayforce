@@ -13,7 +13,7 @@ typedef struct {
     size_t payload_limit, scratch_limit;
 } ray_block_scan_options_t;
 
-/* Internal fixed-width major-2 named-column scan, not yet a query source.
+/* Internal major-2 named-column scan, not yet a query source.
  * Explicit projection: 1..1024 unique, safe column filenames declared by .d.
  * Validates the complete name schema but not unselected column files. Schema
  * is limited to 1 MiB on disk, 1024 entries, and 255 bytes per name. Selected
@@ -25,6 +25,8 @@ typedef struct {
  * Requires initialized runtime heap/symbol table. *out must initially be NULL.
  * Names are interned; caller may discard options/name strings after open.
  * Limits cover logical payload of one batch and temporary decode scratch,
+ * including STR descriptors and pooled bytes. STR decodes selected blocks
+ * twice: once to validate/size the whole batch, once to fill owned output.
  * not mapping/metadata/allocator overhead, symbol vocabulary, or retained batches.
  * The dictionary file is capped at 64 MiB; this is not a vocabulary heap cap. */
 ray_err_t ray_block_scan_open(const char* root, const char* const* columns,

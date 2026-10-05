@@ -29,13 +29,20 @@ static ray_err_t store_preflight(ray_t* table, const ray_block_store_options_t* 
     /* Validation precedes schema allocation as well as any output mutation. */
     for (int64_t i = 0; i < count; i++) {
         ray_t* col = ray_table_get_col_idx(table, i);
-        if (!col || RAY_IS_ERR(col) || col->type < RAY_BOOL || col->type > RAY_SYM)
+        if (!col || RAY_IS_ERR(col) || col->type < RAY_BOOL || col->type > RAY_STR)
             return RAY_ERR_TYPE;
         uint8_t allowed = RAY_ATTR_HAS_NULLS | (col->type == RAY_SYM ? RAY_SYM_W_MASK : 0);
         if (col->attrs & ~allowed) return RAY_ERR_NYI;
         if (col->len != rows) return RAY_ERR_LENGTH;
-        unsigned width = col->type == RAY_SYM ? 8 : ray_elem_size(col->type);
-        if (o->block_bytes < width || o->block_bytes % width) return RAY_ERR_RANGE;
+        unsigned width = col->type == RAY_STR ? 16 : col->type == RAY_SYM ? 8 : ray_elem_size(col->type);
+        if (col->type == RAY_STR) {
+            if (o->block_bytes < 4) return RAY_ERR_RANGE;
+            for (int64_t j = 0; j < rows; j++) {
+                size_t len;
+                if (!ray_str_vec_get(col, j, &len)) return RAY_ERR_CORRUPT;
+                if (len > o->block_bytes - 4) return RAY_ERR_RANGE;
+            }
+        } else if (o->block_bytes < width || o->block_bytes % width) return RAY_ERR_RANGE;
         if ((uint64_t)rows > SIZE_MAX / width) return RAY_ERR_LIMIT;
         if (col->type == RAY_SYM) {
             uint64_t symbols = (uint64_t)ray_sym_domain_count(ray_sym_vec_domain(col));
@@ -171,8 +178,11 @@ ray_err_t ray_block_store_save(ray_t* table, const char* root,
                 token, (uint64_t)ray_sym_domain_count(domain), sym_crc);
         else err = ray_col_block_begin(&w, f, (uint8_t)col->type,
             options->block_bytes, options->codec, token);
-        if (!err) err = col->type == RAY_SYM ? append_symbols(&w, col, domain) :
-            ray_col_block_append(&w, ray_data(col), (uint64_t)col->len);
+        if (!err) {
+            if (col->type == RAY_STR) err = ray_col_block_append_str_vec(&w, col);
+            else if (col->type == RAY_SYM) err = append_symbols(&w, col, domain);
+            else err = ray_col_block_append(&w, ray_data(col), (uint64_t)col->len);
+        }
         if (!err) err = ray_col_block_finish(&w);
         else ray_col_block_abort(&w);
         if (fclose(f) && !err) err = RAY_ERR_IO;
