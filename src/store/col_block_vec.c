@@ -32,6 +32,12 @@ ray_t* ray_col_block_materialize_dom(const ray_col_block_reader_t* r,
     if (err) return block_error(err);
     if (bytes > payload_limit || needed > scratch_capacity) return block_error(RAY_ERR_LIMIT);
     if (needed && !scratch) return block_error(RAY_ERR_DOMAIN);
+    if (r->type == RAY_STR) {
+        err = ray_col_block_payload_size(r, start, count, scratch, scratch_capacity, &bytes);
+        if (err) return block_error(err);
+        if (bytes > payload_limit) return block_error(RAY_ERR_LIMIT);
+        return ray_col_block_materialize_str(r, start, count, bytes, scratch, scratch_capacity);
+    }
     ray_t* result = r->type == RAY_SYM ? ray_sym_vec_new(RAY_SYM_W64, (int64_t)count) :
         ray_vec_new((int8_t)r->type, (int64_t)count);
     if (!result) return block_error(RAY_ERR_OOM);

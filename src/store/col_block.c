@@ -11,7 +11,7 @@
  * computing), SYM dictionary count@88, dictionary CRC@96, reserved[100,128).
  * Dictionary fields must be zero for non-SYM. Prefix: major@17, type@18, row count@24.
  * Entry: row@0, count@8, payload offset@16, stored size@24, decoded size@28,
- * codec@32, encoding@33 (0), reserved[34,40), stored CRC@40, decoded CRC@44,
+ * codec@32, encoding@33 (0 fixed, 1 STR lengths/bytes), reserved[34,40), stored CRC@40, decoded CRC@44,
  * reserved[48,64). Footer: magic[0,8), blocks@8, directory@16, file size@24.
  * Regions are canonical and contiguous: header, blocks, directory, footer.
  * Empty columns have no blocks. Reserved bytes MUST be zero. */
@@ -56,7 +56,8 @@ ray_err_t ray_col_block_open(ray_col_block_reader_t* r, const void* data, size_t
     if (h[17] != 2) return RAY_ERR_VERSION;
     if (size < RAY_COL_BLOCK_HEADER + RAY_COL_BLOCK_FOOTER) return RAY_ERR_CORRUPT;
     if (!little_endian()) return RAY_ERR_NYI;
-    unsigned w = width(h[18]);
+    bool strings = h[18] == RAY_STR;
+    unsigned w = strings ? 4 : width(h[18]);
     uint32_t limit = (uint32_t)get_le(h + 44, 4);
     uint64_t rows = get_le(h + 24, 8), blocks = get_le(h + 48, 8);
     uint64_t dir = get_le(h + 56, 8);
@@ -67,7 +68,7 @@ ray_err_t ray_col_block_open(ray_col_block_reader_t* r, const void* data, size_t
         (h[18] == RAY_SYM ? (!sym_count || sym_count > INT64_MAX) : (sym_count || sym_crc)) ||
         get_le(h + 40, 4) != RAY_COL_BLOCK_HEADER ||
         get_le(h + 84, 4) != header_crc(h) || !w ||
-        limit < w || limit > RAY_COL_BLOCK_MAX || limit % w ||
+        limit < w || limit > RAY_COL_BLOCK_MAX || (!strings && limit % w) ||
         rows > INT64_MAX || get_le(h + 64, 8) != size ||
         dir < RAY_COL_BLOCK_HEADER || dir > size - RAY_COL_BLOCK_FOOTER ||
         blocks > (size - RAY_COL_BLOCK_FOOTER - dir) / RAY_COL_BLOCK_ENTRY ||
@@ -85,9 +86,11 @@ ray_err_t ray_col_block_open(ray_col_block_reader_t* r, const void* data, size_t
         uint32_t stored = (uint32_t)get_le(e + 24, 4);
         uint32_t decoded = (uint32_t)get_le(e + 28, 4);
         if (get_le(e, 8) != row || !count || count > (rows - row) ||
-            count > limit / w || decoded != count * w ||
+            (strings ? (decoded > limit || count > decoded / 4) :
+                (count > limit / w || decoded != count * w)) ||
             get_le(e + 16, 8) != offset || !stored || stored > dir - offset ||
-            e[32] > 1 || !zero(e + 33, 7) || !zero(e + 48, 16) ||
+            e[32] > 1 || e[33] != (strings ? 1 : 0) ||
+            !zero(e + 34, 6) || !zero(e + 48, 16) ||
             (e[32] == 0 ? stored != decoded : stored >= decoded))
             return RAY_ERR_CORRUPT;
         row += count; offset += stored;
@@ -96,6 +99,19 @@ ray_err_t ray_col_block_open(ray_col_block_reader_t* r, const void* data, size_t
     *r = (ray_col_block_reader_t){h, size, rows, blocks, dir,
         get_le(h + 72, 8), limit, h[18], sym_count, sym_crc};
     return RAY_OK;
+}
+
+static bool strings_valid(const uint8_t* data, size_t size, uint64_t rows) {
+    if (rows > size / 4) return false;
+    size_t offset = 0;
+    for (uint64_t i = 0; i < rows; i++) {
+        if (size - offset < 4) return false;
+        uint32_t len = (uint32_t)get_le(data + offset, 4);
+        offset += 4;
+        if (len > size - offset) return false;
+        offset += len;
+    }
+    return offset == size;
 }
 
 ray_err_t ray_col_block_read(const ray_col_block_reader_t* r, uint64_t block,
@@ -111,6 +127,8 @@ ray_err_t ray_col_block_read(const ray_col_block_reader_t* r, uint64_t block,
     if (!e[32]) memcpy(output, payload, decoded);
     else if (!ray_snappy_decompress(payload, stored, output, decoded)) return RAY_ERR_CORRUPT;
     if (ray_crc32(0, output, decoded) != get_le(e + 44, 4)) return RAY_ERR_CORRUPT;
+    if (r->type == RAY_STR && !strings_valid(output, decoded, get_le(e + 8, 8)))
+        return RAY_ERR_CORRUPT;
     *row_start = get_le(e, 8); *row_count = get_le(e + 8, 8);
     return RAY_OK;
 }
@@ -127,16 +145,33 @@ static uint64_t block_for_row(const ray_col_block_reader_t* r, uint64_t row) {
     return lo - 1;
 }
 
+ray_err_t ray_col_block_range_blocks(const ray_col_block_reader_t* r,
+                                    uint64_t start, uint64_t count,
+                                    uint64_t* first, uint64_t* end) {
+    if (!r || !r->data || !first || !end) return RAY_ERR_DOMAIN;
+    if (start > r->rows || count > r->rows - start) return RAY_ERR_RANGE;
+    *first = count ? block_for_row(r, start) : 0;
+    *end = count ? block_for_row(r, start + count - 1) + 1 : 0;
+    return RAY_OK;
+}
+
 ray_err_t ray_col_block_range_size(const ray_col_block_reader_t* r,
                                   uint64_t start, uint64_t count,
                                   size_t* output_bytes, size_t* scratch_bytes) {
     if (!r || !r->data || !output_bytes || !scratch_bytes) return RAY_ERR_DOMAIN;
-    unsigned esz = width(r->type);
+    unsigned esz = r->type == RAY_STR ? 16 : width(r->type);
     if (!esz) return RAY_ERR_TYPE;
     if (start > r->rows || count > r->rows - start) return RAY_ERR_RANGE;
     if (count > SIZE_MAX / esz) return RAY_ERR_LIMIT;
     size_t scratch = 0;
-    if (count) {
+    if (count && r->type == RAY_STR) {
+        uint64_t first = block_for_row(r, start), end = block_for_row(r, start + count - 1) + 1;
+        for (uint64_t b = first; b < end; b++) {
+            const uint8_t* e = r->data + r->directory + b * RAY_COL_BLOCK_ENTRY;
+            size_t decoded = (size_t)get_le(e + 28, 4);
+            if (scratch < decoded) scratch = decoded;
+        }
+    } else if (count) {
         uint64_t boundary[2] = {block_for_row(r, start), block_for_row(r, start + count - 1)};
         for (unsigned i = 0; i < 2; i++) {
             const uint8_t* e = r->data + r->directory + boundary[i] * RAY_COL_BLOCK_ENTRY;
@@ -156,6 +191,7 @@ ray_err_t ray_col_block_read_range(const ray_col_block_reader_t* r,
                                   uint64_t start, uint64_t count,
                                   void* output, size_t capacity,
                                   void* scratch, size_t scratch_capacity) {
+    if (r && r->type == RAY_STR) return RAY_ERR_TYPE;
     size_t bytes, needed;
     ray_err_t err = ray_col_block_range_size(r, start, count, &bytes, &needed);
     if (err) return err;
@@ -194,9 +230,10 @@ static ray_err_t block_begin(ray_col_block_writer_t* w, FILE* output,
     if (!w) return RAY_ERR_DOMAIN;
     memset(w, 0, sizeof(*w));
     if (!output || codec > 1) return RAY_ERR_DOMAIN;
-    unsigned esz = width(type);
+    unsigned esz = type == RAY_STR ? 4 : width(type);
     if (!esz) return RAY_ERR_TYPE;
-    if (block_bytes < esz || block_bytes > RAY_COL_BLOCK_MAX || block_bytes % esz)
+    if (block_bytes < esz || block_bytes > RAY_COL_BLOCK_MAX ||
+        (type != RAY_STR && block_bytes % esz))
         return RAY_ERR_RANGE;
     if (!little_endian()) return RAY_ERR_NYI;
     if (fseek(output, 0, SEEK_END) || ftell(output) != 0) return RAY_ERR_IO;
@@ -240,6 +277,51 @@ ray_err_t ray_col_block_begin_sym(ray_col_block_writer_t* w, FILE* output,
     return err;
 }
 
+static ray_err_t append_block(ray_col_block_writer_t* w, const uint8_t* p,
+                               size_t bytes, uint64_t count) {
+    size_t stored = bytes;
+    const uint8_t* payload = p;
+    uint8_t codec = 0;
+    if (w->codec) {
+        ray_snappy_workspace_t* workspace = w->scratch;
+        uint8_t* compressed = (uint8_t*)(workspace + 1);
+        size_t n = ray_snappy_compress(p, bytes, compressed,
+            ray_snappy_compress_bound(w->block_bytes), workspace);
+        if (!n) return w->error = RAY_ERR_CORRUPT;
+        if (n < bytes) { stored = n; payload = compressed; codec = 1; }
+    }
+    /* Reserve space for this entry and footer before advancing the file. */
+    if (w->blocks >= (UINT64_MAX - RAY_COL_BLOCK_FOOTER) / RAY_COL_BLOCK_ENTRY ||
+        w->offset > UINT64_MAX - RAY_COL_BLOCK_FOOTER -
+            (w->blocks + 1) * RAY_COL_BLOCK_ENTRY ||
+        stored > UINT64_MAX - RAY_COL_BLOCK_FOOTER -
+            (w->blocks + 1) * RAY_COL_BLOCK_ENTRY - w->offset)
+        return w->error = RAY_ERR_LIMIT;
+    uint8_t e[RAY_COL_BLOCK_ENTRY] = {0};
+    put_le(e, w->rows, 8); put_le(e + 8, count, 8); put_le(e + 16, w->offset, 8);
+    put_le(e + 24, stored, 4); put_le(e + 28, bytes, 4); e[32] = codec;
+    e[33] = w->type == RAY_STR ? 1 : 0;
+    put_le(e + 40, ray_crc32(0, payload, stored), 4);
+    put_le(e + 44, ray_crc32(0, p, bytes), 4);
+    if (fwrite(payload, 1, stored, w->output) != stored ||
+        fwrite(e, 1, sizeof(e), w->directory) != sizeof(e))
+        return w->error = RAY_ERR_IO;
+    w->rows += count; w->blocks++; w->offset += stored;
+    return RAY_OK;
+}
+
+ray_err_t ray_col_block_append_str(ray_col_block_writer_t* w, const void* encoded,
+                                   size_t bytes, uint64_t rows) {
+    if (!w || !w->output) return RAY_ERR_DOMAIN;
+    if (w->error) return w->error;
+    if (w->type != RAY_STR) return w->error = RAY_ERR_TYPE;
+    if (rows > (uint64_t)INT64_MAX - w->rows || bytes > w->block_bytes)
+        return w->error = RAY_ERR_RANGE;
+    if ((!encoded && bytes) || !strings_valid(encoded, bytes, rows))
+        return w->error = RAY_ERR_CORRUPT;
+    return rows ? append_block(w, encoded, bytes, rows) : RAY_OK;
+}
+
 ray_err_t ray_col_block_append(ray_col_block_writer_t* w, const void* values, uint64_t rows) {
     if (!w || !w->output) return RAY_ERR_DOMAIN;
     if (w->error) return w->error;
@@ -254,33 +336,9 @@ ray_err_t ray_col_block_append(ray_col_block_writer_t* w, const void* values, ui
     }
     while (rows) {
         uint64_t count = rows < w->block_bytes / esz ? rows : w->block_bytes / esz;
-        size_t bytes = (size_t)count * esz, stored = bytes;
-        const uint8_t* payload = p;
-        uint8_t codec = 0;
-        if (w->codec) {
-            ray_snappy_workspace_t* workspace = w->scratch;
-            uint8_t* compressed = (uint8_t*)(workspace + 1);
-            size_t n = ray_snappy_compress(p, bytes, compressed,
-                ray_snappy_compress_bound(w->block_bytes), workspace);
-            if (!n) return w->error = RAY_ERR_CORRUPT;
-            if (n < bytes) { stored = n; payload = compressed; codec = 1; }
-        }
-        /* Reserve space for this entry and footer before advancing the file. */
-        if (w->blocks >= (UINT64_MAX - RAY_COL_BLOCK_FOOTER) / RAY_COL_BLOCK_ENTRY ||
-            w->offset > UINT64_MAX - RAY_COL_BLOCK_FOOTER -
-                (w->blocks + 1) * RAY_COL_BLOCK_ENTRY ||
-            stored > UINT64_MAX - RAY_COL_BLOCK_FOOTER -
-                (w->blocks + 1) * RAY_COL_BLOCK_ENTRY - w->offset)
-            return w->error = RAY_ERR_LIMIT;
-        uint8_t e[RAY_COL_BLOCK_ENTRY] = {0};
-        put_le(e, w->rows, 8); put_le(e + 8, count, 8); put_le(e + 16, w->offset, 8);
-        put_le(e + 24, stored, 4); put_le(e + 28, bytes, 4); e[32] = codec;
-        put_le(e + 40, ray_crc32(0, payload, stored), 4);
-        put_le(e + 44, ray_crc32(0, p, bytes), 4);
-        if (fwrite(payload, 1, stored, w->output) != stored ||
-            fwrite(e, 1, sizeof(e), w->directory) != sizeof(e))
-            return w->error = RAY_ERR_IO;
-        w->rows += count; w->blocks++; w->offset += stored;
+        size_t bytes = (size_t)count * esz;
+        ray_err_t err = append_block(w, p, bytes, count);
+        if (err) return err;
         p += bytes; rows -= count;
     }
     return RAY_OK;

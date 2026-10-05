@@ -10,7 +10,9 @@ typedef struct {
 } ray_block_store_options_t;
 
 /* Explicit whole-table major-2 save; existing save APIs remain raw.
- * Accepts rectangular, nonempty-schema tables with BOOL..SYM columns only.
+ * Accepts rectangular, nonempty-schema tables with BOOL..STR columns only.
+ * STR uses independent lengths/bytes blocks; a string longer than block_bytes
+ * minus its 4-byte length prefix returns range before filesystem mutation.
  * SYM is re-encoded as uint64 positions over an immutable generation-local
  * .sym dictionary (STRL), capped at 64 MiB on disk. Vocabulary memory grows
  * with distinct symbols; row translation uses one block of extra scratch.
