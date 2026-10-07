@@ -157,6 +157,10 @@ ray_err_t ray_block_scan_open(const char* root, const char* const* columns,
     return RAY_OK;
 }
 
+uint64_t ray_block_scan_rows(const ray_block_scan_t* s) {
+    return s ? s->end - s->options.start : 0;
+}
+
 bool ray_block_scan_has_column(const ray_block_scan_t* s, const char* name) {
     if (!s || !name) return false;
     size_t len = strlen(name);

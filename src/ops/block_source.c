@@ -2,12 +2,16 @@
 #include "block_source.h"
 #include "block_query.h"
 #include "ops.h"
+#include "agg_registry.h"
 #include "lang/eval.h"
 #include "lang/env.h"
 #include "lang/internal.h"
 #include "table/sym.h"
+#include "vec/vec.h"
 #include <stdlib.h>
 #include <string.h>
+
+#define BLOCK_SOURCE_BATCH_ROWS 4096u
 
 static bool dictionary(ray_t* d) {
     if (!d || d->type != RAY_DICT) return false;
@@ -168,6 +172,126 @@ done:
     return result ? result : ray_error("oom", NULL);
 }
 
+typedef struct {
+    const char* name;
+    uint16_t opcode;
+    ray_unary_fn fn;
+} aggregate_t;
+static const aggregate_t aggregates[] = {
+    {"count", OP_COUNT, ray_count_fn}, {"sum", OP_SUM, ray_sum_fn},
+    {"avg", OP_AVG, ray_avg_fn}, {"min", OP_MIN, ray_min_fn}, {"max", OP_MAX, ray_max_fn}
+};
+
+static const aggregate_t* aggregate_kind(ray_t* expr) {
+    if (!expr || expr->type != RAY_LIST || expr->len != 2) return NULL;
+    ray_t* head = ray_list_get(expr, 0);
+    const char* op = name(head);
+    ray_t* fn = op ? ray_env_get(head->i64) : NULL;
+    if (!fn || fn->type != RAY_UNARY) return NULL;
+    for (size_t i = 0; i < sizeof(aggregates) / sizeof(*aggregates); i++)
+        if (!strcmp(op, aggregates[i].name) && (ray_unary_fn)(uintptr_t)fn->i64 == aggregates[i].fn)
+            return &aggregates[i];
+    return NULL;
+}
+
+static bool aggregate_type(uint16_t op, int8_t type) {
+    if (op == OP_COUNT) return true;
+    if (op == OP_SUM || op == OP_AVG)
+        return type == RAY_I16 || type == RAY_I32 || type == RAY_I64;
+    return type == RAY_BOOL || type == RAY_U8 || type == RAY_I16 || type == RAY_I32 ||
+        type == RAY_I64 || type == RAY_DATE || type == RAY_TIME || type == RAY_TIMESTAMP;
+}
+
+typedef struct {
+    const agg_vtable_t* kernel;
+    void* state;
+} aggregate_state_t;
+
+static ray_t* aggregate_result(ray_block_query_t* cursor, const aggregate_t* const* kinds,
+                               const size_t* positions, const int64_t* aliases,
+                               size_t count, size_t remaining) {
+    aggregate_state_t* states = calloc(count, sizeof(*states));
+    uint32_t* gids = calloc(BLOCK_SOURCE_BATCH_ROWS, sizeof(*gids));
+    ray_t* schema = NULL;
+    ray_t* result = NULL;
+    if (!states || !gids) goto done;
+    schema = ray_block_query_schema(cursor);
+    if (!schema || RAY_IS_ERR(schema)) { result = schema; schema = NULL; goto done; }
+    bool has_avg = false;
+    /* Match select's empty-source projection rule, distinct from a WHERE
+     * that filters all rows of a nonempty source (one aggregate row). */
+    int64_t output_rows = ray_block_query_rows(cursor) ? 1 : 0;
+    for (size_t a = 0; a < count; a++) {
+        int8_t type = ray_table_get_col_idx(schema, (int64_t)positions[a])->type;
+        uint16_t op = kinds[a]->opcode;
+        if (ray_block_query_has_column(cursor, kinds[a]->name)) {
+            result = ray_error("nyi", "block select: aggregate name is shadowed by a column"); goto done;
+        }
+        const agg_vtable_t* k = aggregate_type(op, type) ? agg_resolve(op, type) : NULL;
+        if (!k || k->kind != ACC_STREAMING || !k->init || !k->update_batch ||
+            !k->finalize_value || k->destroy) {
+            result = ray_error("nyi", "block select: unsupported streaming aggregate type"); goto done;
+        }
+        size_t bytes = output_rows ? ray_type_sizes[(uint8_t)k->out_type] : 0;
+        if (bytes > remaining) {
+            result = ray_error("limit", "block select: aggregate result exceeds explicit byte limit"); goto done;
+        }
+        remaining -= bytes;
+        states[a].kernel = k;
+        has_avg |= op == OP_AVG;
+    }
+    ray_release(schema); schema = NULL;
+    for (size_t a = 0; a < count; a++) {
+        states[a].state = malloc(states[a].kernel->state_size);
+        if (!states[a].state) goto done;
+        states[a].kernel->init(states[a].state);
+    }
+    uint64_t total = 0;
+    for (;;) {
+        ray_t* batch = ray_block_query_next(cursor);
+        if (!batch) break;
+        if (RAY_IS_ERR(batch)) { result = batch; goto done; }
+        uint64_t rows = (uint64_t)ray_table_nrows(batch);
+        /* Narrow integer avg needs fewer than 2^31 values; I64's packed
+         * counter allows more, but use one conservative cap for all avg plans.
+         * Count includes nulls, so this also bounds every live-value counter. */
+        uint64_t cap = has_avg ? INT32_MAX : INT64_MAX;
+        if (rows > BLOCK_SOURCE_BATCH_ROWS || rows > cap - total) {
+            ray_release(batch); result = ray_error("limit", "block select: aggregate row limit exceeded"); goto done;
+        }
+        total += rows;
+        for (size_t a = 0; a < count; a++) {
+            ray_t* col = ray_table_get_col_idx(batch, (int64_t)positions[a]);
+            ray_valid_t valid = {ray_data(col), col->type, ray_vec_may_have_nulls(col)};
+            const agg_vtable_t* k = states[a].kernel;
+            k->update_batch(states[a].state, k->state_size, gids, ray_data(col), &valid, (int64_t)rows, NULL);
+        }
+        ray_release(batch);
+    }
+    result = ray_table_new((int64_t)count);
+    for (size_t a = 0; result && !RAY_IS_ERR(result) && a < count; a++) {
+        const agg_vtable_t* k = states[a].kernel;
+        ray_t* col = ray_vec_new(k->out_type, output_rows);
+        if (!col || RAY_IS_ERR(col)) { ray_release(result); result = col; break; }
+        col->len = output_rows;
+        bool is_null = output_rows && k->finalize_value(states[a].state, ray_data(col));
+        /* Some ordinary select paths lose the null hint on a wrapped sum at
+         * INT64_MIN. Fail closed until that engine-wide contract is unified. */
+        if (is_null && kinds[a]->opcode == OP_SUM) {
+            ray_release(col); ray_release(result);
+            result = ray_error("range", "block select: sum reached the reserved null sentinel"); break;
+        }
+        if (is_null) col->attrs |= RAY_ATTR_HAS_NULLS;
+        result = ray_table_add_col(result, aliases[a], col);
+        ray_release(col);
+    }
+done:
+    ray_release(schema);
+    if (states) for (size_t a = 0; a < count; a++) free(states[a].state);
+    free(states); free(gids);
+    return result ? result : ray_error("oom", NULL);
+}
+
 ray_t* ray_block_select_source(ray_t* source, ray_t* query) {
     ray_t* path = field(source, ".hdb.block.source");
     if (!path) return NULL;
@@ -179,7 +303,10 @@ ray_t* ray_block_select_source(ray_t* source, ray_t* query) {
     if (!dictionary(query)) return ray_error("type", "invalid block query");
     const char* columns[RAY_BLOCK_SCAN_MAX_COLUMNS];
     int64_t aliases[RAY_BLOCK_SCAN_MAX_COLUMNS];
-    size_t count = 0;
+    const aggregate_t* kinds[RAY_BLOCK_SCAN_MAX_COLUMNS];
+    size_t positions[RAY_BLOCK_SCAN_MAX_COLUMNS];
+    size_t count = 0, n_columns = 0;
+    bool aggregate = false;
     ray_t* keys = ray_dict_keys(query); ray_t* vals = ray_dict_vals(query);
     for (int64_t i = 0; i < keys->len; i++) {
         ray_t* key = ray_sym_vec_cell(keys, i);
@@ -190,8 +317,19 @@ ray_t* ray_block_select_source(ray_t* source, ray_t* query) {
             !strcmp(k, "desc") || !strcmp(k, "nearest"))
             return ray_error("nyi", "block select: grouping, ordering and take are not supported");
         if (count == RAY_BLOCK_SCAN_MAX_COLUMNS) return ray_error("limit", "too many output columns");
-        columns[count] = name(ray_list_get(vals, i));
-        if (!columns[count]) return ray_error("nyi", "block select requires bare-column projections");
+        ray_t* expr = ray_list_get(vals, i);
+        kinds[count] = aggregate_kind(expr);
+        bool is_aggregate = kinds[count] != NULL;
+        const char* col = name(is_aggregate ? ray_list_get(expr, 1) : expr);
+        if (!col || (count && aggregate != is_aggregate))
+            return ray_error("nyi", "block select requires either bare columns or supported global aggregates");
+        aggregate = is_aggregate;
+        size_t pos = 0;
+        while (pos < n_columns && strcmp(columns[pos], col)) pos++;
+        if (pos < n_columns && !aggregate)
+            return ray_error("domain", "block select: repeated projection column");
+        if (pos == n_columns) columns[n_columns++] = col;
+        positions[count] = pos;
         aliases[count] = ray_sym_intern(k, strlen(k));
         if (aliases[count] < 0) return ray_error("oom", NULL);
         count++;
@@ -202,9 +340,9 @@ ray_t* ray_block_select_source(ray_t* source, ray_t* query) {
     ray_t* where = field(query, "where");
     if (where && !predicates(where, pred, &n_pred, 0))
         return ray_error("nyi", "block select requires builtin comparisons and binary AND with typed literals");
-    ray_block_scan_options_t options = {0, UINT64_MAX, 4096, 8u * 1024 * 1024, 8u * 1024 * 1024};
+    ray_block_scan_options_t options = {0, UINT64_MAX, BLOCK_SOURCE_BATCH_ROWS, 8u * 1024 * 1024, 8u * 1024 * 1024};
     ray_block_query_t* cursor = NULL;
-    ray_err_t err = ray_block_query_open(string(path), columns, count, pred, n_pred, &options, &cursor);
+    ray_err_t err = ray_block_query_open(string(path), columns, n_columns, pred, n_pred, &options, &cursor);
     if (err) return ray_error(ray_err_code_str(err), "block select: source or predicate admission failed");
     ray_t* result = NULL;
     /* Query scope can shadow call heads with even an unprojected column.
@@ -215,7 +353,8 @@ ray_t* ray_block_select_source(ray_t* source, ray_t* query) {
             shadowed |= ray_block_query_has_column(cursor, comparisons[i].name);
         if (shadowed) { result = ray_error("nyi", "block select: operator-named columns are not supported"); goto done; }
     }
-    result = collect(cursor, aliases, count, (size_t)limit->i64);
+    result = aggregate ? aggregate_result(cursor, kinds, positions, aliases, count, (size_t)limit->i64) :
+                         collect(cursor, aliases, count, (size_t)limit->i64);
 done:
     ray_block_query_close(&cursor);
     return result ? result : ray_error("oom", NULL);
