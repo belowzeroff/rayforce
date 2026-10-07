@@ -5,6 +5,8 @@
 #include "lang/eval.h"
 #include "lang/env.h"
 #include "lang/internal.h"
+#include "table/sym.h"
+#include <stdlib.h>
 #include <string.h>
 
 static bool dictionary(ray_t* d) {
@@ -87,8 +89,8 @@ static bool predicates(ray_t* expr, ray_block_predicate_t* out, size_t* n, unsig
     return false;
 }
 
-/* Consume only logical result capacity; a batch and concat temporaries remain
- * separately live. Count SYM as W64 even if concat chooses a narrower width. */
+/* Consume only logical result capacity; batch buffers and geometric growth
+ * capacity are separate. The collector preserves SYM's on-disk W64 domain. */
 static bool charge(ray_t* table, size_t* remaining) {
     for (int64_t c = 0; c < ray_table_ncols(table); c++) {
         ray_t* col = ray_table_get_col_idx(table, c);
@@ -104,6 +106,66 @@ static bool charge(ray_t* table, size_t* remaining) {
         }
     }
     return true;
+}
+
+static ray_t* collect(ray_block_query_t* cursor, const int64_t* aliases,
+                      size_t count, size_t remaining) {
+    ray_t** vectors = calloc(count, sizeof(*vectors));
+    if (!vectors) return ray_error("oom", NULL);
+    ray_t* schema = ray_block_query_schema(cursor);
+    ray_t* result = NULL;
+    if (!schema || RAY_IS_ERR(schema)) { result = schema; schema = NULL; goto done; }
+    for (size_t c = 0; c < count; c++) {
+        ray_t* col = ray_table_get_col_idx(schema, (int64_t)c);
+        ray_t* v = col->type == RAY_SYM ? ray_sym_vec_new(RAY_SYM_W64, 0) : ray_vec_new(col->type, 0);
+        if (!v || RAY_IS_ERR(v)) { result = v; goto done; }
+        vectors[c] = v;
+        if (col->type == RAY_SYM) ray_sym_vec_adopt_domain(v, col);
+    }
+    ray_release(schema); schema = NULL;
+    for (;;) {
+        ray_t* batch = ray_block_query_next(cursor);
+        if (!batch) break;
+        if (RAY_IS_ERR(batch)) { result = batch; goto done; }
+        if (!charge(batch, &remaining)) {
+            ray_release(batch);
+            result = ray_error("limit", "block select: result exceeds explicit byte limit"); goto done;
+        }
+        /* These vectors have a single owner until final table construction, so
+         * append can grow geometrically instead of copying via table concat. */
+        for (size_t c = 0; c < count; c++) {
+            ray_t* src = ray_table_get_col_idx(batch, (int64_t)c);
+            if (src->type != vectors[c]->type || (src->type == RAY_SYM &&
+                (ray_sym_elem_size(src->type, src->attrs) != 8 ||
+                 ray_sym_vec_domain(src) != ray_sym_vec_domain(vectors[c])))) {
+                result = ray_error("schema", "block select: inconsistent batch column"); break;
+            }
+            if (src->type == RAY_STR) {
+                for (int64_t i = 0; i < src->len; i++) {
+                    size_t len; const char* s = ray_str_vec_get(src, i, &len);
+                    ray_t* v = ray_str_vec_append(vectors[c], s, len);
+                    if (!v || RAY_IS_ERR(v)) { result = v ? v : ray_error("oom", NULL); break; }
+                    vectors[c] = v;
+                }
+            } else {
+                ray_t* v = ray_vec_append_raw(vectors[c], ray_data(src), src->len);
+                if (!v || RAY_IS_ERR(v)) result = v ? v : ray_error("oom", NULL);
+                else vectors[c] = v;
+            }
+            if (result) break;
+            vectors[c]->attrs |= src->attrs & RAY_ATTR_HAS_NULLS;
+        }
+        ray_release(batch);
+        if (result) goto done;
+    }
+    result = ray_table_new((int64_t)count);
+    for (size_t c = 0; result && !RAY_IS_ERR(result) && c < count; c++)
+        result = ray_table_add_col(result, aliases[c], vectors[c]);
+done:
+    ray_release(schema);
+    for (size_t c = 0; c < count; c++) ray_release(vectors[c]);
+    free(vectors);
+    return result ? result : ray_error("oom", NULL);
 }
 
 ray_t* ray_block_select_source(ray_t* source, ray_t* query) {
@@ -153,26 +215,7 @@ ray_t* ray_block_select_source(ray_t* source, ray_t* query) {
             shadowed |= ray_block_query_has_column(cursor, comparisons[i].name);
         if (shadowed) { result = ray_error("nyi", "block select: operator-named columns are not supported"); goto done; }
     }
-    result = ray_block_query_schema(cursor);
-    size_t remaining = (size_t)limit->i64;
-    while (result && !RAY_IS_ERR(result)) {
-        ray_t* batch = ray_block_query_next(cursor);
-        if (!batch) break;
-        if (RAY_IS_ERR(batch)) { ray_release(result); result = batch; break; }
-        if (!charge(batch, &remaining)) {
-            ray_release(batch); ray_release(result);
-            result = ray_error("limit", "block select: result exceeds explicit byte limit"); break;
-        }
-        ray_t* joined = ray_concat_fn(result, batch);
-        ray_release(result); ray_release(batch);
-        result = joined;
-    }
-    if (result && !RAY_IS_ERR(result)) {
-        ray_t* renamed = ray_table_new((int64_t)count);
-        for (size_t i = 0; renamed && !RAY_IS_ERR(renamed) && i < count; i++)
-            renamed = ray_table_add_col(renamed, aliases[i], ray_table_get_col_idx(result, (int64_t)i));
-        ray_release(result); result = renamed;
-    }
+    result = collect(cursor, aliases, count, (size_t)limit->i64);
 done:
     ray_block_query_close(&cursor);
     return result ? result : ray_error("oom", NULL);

@@ -4,7 +4,8 @@
 #include <rayforce.h>
 /* Experimental (.db.block.scan path result-bytes) data-only descriptor.
  * Opening occurs at select time, not construction. Result limit covers logical
- * vector bytes and STR pools, not total RSS, vocabulary, or concat temporaries.
+ * vector bytes and STR pools, not total RSS, vocabulary, or allocator capacity.
+ * Results grow in singly-owned column buffers; the table is built once at EOF.
  * Read batches: 4096 rows, 8 MiB payload and 8 MiB decode scratch per read.
  * Select admits explicit distinct bare-column projections/aliases and typed comparisons
  * with AND; unsupported plans fail, never silently materialize the full source.
