@@ -97,7 +97,7 @@ static test_result_t select_parity(void) {
 static test_result_t select_rejections(void) {
     fixture(16, false);
     const char* commands[] = {
-        "(select {from: source})", "(select {from: source n: (count id)})",
+        "(select {from: source})", "(select {from: source n: (count id) id: id})",
         "(select {from: source id: id take: 2})", "(select {from: source id: id by: x})",
         "(select {from: source id: id asc: id})", "(select {from: source id: id where: (> x (+ 1 1))})",
         "(select {from: source id: id where: (or (> x 1) (< x 4))})",
@@ -163,7 +163,7 @@ static test_result_t descriptor_validation(void) {
     for (unsigned i = 0; i < sizeof(invalid) / sizeof(*invalid); i++) {
         ray_t* r = ray_eval_str(invalid[i]); TEST_ASSERT_TRUE(RAY_IS_ERR(r)); ray_release(r);
     }
-    ray_t* r = ray_eval_str("(select {from: (.db.block.scan \"/missing-hdb-source\" 1) n: (count x)})");
+    ray_t* r = ray_eval_str("(select {from: (.db.block.scan \"/missing-hdb-source\" 1) n: (sum (+ x 1))})");
     TEST_ASSERT_TRUE(RAY_IS_ERR(r)); TEST_ASSERT_STR_EQ(ray_err_code(r), "nyi"); ray_release(r);
     ray_eval_set_restricted(true);
     r = ray_eval_str("(.db.block.scan \"path\" 100)");
@@ -251,7 +251,173 @@ static test_result_t builder_partial_limit(void) {
     PASS();
 }
 
+static test_result_t aggregate_parity(void) {
+    fixture(8207, false);
+    const char* clauses[] = {
+        "n: (count id) total: (sum id) mean: (avg id) lo: (min id) hi: (max id) ns: (count s) ny: (count sy)",
+        "where: (== x 2) n: (count id) total: (sum id) mean: (avg id) lo: (min id) hi: (max id)",
+        "where: (and (> id 4090) (< id 8194)) n: (count id) total: (sum id) mean: (avg id)",
+        "where: (> x 99) n: (count id) total: (sum id) mean: (avg id) lo: (min id) hi: (max id)",
+        "id: (sum id) n: (count id) x: (avg x)",
+        "n: (count id)"
+    };
+    for (unsigned mode = 0; mode < 5; mode++) {
+        ray_t* raw = ray_env_get(ray_sym_intern("raw", 3));
+        ray_t* col = ray_table_get_col_idx(raw, 0);
+        if (mode == 1) {
+            for (int64_t i = 0; i < col->len; i++) ((int64_t*)ray_data(col))[i] =
+                i % 3 == 0 ? INT64_MAX : i % 3 == 1 ? INT64_MAX - 1 : -INT64_MAX;
+            ray_vec_set_null(col, 4096, true);
+        } else if (mode == 2) {
+            memset(ray_data(col), 0, (size_t)col->len * 8);
+            ((int64_t*)ray_data(col))[0] = INT64_MAX;
+            ((int64_t*)ray_data(col))[4096] = 1;
+        } else if (mode == 3) {
+            for (int64_t i = 0; i < col->len; i++) ray_vec_set_null(col, i, true);
+        } else if (mode == 4) fixture(0, false);
+        if (mode < 4) {
+            ray_block_store_options_t write = {256, 1, false};
+            TEST_ASSERT_EQ_I(ray_block_store_save(raw, root, &write), RAY_OK);
+        }
+        for (unsigned c = 0; c < sizeof(clauses) / sizeof(*clauses); c++) {
+            char command[768];
+            snprintf(command, sizeof(command), "(select {from: raw %s})", clauses[c]);
+            ray_t* expected = ray_eval_str(command);
+            snprintf(command, sizeof(command), "(select {from: (.db.block.scan \"%s\" 56) %s})", root, clauses[c]);
+            ray_t* actual = ray_eval_str(command);
+            TEST_ASSERT_NOT_NULL(expected); TEST_ASSERT_FALSE(RAY_IS_ERR(expected));
+            if (mode == 2 && (c == 0 || c == 4)) {
+                TEST_ASSERT_TRUE(RAY_IS_ERR(actual)); TEST_ASSERT_STR_EQ(ray_err_code(actual), "range");
+                ray_release(actual); ray_release(expected); continue;
+            }
+            TEST_ASSERT_NOT_NULL(actual); TEST_ASSERT_FALSE(RAY_IS_ERR(actual));
+            TEST_ASSERT_EQ_I(ray_table_nrows(actual), ray_table_nrows(expected));
+            TEST_ASSERT_EQ_I(ray_table_ncols(actual), ray_table_ncols(expected));
+            for (int64_t a = 0; a < ray_table_ncols(actual); a++) {
+                ray_t* v = ray_table_get_col_idx(actual, a); ray_t* e = ray_table_get_col_idx(expected, a);
+                TEST_ASSERT_EQ_I(ray_table_col_name(actual, a), ray_table_col_name(expected, a));
+                TEST_ASSERT_EQ_I(v->type, e->type);
+                TEST_ASSERT_EQ_I(v->len, e->len);
+                if (!v->len) continue;
+                TEST_ASSERT_EQ_I(ray_vec_is_null(v, 0), ray_vec_is_null(e, 0));
+                if (!ray_vec_is_null(e, 0))
+                    TEST_ASSERT_TRUE(!memcmp(ray_data(v), ray_data(e), ray_type_sizes[(uint8_t)e->type]));
+            }
+            ray_release(actual); ray_release(expected);
+        }
+    }
+    PASS();
+}
+
+static test_result_t aggregate_types(void) {
+    fixture(4103, false);
+    const int8_t types[] = {RAY_BOOL, RAY_U8, RAY_I16, RAY_I32, RAY_DATE, RAY_TIME, RAY_TIMESTAMP};
+    for (unsigned t = 0; t < sizeof(types); t++) {
+        int8_t type = types[t];
+        for (unsigned empty = 0; empty < 3; empty++) {
+            ray_t* col = ray_vec_new(type, empty == 1 ? 0 : 4103); col->len = empty == 1 ? 0 : 4103;
+            for (int64_t i = 0; i < col->len; i++) {
+                switch (type) {
+                case RAY_BOOL: ((uint8_t*)ray_data(col))[i] = i % 2; break;
+                case RAY_U8: ((uint8_t*)ray_data(col))[i] = i % 201; break;
+                case RAY_I16: ((int16_t*)ray_data(col))[i] = (int16_t)(i % 99 - 40); break;
+                case RAY_I32: case RAY_DATE: case RAY_TIME:
+                    ((int32_t*)ray_data(col))[i] = (int32_t)(i % 99 - 40); break;
+                default: ((int64_t*)ray_data(col))[i] = i % 99 - 40; break;
+                }
+            }
+            if (!empty && type != RAY_BOOL && type != RAY_U8) ray_vec_set_null(col, 4096, true);
+            if (empty == 2 && type != RAY_BOOL && type != RAY_U8)
+                for (int64_t i = 0; i < col->len; i++) ray_vec_set_null(col, i, true);
+            ray_t* table = ray_table_new(1);
+            table = ray_table_add_col(table, ray_sym_intern("v", 1), col); ray_release(col);
+            TEST_ASSERT_EQ_I(ray_env_set(ray_sym_intern("raw", 3), table), RAY_OK);
+            ray_block_store_options_t write = {256, 1, false};
+            TEST_ASSERT_EQ_I(ray_block_store_save(table, root, &write), RAY_OK); ray_release(table);
+            const char* extra = type == RAY_I16 || type == RAY_I32 ? "s: (sum v) a: (avg v)" : "";
+            char command[512];
+            snprintf(command, sizeof(command), "(select {from: raw n: (count v) lo: (min v) hi: (max v) %s})", extra);
+            ray_t* expected = ray_eval_str(command);
+            snprintf(command, sizeof(command), "(select {from: source n: (count v) lo: (min v) hi: (max v) %s})", extra);
+            ray_t* actual = ray_eval_str(command);
+            TEST_ASSERT_NOT_NULL(expected); TEST_ASSERT_FALSE(RAY_IS_ERR(expected));
+            TEST_ASSERT_NOT_NULL(actual); TEST_ASSERT_FALSE(RAY_IS_ERR(actual));
+            TEST_ASSERT_EQ_I(ray_table_nrows(actual), ray_table_nrows(expected));
+            TEST_ASSERT_EQ_I(ray_table_ncols(actual), ray_table_ncols(expected));
+            for (int64_t a = 0; a < ray_table_ncols(actual); a++) {
+                ray_t* v = ray_table_get_col_idx(actual, a); ray_t* e = ray_table_get_col_idx(expected, a);
+                TEST_ASSERT_EQ_I(v->type, e->type);
+                TEST_ASSERT_EQ_I(v->len, e->len);
+                if (!v->len) continue;
+                TEST_ASSERT_EQ_I(ray_vec_is_null(v, 0), ray_vec_is_null(e, 0));
+                if (!ray_vec_is_null(e, 0))
+                    TEST_ASSERT_TRUE(!memcmp(ray_data(v), ray_data(e), ray_type_sizes[(uint8_t)e->type]));
+            }
+            ray_release(expected); ray_release(actual);
+        }
+    }
+    PASS();
+}
+
+static test_result_t aggregate_admission(void) {
+    fixture(16, false);
+    const char* invalid[] = {
+        "(select {from: source n: (sum s)})", "(select {from: source n: (min sy)})",
+        "(select {from: source n: (avg s)})", "(select {from: source n: (sum (+ id 1))})",
+        "(select {from: source id: id n: (count id)})", "(select {from: source n: (count id) by: x})"
+    };
+    for (unsigned i = 0; i < sizeof(invalid) / sizeof(*invalid); i++) {
+        ray_t* r = ray_eval_str(invalid[i]);
+        TEST_ASSERT_TRUE(RAY_IS_ERR(r)); TEST_ASSERT_STR_EQ(ray_err_code(r), "nyi"); ray_release(r);
+    }
+    for (unsigned i = 0; i < 2; i++) {
+        char command[256];
+        snprintf(command, sizeof(command), "(select {from: (.db.block.scan \"%s\" %u) n: (count id) s: (sum id)})", root, 16 - i);
+        ray_t* r = ray_eval_str(command);
+        if (i) { TEST_ASSERT_TRUE(RAY_IS_ERR(r)); TEST_ASSERT_STR_EQ(ray_err_code(r), "limit"); }
+        else { TEST_ASSERT_FALSE(RAY_IS_ERR(r)); TEST_ASSERT_EQ_I(ray_table_nrows(r), 1); }
+        ray_release(r);
+    }
+    int64_t sum = ray_sym_intern("sum", 3);
+    ray_t* saved = ray_env_get(sum); ray_retain(saved);
+    TEST_ASSERT_EQ_I(ray_env_set(sum, ray_env_get(ray_sym_intern("count", 5))), RAY_OK);
+    ray_t* r = ray_eval_str("(select {from: source s: (sum id)})");
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r)); TEST_ASSERT_STR_EQ(ray_err_code(r), "nyi"); ray_release(r);
+    TEST_ASSERT_EQ_I(ray_env_set(sum, saved), RAY_OK); ray_release(saved);
+    ray_t* raw = ray_env_get(ray_sym_intern("raw", 3)); ray_retain(raw);
+    raw = ray_table_add_col(raw, sum, ray_table_get_col_idx(raw, 0));
+    ray_block_store_options_t write = {256, 1, false};
+    TEST_ASSERT_EQ_I(ray_block_store_save(raw, root, &write), RAY_OK); ray_release(raw);
+    r = ray_eval_str("(select {from: source s: (sum id)})");
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r)); TEST_ASSERT_STR_EQ(ray_err_code(r), "nyi"); ray_release(r);
+    PASS();
+}
+
+static test_result_t aggregate_corruption(void) {
+    fixture(16, false);
+    char dir[1024], path[1100];
+    TEST_ASSERT_EQ_I(ray_splay_resolve_dir(root, dir, sizeof(dir)), RAY_OK);
+    snprintf(path, sizeof(path), "%s/id", dir);
+    FILE* f = fopen(path, "r+b"); TEST_ASSERT_NOT_NULL(f);
+    TEST_ASSERT_EQ_I(fseek(f, RAY_COL_BLOCK_HEADER, SEEK_SET), 0);
+    int b = fgetc(f); TEST_ASSERT_TRUE(b != EOF);
+    TEST_ASSERT_EQ_I(fseek(f, RAY_COL_BLOCK_HEADER, SEEK_SET), 0);
+    TEST_ASSERT_TRUE(fputc(b ^ 1, f) != EOF); TEST_ASSERT_EQ_I(fclose(f), 0);
+    ray_t* r = ray_eval_str("(select {from: source where: (> x 99) n: (count id) s: (sum id) a: (avg id)})");
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r)); TEST_ASSERT_EQ_I(ray_table_nrows(r), 1);
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(ray_table_get_col_idx(r, 0)))[0], 0);
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(ray_table_get_col_idx(r, 1)))[0], 0);
+    TEST_ASSERT_TRUE(ray_vec_is_null(ray_table_get_col_idx(r, 2), 0)); ray_release(r);
+    r = ray_eval_str("(select {from: source n: (count id)})");
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r)); TEST_ASSERT_STR_EQ(ray_err_code(r), "corrupt"); ray_release(r);
+    PASS();
+}
+
 const test_entry_t block_source_entries[] = {
+    {"block_source/aggregate_corruption", aggregate_corruption, setup, teardown},
+    {"block_source/aggregate_parity", aggregate_parity, setup, teardown},
+    {"block_source/aggregate_types", aggregate_types, setup, teardown},
+    {"block_source/aggregate_admission", aggregate_admission, setup, teardown},
     {"block_source/builder_growth", builder_growth, setup, teardown},
     {"block_source/builder_partial_limit", builder_partial_limit, setup, teardown},
     {"block_source/select_parity", select_parity, setup, teardown},

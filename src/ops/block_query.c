@@ -122,6 +122,10 @@ ray_err_t ray_block_query_open(const char* root, const char* const* columns,
     return RAY_OK;
 }
 
+uint64_t ray_block_query_rows(const ray_block_query_t* q) {
+    return q ? ray_block_scan_rows(q->scan) : 0;
+}
+
 bool ray_block_query_has_column(const ray_block_query_t* q, const char* name) {
     return q && ray_block_scan_has_column(q->scan, name);
 }
