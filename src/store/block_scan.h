@@ -38,6 +38,8 @@ ray_t* ray_block_scan_schema(const ray_block_scan_t* scan);
 /* Membership in the full pinned name schema, including unprojected columns.
  * The bounded decoded name schema is retained as metadata until close. */
 bool ray_block_scan_has_column(const ray_block_scan_t* scan, const char* name);
+/* Configured row-range cardinality, before filtering; stable across next(). */
+uint64_t ray_block_scan_rows(const ray_block_scan_t* scan);
 /* Owned table, NULL at EOF, or owned runtime error. Batches outlive scan.
  * On any error scan is terminal; close it rather than retrying. No row cursor
  * advancement until a complete batch succeeds. Cancel is checked at next(),
