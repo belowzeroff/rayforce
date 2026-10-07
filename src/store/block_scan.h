@@ -35,6 +35,9 @@ ray_err_t ray_block_scan_open(const char* root, const char* const* columns,
 /* Owned zero-row table describing the projection, including for empty scans.
  * No payload reads or cursor advancement. Allocator overhead is not budgeted. */
 ray_t* ray_block_scan_schema(const ray_block_scan_t* scan);
+/* Membership in the full pinned name schema, including unprojected columns.
+ * The bounded decoded name schema is retained as metadata until close. */
+bool ray_block_scan_has_column(const ray_block_scan_t* scan, const char* name);
 /* Owned table, NULL at EOF, or owned runtime error. Batches outlive scan.
  * On any error scan is terminal; close it rather than retrying. No row cursor
  * advancement until a complete batch succeeds. Cancel is checked at next(),

@@ -19,6 +19,7 @@ typedef struct {
 struct ray_block_scan_s {
     ray_splay_lease_t* lease;
     ray_sym_domain_t* domain;
+    ray_t* names;
     scan_column_t* columns;
     size_t count;
     ray_block_scan_options_t options;
@@ -31,6 +32,7 @@ void ray_block_scan_close(ray_block_scan_t** scan) {
     ray_block_scan_t* s = *scan;
     for (size_t i = 0; i < s->count; i++) ray_col_block_file_close(&s->columns[i].file);
     free(s->columns);
+    ray_release(s->names);
     if (s->domain) ray_sym_domain_release(s->domain);
     ray_splay_lease_release(&s->lease);
     free(s);
@@ -44,7 +46,8 @@ static bool scan_name_safe(const char* name, size_t len) {
 
 /* The lease prevents prune across stat/load; immutability is a writer contract.
  * Use the normal .d decoder, with an on-disk cap before allocating vectors. */
-static ray_err_t scan_check_schema(const char* dir, const char* const* columns, size_t count) {
+static ray_err_t scan_check_schema(const char* dir, const char* const* columns, size_t count,
+                                   ray_t** names) {
     char path[1100];
     int n = snprintf(path, sizeof(path), "%s/.d", dir);
     if (n < 0 || (size_t)n >= sizeof(path)) return RAY_ERR_RANGE;
@@ -82,7 +85,8 @@ static ray_err_t scan_check_schema(const char* dir, const char* const* columns, 
     }
     for (size_t j = 0; !err && j < count; j++)
         if (!found[j]) err = RAY_ERR_SCHEMA;
-    ray_release(schema);
+    if (err) ray_release(schema);
+    else *names = schema;
     return err;
 }
 
@@ -106,7 +110,7 @@ ray_err_t ray_block_scan_open(const char* root, const char* const* columns,
     if (!s->columns) { free(s); return RAY_ERR_OOM; }
     s->count = count;
     ray_err_t err = ray_splay_lease_acquire(root, &s->lease);
-    if (!err) err = scan_check_schema(ray_splay_lease_dir(s->lease), columns, count);
+    if (!err) err = scan_check_schema(ray_splay_lease_dir(s->lease), columns, count, &s->names);
     uint64_t rows = 0, generation = 0, sym_count = 0;
     uint32_t sym_crc = 0;
     for (size_t i = 0; !err && i < count; i++) {
@@ -151,6 +155,17 @@ ray_err_t ray_block_scan_open(const char* root, const char* const* columns,
     if (err) { ray_block_scan_close(&s); return err; }
     *out = s;
     return RAY_OK;
+}
+
+bool ray_block_scan_has_column(const ray_block_scan_t* s, const char* name) {
+    if (!s || !name) return false;
+    size_t len = strlen(name);
+    for (int64_t i = 0; i < s->names->len; i++) {
+        size_t n;
+        const char* p = ray_str_vec_get(s->names, i, &n);
+        if (n == len && !memcmp(p, name, n)) return true;
+    }
+    return false;
 }
 
 ray_t* ray_block_scan_schema(const ray_block_scan_t* s) {

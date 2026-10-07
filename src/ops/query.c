@@ -26,6 +26,7 @@
  */
 
 #include "lang/internal.h"
+#include "ops/block_source.h"
 #include "io/parquet.h"
 #include "lang/eval.h"
 #include "lang/env.h"
@@ -8641,6 +8642,8 @@ static ray_t* ray_select_impl(ray_t** args, int64_t n, bool aliases_resolved) {
         ray_group_emit_filter_set(prev_emit_filter);
     if (RAY_IS_ERR(tbl)) return tbl;
     if (tbl->type == RAY_DICT) {
+        ray_t* block = ray_block_select_source(tbl, dict);
+        if (block) { ray_release(tbl); return block; }
         bool complete;
         ray_t* scan = ray_parquet_select_source(tbl,dict,&complete);
         if (scan) { ray_release(tbl); tbl = scan; }
