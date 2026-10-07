@@ -8,6 +8,7 @@
 #include "lang/env.h"
 #include "ops/block_query.h"
 #include "table/sym.h"
+#include "table/domain.h"
 #include <stdlib.h>
 #include <unistd.h>
 
@@ -33,7 +34,8 @@ static void fixture(unsigned rows, bool shadow) {
         ((int64_t*)ray_data(id))[i] = i;
         ((int64_t*)ray_data(x))[i] = i % 5;
         ((int64_t*)ray_data(sy))[i] = ray_sym_intern(i % 2 ? "alpha" : "beta", i % 2 ? 5 : 4);
-        str = ray_str_vec_append(str, i % 2 ? "abcdefghijklm" : "", i % 2 ? 13 : 0);
+        const char* text = i % 3 ? "abcdefghijklm" : "abc\0efghijklm";
+        str = ray_str_vec_append(str, i % 2 ? text : "", i % 2 ? 13 : 0);
     }
     t = ray_table_add_col(t, ray_sym_intern("id", 2), id);
     t = ray_table_add_col(t, ray_sym_intern("x", 1), x);
@@ -189,7 +191,69 @@ static test_result_t descriptor_validation(void) {
     PASS();
 }
 
+static test_result_t builder_growth(void) {
+    fixture(8207, false);
+    ray_t* raw = ray_env_get(ray_sym_intern("raw", 3));
+    ray_vec_set_null(ray_table_get_col_idx(raw, 0), 4096, true);
+    ray_vec_set_null(ray_table_get_col_idx(raw, 3), 4097, true);
+    ray_block_store_options_t options = {256, 1, false};
+    TEST_ASSERT_EQ_I(ray_block_store_save(raw, root, &options), RAY_OK);
+    ray_t* r = ray_eval_str("(select {from: source number: id text: s symbol: sy})");
+    TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(ray_table_nrows(r), 8207);
+    ray_t* numbers = ray_table_get_col_idx(r, 0);
+    ray_t* strings = ray_table_get_col_idx(r, 1);
+    ray_t* symbols = ray_table_get_col_idx(r, 2);
+    TEST_ASSERT_TRUE(ray_vec_is_null(numbers, 4096));
+    TEST_ASSERT_TRUE(ray_vec_is_null(symbols, 4097));
+    TEST_ASSERT_TRUE(ray_sym_vec_domain(symbols) != ray_sym_runtime_domain());
+    TEST_ASSERT_EQ_I(ray_sym_elem_size(symbols->type, symbols->attrs), 8);
+    /* Returned vectors must survive publication/GC, not just query close. */
+    for (unsigned i = 0; i < 3; i++) fixture(0, false);
+    for (int64_t i = 0; i < 8207; i++) {
+        TEST_ASSERT_EQ_I(((int64_t*)ray_data(numbers))[i], i == 4096 ? NULL_I64 : i);
+        size_t n; const char* text = ray_str_vec_get(strings, i, &n);
+        TEST_ASSERT_EQ_I(n, i % 2 ? 13 : 0);
+        TEST_ASSERT_TRUE(!memcmp(text, i % 3 ? "abcdefghijklm" : "abc\0efghijklm", n));
+        ray_t* symbol = ray_sym_vec_cell(symbols, i);
+        const char* expected = i == 4097 ? "" : i % 2 ? "alpha" : "beta";
+        TEST_ASSERT_EQ_I(ray_str_len(symbol), strlen(expected));
+        TEST_ASSERT_TRUE(!memcmp(ray_str_ptr(symbol), expected, strlen(expected)));
+    }
+    ray_release(r);
+    r = ray_eval_str("(select {from: source number: id text: s symbol: sy})");
+    TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(ray_table_nrows(r), 0);
+    TEST_ASSERT_EQ_I(ray_table_get_col_idx(r, 0)->type, RAY_I64);
+    TEST_ASSERT_EQ_I(ray_table_get_col_idx(r, 1)->type, RAY_STR);
+    TEST_ASSERT_EQ_I(ray_table_get_col_idx(r, 2)->type, RAY_SYM);
+    ray_release(r);
+    PASS();
+}
+
+static test_result_t builder_partial_limit(void) {
+    fixture(8207, false);
+    /* First full batch fits; fail after it has been appended. Also exercise
+     * cleanup after many single-row matching ranges, then exact total budget. */
+    const unsigned total = 8207 * 32 + 4103 * 13;
+    const unsigned limits[] = {4096 * 32 + 2048 * 13, 1000, total - 1, total};
+    for (unsigned i = 0; i < 4; i++) {
+        char command[512];
+        snprintf(command, sizeof(command),
+            "(select {from: (.db.block.scan \"%s\" %u) %s number: id text: s symbol: sy})",
+            root, limits[i], i == 1 ? "where: (== x 2)" : "");
+        ray_t* r = ray_eval_str(command);
+        TEST_ASSERT_NOT_NULL(r);
+        if (i < 3) { TEST_ASSERT_TRUE(RAY_IS_ERR(r)); TEST_ASSERT_STR_EQ(ray_err_code(r), "limit"); }
+        else { TEST_ASSERT_FALSE(RAY_IS_ERR(r)); TEST_ASSERT_EQ_I(ray_table_nrows(r), 8207); }
+        ray_release(r);
+    }
+    PASS();
+}
+
 const test_entry_t block_source_entries[] = {
+    {"block_source/builder_growth", builder_growth, setup, teardown},
+    {"block_source/builder_partial_limit", builder_partial_limit, setup, teardown},
     {"block_source/select_parity", select_parity, setup, teardown},
     {"block_source/select_rejections", select_rejections, setup, teardown},
     {"block_source/select_limits", select_limits, setup, teardown},
