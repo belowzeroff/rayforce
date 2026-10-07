@@ -1,6 +1,7 @@
 /* Copyright (c) 2026 Anton Kundenko. MIT license; see LICENSE. */
 #include "block_query.h"
 #include "ops.h"
+#include "lang/eval.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -121,6 +122,10 @@ ray_err_t ray_block_query_open(const char* root, const char* const* columns,
     return RAY_OK;
 }
 
+bool ray_block_query_has_column(const ray_block_query_t* q, const char* name) {
+    return q && ray_block_scan_has_column(q->scan, name);
+}
+
 ray_t* ray_block_query_schema(const ray_block_query_t* q) {
     if (!q) return ray_error("domain", "null block query");
     ray_retain(q->schema);
@@ -161,7 +166,9 @@ ray_t* ray_block_query_next(ray_block_query_t* q) {
     if (q->failed) return ray_error("domain", "block query is terminal; close it");
     ray_t* result;
     for (;;) {
-        if (q->cancelled) { result = ray_error("cancel", "block query cancelled"); break; }
+        if (q->cancelled || ray_eval_is_interrupted()) {
+            result = ray_error("cancel", "block query cancelled"); break;
+        }
         if (!q->n_predicates) { result = ray_block_scan_next(q->scan); break; }
         if (q->mask) {
             const uint8_t* mask = ray_data(q->mask);

@@ -29,8 +29,10 @@ ray_err_t ray_block_query_open(const char* root, const char* const* columns,
                              ray_block_query_t** out);
 /* Owned zero-row output schema, including for an empty/no-match query. */
 ray_t* ray_block_query_schema(const ray_block_query_t* query);
+bool ray_block_query_has_column(const ray_block_query_t* query, const char* name);
 /* Owned table/error, NULL at EOF. Errors and cancellation are terminal. Cancel
- * is checked between calls and filter batches, not during synchronous decode.
+ * and runtime interrupts are checked between calls and filter batches, not
+ * during synchronous decode.
  * Repeated small matching ranges may re-decode boundary blocks. */
 ray_t* ray_block_query_next(ray_block_query_t* query);
 void ray_block_query_cancel(ray_block_query_t* query);
