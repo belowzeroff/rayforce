@@ -5,6 +5,8 @@
 /* Experimental (.db.block.scan path result-bytes [options]) data-only descriptor.
  * Opening occurs at select time, not construction. Result limit covers logical
  * vector bytes and STR pools, not total RSS, vocabulary, or allocator capacity.
+ * A leased generation may mix legacy raw and compressed block columns; scan
+ * batches own copied raw ranges and remain valid after the lease is released.
  * Results grow in singly-owned column buffers; the table is built once at EOF.
  * Options: {batch-rows: I64 payload-bytes: I64 scratch-bytes: I64}.
  * Each key is optional. Defaults: 4096 rows, 8 MiB payload, 8 MiB scratch.

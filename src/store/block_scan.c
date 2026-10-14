@@ -4,7 +4,11 @@
 #include "col.h"
 #include "splay.h"
 #include "block_sym.h"
+#include "core/types.h"
+#include "mem/heap.h"
+#include "table/sym.h"
 #include "table/domain.h"
+#include "vec/str.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -12,6 +16,7 @@
 
 typedef struct {
     ray_col_block_file_t* file;
+    ray_t* raw;
     int64_t name;
     size_t payload_bytes;
 } scan_column_t;
@@ -22,6 +27,8 @@ struct ray_block_scan_s {
     ray_t* names;
     scan_column_t* columns;
     size_t count;
+    uint64_t domain_count;
+    uint32_t domain_crc;
     ray_block_scan_options_t options;
     uint64_t cursor, end;
     bool failed, cancelled;
@@ -30,13 +37,46 @@ struct ray_block_scan_s {
 void ray_block_scan_close(ray_block_scan_t** scan) {
     if (!scan || !*scan) return;
     ray_block_scan_t* s = *scan;
-    for (size_t i = 0; i < s->count; i++) ray_col_block_file_close(&s->columns[i].file);
+    for (size_t i = 0; i < s->count; i++) {
+        ray_col_block_file_close(&s->columns[i].file);
+        ray_release(s->columns[i].raw);
+    }
     free(s->columns);
     ray_release(s->names);
     if (s->domain) ray_sym_domain_release(s->domain);
     ray_splay_lease_release(&s->lease);
     free(s);
     *scan = NULL;
+}
+
+static ray_err_t scan_value_error(ray_t* value) {
+    if (!value) return RAY_ERR_OOM;
+    if (!RAY_IS_ERR(value)) return RAY_OK;
+    ray_err_t err = ray_err_from_obj(value);
+    return err == RAY_ERR_DOMAIN && strcmp(ray_err_code(value), "domain") ?
+        RAY_ERR_CORRUPT : err;
+}
+
+static ray_err_t scan_open_domain(ray_block_scan_t* s, const char* dir,
+                                  uint64_t* count, uint32_t* crc) {
+    if (!s->domain) {
+        char path[1100];
+        int n = snprintf(path, sizeof(path), "%s/.sym", dir);
+        if (n < 0 || (size_t)n >= sizeof(path)) return RAY_ERR_RANGE;
+        ray_err_t err = ray_block_sym_checksum(path, &s->domain_count, &s->domain_crc);
+        if (err) return err;
+        s->domain = ray_sym_domain_open(path);
+        if (!s->domain || (uint64_t)ray_sym_domain_count(s->domain) != s->domain_count)
+            return RAY_ERR_CORRUPT;
+    }
+    *count = s->domain_count;
+    *crc = s->domain_crc;
+    return RAY_OK;
+}
+
+static int8_t scan_column_type(const scan_column_t* column) {
+    if (column->raw) return column->raw->type;
+    return (int8_t)ray_col_block_file_reader(column->file)->type;
 }
 
 static bool scan_name_safe(const char* name, size_t len) {
@@ -112,37 +152,54 @@ ray_err_t ray_block_scan_open(const char* root, const char* const* columns,
     ray_err_t err = ray_splay_lease_acquire(root, &s->lease);
     if (!err) err = scan_check_schema(ray_splay_lease_dir(s->lease), columns, count, &s->names);
     uint64_t rows = 0, generation = 0, sym_count = 0;
-    uint32_t sym_crc = 0;
+    uint64_t actual_sym_count = 0;
+    uint32_t sym_crc = 0, actual_sym_crc = 0;
+    bool have_generation = false;
     for (size_t i = 0; !err && i < count; i++) {
         char path[1300];
         int n = snprintf(path, sizeof(path), "%s/%s", ray_splay_lease_dir(s->lease), columns[i]);
         if (n < 0 || (size_t)n >= sizeof(path)) { err = RAY_ERR_RANGE; break; }
         err = ray_col_block_file_open(path, &s->columns[i].file);
-        if (err) break;
-        const ray_col_block_reader_t* r = ray_col_block_file_reader(s->columns[i].file);
-        if (!i) { rows = r->rows; generation = r->generation; }
-        else if (r->rows != rows || r->generation != generation) { err = RAY_ERR_SCHEMA; break; }
-        if (r->type == RAY_SYM) {
-            if (sym_count && (sym_count != r->sym_count || sym_crc != r->sym_crc)) {
-                err = RAY_ERR_SCHEMA; break;
+        uint64_t column_rows;
+        if (err == RAY_ERR_VERSION) {
+            err = RAY_OK;
+            ray_t* raw = ray_col_mmap_splayed_dom(path, s->domain);
+            if (RAY_IS_ERR(raw) && !strcmp(ray_err_code(raw), "sym") && !s->domain) {
+                ray_error_free(raw);
+                err = scan_open_domain(s, ray_splay_lease_dir(s->lease),
+                                       &actual_sym_count, &actual_sym_crc);
+                if (!err) raw = ray_col_mmap_splayed_dom(path, s->domain);
             }
-            sym_count = r->sym_count; sym_crc = r->sym_crc;
+            if (!err) {
+                err = scan_value_error(raw);
+                if (err) ray_error_free(raw);
+                else {
+                    s->columns[i].raw = raw;
+                    column_rows = (uint64_t)raw->len;
+                }
+            }
+        } else if (!err) {
+            const ray_col_block_reader_t* r = ray_col_block_file_reader(s->columns[i].file);
+            column_rows = r->rows;
+            if (!have_generation) { generation = r->generation; have_generation = true; }
+            else if (r->generation != generation) err = RAY_ERR_SCHEMA;
+            if (!err && r->type == RAY_SYM) {
+                if (sym_count && (sym_count != r->sym_count || sym_crc != r->sym_crc))
+                    err = RAY_ERR_SCHEMA;
+                else { sym_count = r->sym_count; sym_crc = r->sym_crc; }
+            }
         }
+        if (err) break;
+        if (!i) rows = column_rows;
+        else if (column_rows != rows) { err = RAY_ERR_SCHEMA; break; }
         s->columns[i].name = ray_sym_intern(columns[i], strlen(columns[i]));
         if (s->columns[i].name < 0) err = RAY_ERR_OOM;
     }
     if (!err && sym_count) {
-        char path[1100];
-        snprintf(path, sizeof(path), "%s/.sym", ray_splay_lease_dir(s->lease));
-        uint64_t actual_count;
-        uint32_t actual_crc;
-        err = ray_block_sym_checksum(path, &actual_count, &actual_crc);
-        if (!err && (actual_count != sym_count || actual_crc != sym_crc)) err = RAY_ERR_CORRUPT;
-        if (!err) {
-            s->domain = ray_sym_domain_open(path);
-            if (!s->domain || (uint64_t)ray_sym_domain_count(s->domain) != sym_count)
-                err = RAY_ERR_CORRUPT;
-        }
+        err = scan_open_domain(s, ray_splay_lease_dir(s->lease),
+                               &actual_sym_count, &actual_sym_crc);
+        if (!err && (actual_sym_count != sym_count || actual_sym_crc != sym_crc))
+            err = RAY_ERR_CORRUPT;
     }
     if (!err) {
         if (options->start > rows ||
@@ -177,14 +234,77 @@ ray_t* ray_block_scan_schema(const ray_block_scan_t* s) {
     ray_t* schema = ray_table_new((int64_t)s->count);
     if (!schema) return ray_error("oom", "block scan schema allocation failed");
     for (size_t i = 0; !RAY_IS_ERR(schema) && i < s->count; i++) {
-        const ray_col_block_reader_t* r = ray_col_block_file_reader(s->columns[i].file);
-        ray_t* col = ray_col_block_materialize_dom(r, 0, 0, 0, NULL, 0, s->domain);
+        scan_column_t* column = &s->columns[i];
+        ray_t* col = column->raw ? ray_vec_new(scan_column_type(column), 0) :
+            ray_col_block_materialize_dom(ray_col_block_file_reader(column->file),
+                                          0, 0, 0, NULL, 0, s->domain);
+        if (column->raw && col && !RAY_IS_ERR(col) && column->raw->type == RAY_SYM)
+            ray_sym_vec_adopt_domain(col, column->raw);
         if (RAY_IS_ERR(col)) { ray_release(schema); return col; }
         schema = ray_table_add_col(schema, s->columns[i].name, col);
         ray_release(col);
         if (!schema) return ray_error("oom", "block scan schema allocation failed");
     }
     return schema;
+}
+
+static ray_err_t scan_raw_range_size(const ray_t* raw, uint64_t start, uint64_t rows,
+                                     size_t* bytes) {
+    if (!raw || raw->len < 0 || start > (uint64_t)raw->len ||
+        rows > (uint64_t)raw->len - start) return RAY_ERR_RANGE;
+    if (raw->type == RAY_STR) {
+        if (rows > SIZE_MAX / sizeof(ray_str_t)) return RAY_ERR_LIMIT;
+        size_t total = (size_t)rows * sizeof(ray_str_t);
+        for (uint64_t i = 0; i < rows; i++) {
+            size_t len = 0;
+            if (!ray_str_vec_get((ray_t*)raw, (int64_t)(start + i), &len))
+                return RAY_ERR_CORRUPT;
+            if (len > RAY_STR_INLINE_MAX) {
+                if (len > SIZE_MAX - total) return RAY_ERR_LIMIT;
+                total += len;
+            }
+        }
+        *bytes = total;
+        return RAY_OK;
+    }
+    size_t width = raw->type == RAY_SYM ? sizeof(int64_t) : ray_elem_size(raw->type);
+    if (!width || rows > SIZE_MAX / width) return RAY_ERR_LIMIT;
+    *bytes = (size_t)rows * width;
+    return RAY_OK;
+}
+
+static ray_t* scan_raw_materialize(ray_t* raw, uint64_t start, uint64_t rows) {
+    if (rows > INT64_MAX) return ray_error("range", "raw block range exceeds vector length");
+    if (raw->type == RAY_STR) {
+        ray_t* out = ray_vec_new(RAY_STR, (int64_t)rows);
+        if (!out || RAY_IS_ERR(out)) return out;
+        for (uint64_t i = 0; i < rows; i++) {
+            size_t len = 0;
+            const char* str = ray_str_vec_get(raw, (int64_t)(start + i), &len);
+            if (!str && len) { ray_release(out); return ray_error("corrupt", "invalid raw string"); }
+            ray_t* next = ray_str_vec_append(out, str, len);
+            if (!next || RAY_IS_ERR(next)) { ray_release(out); return next; }
+            out = next;
+        }
+        return out;
+    }
+    if (raw->type == RAY_SYM) {
+        ray_t* out = ray_sym_vec_new(RAY_SYM_W64, (int64_t)rows);
+        if (!out || RAY_IS_ERR(out)) return out;
+        for (uint64_t i = 0; i < rows; i++)
+            ray_write_sym(ray_data(out), (int64_t)i,
+                (uint64_t)ray_read_sym(ray_data(raw), (int64_t)(start + i), RAY_SYM, raw->attrs),
+                RAY_SYM, out->attrs);
+        out->len = (int64_t)rows;
+        out->attrs |= raw->attrs & RAY_ATTR_HAS_NULLS;
+        ray_sym_vec_adopt_domain(out, raw);
+        return out;
+    }
+    size_t width = ray_elem_size(raw->type);
+    const uint8_t* data = (const uint8_t*)ray_data(raw) + (size_t)start * width;
+    ray_t* out = ray_vec_from_raw(raw->type, data, (int64_t)rows);
+    if (out && !RAY_IS_ERR(out)) out->attrs |= raw->attrs & RAY_ATTR_HAS_NULLS;
+    return out;
 }
 
 void ray_block_scan_cancel(ray_block_scan_t* s) {
@@ -215,9 +335,15 @@ static ray_t* scan_materialize(ray_block_scan_t* s, const size_t* indices,
     size_t total = 0, scratch_bytes = 0;
     for (size_t i = 0; i < count; i++) {
         scan_column_t* column = &s->columns[indices ? indices[i] : i];
-        const ray_col_block_reader_t* r = ray_col_block_file_reader(column->file);
         size_t bytes, scratch;
-        ray_err_t err = ray_col_block_range_size(r, start, rows, &bytes, &scratch);
+        ray_err_t err;
+        if (column->raw) {
+            err = scan_raw_range_size(column->raw, start, rows, &bytes);
+            scratch = 0;
+        } else {
+            err = ray_col_block_range_size(ray_col_block_file_reader(column->file),
+                                           start, rows, &bytes, &scratch);
+        }
         if (err) return scan_error(s, err);
         if (bytes > s->options.payload_limit - total || scratch > s->options.scratch_limit)
             return scan_error(s, RAY_ERR_LIMIT);
@@ -232,10 +358,11 @@ static ray_t* scan_materialize(ray_block_scan_t* s, const size_t* indices,
     total = 0;
     for (size_t i = 0; i < count; i++) {
         scan_column_t* column = &s->columns[indices ? indices[i] : i];
-        const ray_col_block_reader_t* r = ray_col_block_file_reader(column->file);
         size_t bytes = column->payload_bytes;
         ray_err_t err = RAY_OK;
-        if (r->type == RAY_STR)
+        const ray_col_block_reader_t* r = column->raw ? NULL :
+            ray_col_block_file_reader(column->file);
+        if (r && r->type == RAY_STR)
             err = ray_col_block_payload_size(r, start, rows, scratch, scratch_bytes, &bytes);
         if (!err && bytes > s->options.payload_limit - total) err = RAY_ERR_LIMIT;
         if (err) { free(scratch); return scan_error(s, err); }
@@ -246,8 +373,10 @@ static ray_t* scan_materialize(ray_block_scan_t* s, const size_t* indices,
     if (!batch) { free(scratch); return scan_error(s, RAY_ERR_OOM); }
     for (size_t i = 0; !RAY_IS_ERR(batch) && i < count; i++) {
         scan_column_t* column = &s->columns[indices ? indices[i] : i];
-        const ray_col_block_reader_t* r = ray_col_block_file_reader(column->file);
-        ray_t* col = r->type == RAY_STR ?
+        const ray_col_block_reader_t* r = column->raw ? NULL :
+            ray_col_block_file_reader(column->file);
+        ray_t* col = column->raw ? scan_raw_materialize(column->raw, start, rows) :
+            r->type == RAY_STR ?
             ray_col_block_materialize_str(r, start, rows,
                 column->payload_bytes, scratch, scratch_bytes) :
             ray_col_block_materialize_dom(r, start, rows,

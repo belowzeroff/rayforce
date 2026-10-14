@@ -81,6 +81,77 @@ static void damage(const char* name, long offset) {
         ray_test_fatal("scan test damage");
 }
 
+static void replace_x_raw(unsigned epoch, unsigned rows) {
+    int64_t values[32];
+    for (unsigned i = 0; i < 32; i++) values[i] = epoch * 100 + i;
+    ray_t* col = ray_vec_from_raw(RAY_I64, values, rows);
+    if (!col || RAY_IS_ERR(col)) ray_test_fatal("scan raw vector");
+    char dir[1024], path[1100];
+    if (ray_splay_resolve_dir(root, dir, sizeof(dir))) ray_test_fatal("scan raw resolve");
+    int n = snprintf(path, sizeof(path), "%s/x", dir);
+    if (n < 0 || (size_t)n >= sizeof(path)) ray_test_fatal("scan raw path");
+    ray_err_t err = ray_col_save(col, path);
+    ray_release(col);
+    if (err) ray_test_fatal("scan raw save");
+}
+
+static void truncate_x_raw(void) {
+    char dir[1024], path[1100];
+    if (ray_splay_resolve_dir(root, dir, sizeof(dir))) ray_test_fatal("scan raw resolve");
+    int n = snprintf(path, sizeof(path), "%s/x", dir);
+    if (n < 0 || (size_t)n >= sizeof(path) || truncate(path, 1))
+        ray_test_fatal("scan raw truncate");
+}
+
+static test_result_t mixed_raw_scan(void) {
+    publish(1, 16, 16, 1);
+    replace_x_raw(1, 16);
+    int64_t baseline = mapped();
+    char pinned[1024];
+    TEST_ASSERT_EQ_I(ray_splay_resolve_dir(root, pinned, sizeof(pinned)), RAY_OK);
+    ray_block_scan_options_t options = {2, 12, 5, 60, 64};
+    TEST_ASSERT_EQ_I(ray_block_scan_open(root, names, 2, &options, &scan), RAY_OK);
+    ray_t* retained = ray_block_scan_next(scan);
+    TEST_ASSERT_NOT_NULL(retained); TEST_ASSERT_FALSE(RAY_IS_ERR(retained));
+    TEST_ASSERT_EQ_I(ray_table_nrows(retained), 5);
+    ray_t* x = ray_table_get_col_idx(retained, 0);
+    ray_t* y = ray_table_get_col_idx(retained, 1);
+    for (int64_t i = 0; i < 5; i++) {
+        TEST_ASSERT_EQ_I(((int64_t*)ray_data(x))[i], 102 + i);
+        TEST_ASSERT_EQ_I(((int32_t*)ray_data(y))[i], 1002 + i);
+    }
+    for (unsigned epoch = 2; epoch <= 4; epoch++) publish(epoch, 16, 16, epoch);
+    TEST_ASSERT_EQ_I(access(pinned, F_OK), 0);
+    ray_block_scan_close(&scan);
+    TEST_ASSERT_EQ_I(mapped(), baseline);
+    publish(5, 16, 16, 5);
+    TEST_ASSERT_EQ_I(access(pinned, F_OK), -1);
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(x))[0], 102);
+    ray_release(retained);
+
+    publish(6, 16, 16, 6);
+    replace_x_raw(6, 16);
+    options.start = 0; options.count = 5; options.payload_limit = 59;
+    TEST_ASSERT_EQ_I(ray_block_scan_open(root, names, 2, &options, &scan), RAY_OK);
+    ray_t* error = ray_block_scan_next(scan);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(error)); TEST_ASSERT_STR_EQ(ray_err_code(error), "limit");
+    ray_release(error); ray_block_scan_close(&scan);
+    TEST_ASSERT_EQ_I(mapped(), baseline);
+
+    publish(7, 16, 16, 7);
+    replace_x_raw(7, 15);
+    options.payload_limit = 60;
+    TEST_ASSERT_EQ_I(ray_block_scan_open(root, names, 2, &options, &scan), RAY_ERR_SCHEMA);
+    TEST_ASSERT_TRUE(scan == NULL); TEST_ASSERT_EQ_I(mapped(), baseline);
+
+    publish(8, 16, 16, 8);
+    replace_x_raw(8, 16);
+    truncate_x_raw();
+    TEST_ASSERT_EQ_I(ray_block_scan_open(root, names, 2, &options, &scan), RAY_ERR_CORRUPT);
+    TEST_ASSERT_TRUE(scan == NULL); TEST_ASSERT_EQ_I(mapped(), baseline);
+    PASS();
+}
+
 static test_result_t batches(void) {
     publish(1, 16, 16, 1);
     char pinned[1024];
@@ -1096,6 +1167,7 @@ static test_result_t query_budgets_and_errors(void) {
 }
 
 const test_entry_t block_scan_entries[] = {
+    {"block_scan/mixed_raw_scan", mixed_raw_scan, setup, teardown},
     {"block_scan/query_budgets_and_errors", query_budgets_and_errors, setup, teardown},
     {"block_scan/query_late_materialization", query_late_materialization, setup, teardown},
     {"block_scan/query_conjunction", query_conjunction, setup, teardown},
