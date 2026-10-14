@@ -41,6 +41,7 @@
 #include "core/qmeasure.h"  /* shared per-query measurement lifecycle */
 #include "core/qlog.h"      /* g_qlog — (.sys.querylog) */
 #include "store/serde.h"
+#include "store/block_store.h"
 #include "store/splay.h"
 #include "store/part.h"
 #include "core/ipc.h"
@@ -174,6 +175,70 @@ static const char* str_to_cpath(ray_t* s, char* buf, size_t bufsz) {
     memcpy(buf, p, len);
     buf[len] = '\0';
     return buf;
+}
+
+static const char* block_codec_name(ray_t* value, size_t* len) {
+    if (!value || value->type != -RAY_SYM) return NULL;
+    ray_t* text = ray_sym_str(value->i64);
+    if (!text) return NULL;
+    *len = ray_str_len(text);
+    return ray_str_ptr(text);
+}
+
+static ray_err_t block_store_options(ray_t* value, ray_block_store_options_t* out) {
+    if (!value || value->type != RAY_DICT) return RAY_ERR_TYPE;
+    ray_t* keys = ray_dict_keys(value);
+    ray_t* vals = ray_dict_vals(value);
+    if (!keys || !vals || keys->type != RAY_SYM || vals->type != RAY_LIST ||
+        keys->len != vals->len || keys->len < 2 || keys->len > 3) return RAY_ERR_DOMAIN;
+    *out = (ray_block_store_options_t){0, 0, true};
+    unsigned seen = 0;
+    for (int64_t i = 0; i < keys->len; i++) {
+        ray_t* key = ray_sym_vec_cell(keys, i);
+        const char* name = key && key->type == -RAY_STR ? ray_str_ptr(key) : NULL;
+        size_t len = name ? ray_str_len(key) : 0;
+        unsigned bit = name && len == 11 && !memcmp(name, "block-bytes", 11) ? 1 :
+            name && len == 5 && !memcmp(name, "codec", 5) ? 2 :
+            name && len == 7 && !memcmp(name, "durable", 7) ? 4 : 0;
+        if (!bit || (seen & bit)) return RAY_ERR_DOMAIN;
+        seen |= bit;
+        ray_t* option = ray_list_get(vals, i);
+        if (bit == 1) {
+            if (!option || option->type != -RAY_I64) return RAY_ERR_TYPE;
+            if (option->i64 <= 0 || (uint64_t)option->i64 > UINT32_MAX) return RAY_ERR_RANGE;
+            out->block_bytes = (uint32_t)option->i64;
+        } else if (bit == 2) {
+            size_t codec_len;
+            const char* codec = block_codec_name(option, &codec_len);
+            if (!codec) return RAY_ERR_TYPE;
+            if (codec_len == 4 && !memcmp(codec, "none", 4)) out->codec = 0;
+            else if (codec_len == 6 && !memcmp(codec, "snappy", 6)) out->codec = 1;
+            else return RAY_ERR_DOMAIN;
+        } else {
+            if (!option || option->type != -RAY_BOOL) return RAY_ERR_TYPE;
+            out->durable = option->i64 != 0;
+        }
+    }
+    return (seen & 3) == 3 ? RAY_OK : RAY_ERR_DOMAIN;
+}
+
+/* (.db.block.set path table {block-bytes: I64 codec: SYM durable: BOOL})
+ * block-bytes and codec are required; durable defaults to true. */
+ray_t* ray_block_store_fn(ray_t** args, int64_t n) {
+    if (n != 3) return ray_error("arity", ".db.block.set: path table options");
+    char path[1024];
+    if (!str_to_cpath(args[0], path, sizeof(path)))
+        return ray_error(args[0] && args[0]->type == -RAY_STR ? "domain" : "type",
+                         ".db.block.set: invalid path");
+    if (!args[1] || args[1]->type != RAY_TABLE)
+        return ray_error("type", ".db.block.set: value must be a table");
+    ray_block_store_options_t options;
+    ray_err_t err = block_store_options(args[2], &options);
+    if (err) return ray_error(ray_err_code_str(err), ".db.block.set: invalid options");
+    err = ray_block_store_save(args[1], path, &options);
+    if (err) return ray_error(ray_err_code_str(err), ".db.block.set: save failed");
+    ray_retain(args[1]);
+    return args[1];
 }
 
 /* (.db.splayed.set "dir" table) or (.db.splayed.set "dir" table "sym_path") */
