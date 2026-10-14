@@ -13,12 +13,14 @@ typedef struct {
     size_t payload_limit, scratch_limit;
 } ray_block_scan_options_t;
 
-/* Internal major-2 named-column scan, not yet a query source.
+/* Internal named-column scan over mixed major-0 raw and major-2 block files.
  * Explicit projection: 1..1024 unique, safe column filenames declared by .d.
  * Validates the complete name schema but not unselected column files. Schema
  * is limited to 1 MiB on disk, 1024 entries, and 255 bytes per name. Selected
- * columns must have equal row
- * counts and generation tokens. Acquires a generation lease before mapping.
+ * columns must have equal row counts; compressed columns must also have equal
+ * generation tokens. Acquires a generation lease before mapping. Raw columns
+ * remain mmap-backed inside the scan, but returned batches copy selected rows
+ * and do not retain the mappings.
  * SYM uses the generation's .sym vocabulary, verified by count and CRC before
  * attaching its retained domain to each output vector. Selected SYM columns
  * must reference the same dictionary; numeric-only projections do not open it.

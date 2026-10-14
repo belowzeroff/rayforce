@@ -3,6 +3,7 @@
 #include "test.h"
 #include "store/block_store.h"
 #include "store/splay.h"
+#include "store/col.h"
 #include "store/col_block.h"
 #include "lang/eval.h"
 #include "lang/env.h"
@@ -53,6 +54,85 @@ static void fixture(unsigned rows, bool shadow) {
     ray_t* r = ray_eval_str(command);
     if (!r || RAY_IS_ERR(r)) ray_test_fatal("block source descriptor");
     ray_release(r);
+}
+
+static void make_column_raw(const char* name) {
+    char dir[1024], path[1100];
+    if (ray_splay_resolve_dir(root, dir, sizeof(dir))) ray_test_fatal("block source resolve");
+    int n = snprintf(path, sizeof(path), "%s/%s", dir, name);
+    if (n < 0 || (size_t)n >= sizeof(path)) ray_test_fatal("block source column path");
+    ray_t* table = ray_env_get(ray_sym_intern("raw", 3));
+    ray_t* col = ray_table_get_col(table, ray_sym_intern(name, strlen(name)));
+    ray_err_t err;
+    if (col->type == RAY_SYM) {
+        char sym_path[1100];
+        n = snprintf(sym_path, sizeof(sym_path), "%s/.sym", dir);
+        if (n < 0 || (size_t)n >= sizeof(sym_path)) ray_test_fatal("block source sym path");
+        ray_sym_domain_t* dom = ray_sym_domain_open(sym_path);
+        if (!dom) ray_test_fatal("block source sym domain");
+        err = ray_col_save_sym_encoded(col, path, dom, false);
+        ray_sym_domain_release(dom);
+    } else err = ray_col_save(col, path);
+    if (err) ray_test_fatal("block source raw column");
+}
+
+static test_result_t mixed_format_parity(void) {
+    fixture(4103, false);
+    make_column_raw("x");
+    make_column_raw("s");
+    make_column_raw("sy");
+    ray_t* expected = ray_eval_str(
+        "(select {from: raw where: (and (> x 1) (< x 4)) out: id text: s symbol: sy})");
+    ray_t* actual = ray_eval_str(
+        "(select {from: source where: (and (> x 1) (< x 4)) out: id text: s symbol: sy})");
+    TEST_ASSERT_NOT_NULL(expected); TEST_ASSERT_FALSE(RAY_IS_ERR(expected));
+    TEST_ASSERT_NOT_NULL(actual); TEST_ASSERT_FALSE(RAY_IS_ERR(actual));
+    TEST_ASSERT_EQ_I(ray_table_nrows(actual), ray_table_nrows(expected));
+    for (int64_t c = 0; c < 3; c++) {
+        ray_t* a = ray_table_get_col_idx(actual, c);
+        ray_t* e = ray_table_get_col_idx(expected, c);
+        TEST_ASSERT_EQ_I(a->type, e->type); TEST_ASSERT_EQ_I(a->len, e->len);
+        for (int64_t i = 0; i < a->len; i++) {
+            if (c == 0) TEST_ASSERT_EQ_I(((int64_t*)ray_data(a))[i], ((int64_t*)ray_data(e))[i]);
+            else if (c == 1) {
+                size_t an, en; const char* ap = ray_str_vec_get(a, i, &an);
+                const char* ep = ray_str_vec_get(e, i, &en);
+                TEST_ASSERT_EQ_I(an, en); TEST_ASSERT_TRUE(!memcmp(ap, ep, an));
+            } else {
+                ray_t* as = ray_sym_vec_cell(a, i); ray_t* es = ray_sym_vec_cell(e, i);
+                TEST_ASSERT_EQ_I(ray_str_len(as), ray_str_len(es));
+                TEST_ASSERT_TRUE(!memcmp(ray_str_ptr(as), ray_str_ptr(es), ray_str_len(as)));
+            }
+        }
+    }
+    ray_release(expected); ray_release(actual);
+
+    char command[512];
+    snprintf(command, sizeof(command),
+        "(select {from: (.db.block.scan \"%s\" 1048576 {batch-rows: 1 payload-bytes: 37 scratch-bytes: 0}) where: (== x 2) text: s symbol: sy})",
+        root);
+    actual = ray_eval_str(command);
+    TEST_ASSERT_NOT_NULL(actual); TEST_ASSERT_FALSE(RAY_IS_ERR(actual)); ray_release(actual);
+    snprintf(command, sizeof(command),
+        "(select {from: (.db.block.scan \"%s\" 1048576 {batch-rows: 1 payload-bytes: 36 scratch-bytes: 0}) where: (== x 2) text: s symbol: sy})",
+        root);
+    actual = ray_eval_str(command);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(actual)); TEST_ASSERT_STR_EQ(ray_err_code(actual), "limit");
+    ray_release(actual);
+
+    expected = ray_eval_str(
+        "(select {from: raw where: (>= x 2) n: (count id) total: (sum id) mean: (avg id)})");
+    actual = ray_eval_str(
+        "(select {from: source where: (>= x 2) n: (count id) total: (sum id) mean: (avg id)})");
+    TEST_ASSERT_NOT_NULL(expected); TEST_ASSERT_FALSE(RAY_IS_ERR(expected));
+    TEST_ASSERT_NOT_NULL(actual); TEST_ASSERT_FALSE(RAY_IS_ERR(actual));
+    for (int64_t c = 0; c < 3; c++) {
+        ray_t* a = ray_table_get_col_idx(actual, c); ray_t* e = ray_table_get_col_idx(expected, c);
+        TEST_ASSERT_EQ_I(a->type, e->type);
+        TEST_ASSERT_TRUE(!memcmp(ray_data(a), ray_data(e), ray_type_sizes[(uint8_t)a->type]));
+    }
+    ray_release(expected); ray_release(actual);
+    PASS();
 }
 
 static test_result_t select_parity(void) {
@@ -520,6 +600,7 @@ static test_result_t aggregate_batch_options(void) {
 }
 
 const test_entry_t block_source_entries[] = {
+    {"block_source/mixed_format_parity", mixed_format_parity, setup, teardown},
     {"block_source/scan_work_limits", scan_work_limits, setup, teardown},
     {"block_source/scan_options_admission", scan_options_admission, setup, teardown},
     {"block_source/aggregate_batch_options", aggregate_batch_options, setup, teardown},
