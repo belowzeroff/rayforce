@@ -41,21 +41,55 @@ static const char* name(ray_t* s) {
         string(ray_sym_str(s->i64)) : NULL;
 }
 
+static ray_err_t scan_options(ray_t* opts, ray_block_scan_options_t* out) {
+    *out = (ray_block_scan_options_t){0, UINT64_MAX, BLOCK_SOURCE_BATCH_ROWS,
+                                    8u * 1024 * 1024, 8u * 1024 * 1024};
+    if (!opts) return RAY_OK;
+    /* The parser represents {} using empty LIST keys and values. */
+    ray_t* empty_keys = ray_dict_keys(opts); ray_t* empty_vals = ray_dict_vals(opts);
+    if (empty_keys && empty_vals && empty_keys->type == RAY_LIST && empty_vals->type == RAY_LIST &&
+        !empty_keys->len && !empty_vals->len) return RAY_OK;
+    if (!dictionary(opts)) return RAY_ERR_TYPE;
+    ray_t* keys = ray_dict_keys(opts); ray_t* vals = ray_dict_vals(opts);
+    if (keys->len > 3) return RAY_ERR_DOMAIN;
+    unsigned seen = 0;
+    for (int64_t i = 0; i < keys->len; i++) {
+        const char* key = string(ray_sym_vec_cell(keys, i));
+        unsigned bit = !key ? 0 : !strcmp(key, "batch-rows") ? 1 :
+            !strcmp(key, "payload-bytes") ? 2 : !strcmp(key, "scratch-bytes") ? 4 : 0;
+        if (!bit || (seen & bit)) return RAY_ERR_DOMAIN;
+        seen |= bit;
+        ray_t* value = ray_list_get(vals, i);
+        if (!value || value->type != -RAY_I64) return RAY_ERR_TYPE;
+        if (value->i64 < 0 || (uint64_t)value->i64 > SIZE_MAX) return RAY_ERR_RANGE;
+        if (bit == 1) {
+            if (!value->i64 || (uint64_t)value->i64 > UINT32_MAX) return RAY_ERR_RANGE;
+            out->batch_rows = (uint32_t)value->i64;
+        } else if (bit == 2) out->payload_limit = (size_t)value->i64;
+        else out->scratch_limit = (size_t)value->i64;
+    }
+    return RAY_OK;
+}
+
 ray_t* ray_block_source_fn(ray_t** args, int64_t n) {
     if (ray_eval_get_restricted()) return ray_error("access", "restricted");
-    if (n != 2) return ray_error("arity", ".db.block.scan: path result-bytes");
+    if (n != 2 && n != 3) return ray_error("arity", ".db.block.scan: path result-bytes [options]");
     if (!string(args[0]) || args[1]->type != -RAY_I64 || args[1]->i64 <= 0 ||
         (uint64_t)args[1]->i64 > SIZE_MAX)
         return ray_error("domain", ".db.block.scan: nonempty path and positive I64 result limit required");
-    int64_t names[] = {ray_sym_intern(".hdb.block.source", 17), ray_sym_intern(".hdb.block.limit", 16)};
-    if (names[0] < 0 || names[1] < 0) return ray_error("oom", NULL);
-    ray_t* keys = ray_vec_from_raw(RAY_SYM, names, 2);
-    ray_t* vals = ray_list_new(2);
+    ray_block_scan_options_t options;
+    ray_err_t err = scan_options(n == 3 ? args[2] : NULL, &options);
+    if (err) return ray_error(ray_err_code_str(err), "invalid block scan options");
+    int64_t names[] = {ray_sym_intern(".hdb.block.source", 17), ray_sym_intern(".hdb.block.limit", 16),
+                       ray_sym_intern(".hdb.block.options", 18)};
+    if (names[0] < 0 || names[1] < 0 || names[2] < 0) return ray_error("oom", NULL);
+    ray_t* keys = ray_vec_from_raw(RAY_SYM, names, n);
+    ray_t* vals = ray_list_new(n);
     if (!keys || RAY_IS_ERR(keys) || !vals || RAY_IS_ERR(vals)) {
         ray_release(keys); ray_release(vals); return ray_error("oom", NULL);
     }
-    for (int i = 0; i < 2; i++) { ray_retain(args[i]); ((ray_t**)ray_data(vals))[i] = args[i]; }
-    vals->len = 2;
+    for (int64_t i = 0; i < n; i++) { ray_retain(args[i]); ((ray_t**)ray_data(vals))[i] = args[i]; }
+    vals->len = n;
     return ray_dict_new(keys, vals);
 }
 
@@ -209,9 +243,10 @@ typedef struct {
 
 static ray_t* aggregate_result(ray_block_query_t* cursor, const aggregate_t* const* kinds,
                                const size_t* positions, const int64_t* aliases,
-                               size_t count, size_t remaining) {
+                               size_t count, size_t remaining, uint32_t batch_rows) {
     aggregate_state_t* states = calloc(count, sizeof(*states));
-    uint32_t* gids = calloc(BLOCK_SOURCE_BATCH_ROWS, sizeof(*gids));
+    uint32_t chunk_rows = batch_rows < BLOCK_SOURCE_BATCH_ROWS ? batch_rows : BLOCK_SOURCE_BATCH_ROWS;
+    uint32_t* gids = calloc(chunk_rows, sizeof(*gids));
     ray_t* schema = NULL;
     ray_t* result = NULL;
     if (!states || !gids) goto done;
@@ -256,17 +291,27 @@ static ray_t* aggregate_result(ray_block_query_t* cursor, const aggregate_t* con
          * counter allows more, but use one conservative cap for all avg plans.
          * Count includes nulls, so this also bounds every live-value counter. */
         uint64_t cap = has_avg ? INT32_MAX : INT64_MAX;
-        if (rows > BLOCK_SOURCE_BATCH_ROWS || rows > cap - total) {
+        if (rows > batch_rows || rows > cap - total) {
             ray_release(batch); result = ray_error("limit", "block select: aggregate row limit exceeded"); goto done;
         }
         total += rows;
-        for (size_t a = 0; a < count; a++) {
+        for (size_t a = 0; a < count && !result; a++) {
             ray_t* col = ray_table_get_col_idx(batch, (int64_t)positions[a]);
-            ray_valid_t valid = {ray_data(col), col->type, ray_vec_may_have_nulls(col)};
             const agg_vtable_t* k = states[a].kernel;
-            k->update_batch(states[a].state, k->state_size, gids, ray_data(col), &valid, (int64_t)rows, NULL);
+            size_t width = ray_sym_elem_size(col->type, col->attrs);
+            /* Keep the group-id workspace fixed even when the caller selects
+             * a larger input batch. Validity must use the same offset as vals. */
+            for (uint64_t offset = 0; offset < rows; offset += chunk_rows) {
+                if (ray_eval_is_interrupted()) { result = ray_error("cancel", "block aggregate interrupted"); break; }
+                uint64_t n = rows - offset;
+                if (n > chunk_rows) n = chunk_rows;
+                const uint8_t* data = (const uint8_t*)ray_data(col) + (size_t)offset * width;
+                ray_valid_t valid = {data, col->type, ray_vec_may_have_nulls(col)};
+                k->update_batch(states[a].state, k->state_size, gids, data, &valid, (int64_t)n, NULL);
+            }
         }
         ray_release(batch);
+        if (result) goto done;
     }
     result = ray_table_new((int64_t)count);
     for (size_t a = 0; result && !RAY_IS_ERR(result) && a < count; a++) {
@@ -297,9 +342,13 @@ ray_t* ray_block_select_source(ray_t* source, ray_t* query) {
     if (!path) return NULL;
     if (ray_eval_get_restricted()) return ray_error("access", "restricted");
     ray_t* limit = field(source, ".hdb.block.limit");
-    if (ray_dict_len(source) != 2 || !string(path) || !limit || limit->type != -RAY_I64 ||
+    ray_t* opts = field(source, ".hdb.block.options");
+    if (ray_dict_len(source) != (opts ? 3 : 2) || !string(path) || !limit || limit->type != -RAY_I64 ||
         limit->i64 <= 0 || (uint64_t)limit->i64 > SIZE_MAX)
         return ray_error("domain", "invalid block source descriptor");
+    ray_block_scan_options_t options;
+    ray_err_t option_err = scan_options(opts, &options);
+    if (option_err) return ray_error(ray_err_code_str(option_err), "invalid block scan options");
     if (!dictionary(query)) return ray_error("type", "invalid block query");
     const char* columns[RAY_BLOCK_SCAN_MAX_COLUMNS];
     int64_t aliases[RAY_BLOCK_SCAN_MAX_COLUMNS];
@@ -340,7 +389,6 @@ ray_t* ray_block_select_source(ray_t* source, ray_t* query) {
     ray_t* where = field(query, "where");
     if (where && !predicates(where, pred, &n_pred, 0))
         return ray_error("nyi", "block select requires builtin comparisons and binary AND with typed literals");
-    ray_block_scan_options_t options = {0, UINT64_MAX, BLOCK_SOURCE_BATCH_ROWS, 8u * 1024 * 1024, 8u * 1024 * 1024};
     ray_block_query_t* cursor = NULL;
     ray_err_t err = ray_block_query_open(string(path), columns, n_columns, pred, n_pred, &options, &cursor);
     if (err) return ray_error(ray_err_code_str(err), "block select: source or predicate admission failed");
@@ -353,7 +401,7 @@ ray_t* ray_block_select_source(ray_t* source, ray_t* query) {
             shadowed |= ray_block_query_has_column(cursor, comparisons[i].name);
         if (shadowed) { result = ray_error("nyi", "block select: operator-named columns are not supported"); goto done; }
     }
-    result = aggregate ? aggregate_result(cursor, kinds, positions, aliases, count, (size_t)limit->i64) :
+    result = aggregate ? aggregate_result(cursor, kinds, positions, aliases, count, (size_t)limit->i64, options.batch_rows) :
                          collect(cursor, aliases, count, (size_t)limit->i64);
 done:
     ray_block_query_close(&cursor);
