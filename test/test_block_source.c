@@ -7,6 +7,7 @@
 #include "lang/eval.h"
 #include "lang/env.h"
 #include "ops/block_query.h"
+#include "ops/block_source.h"
 #include "table/sym.h"
 #include "table/domain.h"
 #include <stdlib.h>
@@ -413,7 +414,115 @@ static test_result_t aggregate_corruption(void) {
     PASS();
 }
 
+static test_result_t scan_work_limits(void) {
+    fixture(64, false);
+    const char* opts[] = {
+        "{batch-rows: 1 payload-bytes: 45 scratch-bytes: 256}",
+        "{batch-rows: 1 payload-bytes: 44 scratch-bytes: 256}",
+        "{batch-rows: 1 payload-bytes: 45 scratch-bytes: 255}",
+        "{batch-rows: 2 payload-bytes: 45 scratch-bytes: 256}",
+        "{batch-rows: 1 payload-bytes: 7 scratch-bytes: 256}"
+    };
+    for (unsigned i = 0; i < sizeof(opts) / sizeof(*opts); i++) {
+        char command[512];
+        snprintf(command, sizeof(command),
+            "(select {from: (.db.block.scan \"%s\" 8192 %s) where: (>= x 0) number: id text: s symbol: sy})",
+            root, opts[i]);
+        ray_t* r = ray_eval_str(command);
+        TEST_ASSERT_NOT_NULL(r);
+        if (i) { TEST_ASSERT_TRUE(RAY_IS_ERR(r)); TEST_ASSERT_STR_EQ(ray_err_code(r), "limit"); }
+        else {
+            TEST_ASSERT_FALSE(RAY_IS_ERR(r)); TEST_ASSERT_EQ_I(ray_table_nrows(r), 64);
+            ray_t* id = ray_table_get_col_idx(r, 0);
+            for (int64_t j = 0; j < id->len; j++) TEST_ASSERT_EQ_I(((int64_t*)ray_data(id))[j], j);
+        }
+        ray_release(r);
+    }
+    fixture(0, false);
+    char command[512];
+    snprintf(command, sizeof(command),
+        "(select {from: (.db.block.scan \"%s\" 1 {payload-bytes: 0 scratch-bytes: 0}) id: id})", root);
+    ray_t* r = ray_eval_str(command);
+    TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r)); TEST_ASSERT_EQ_I(ray_table_nrows(r), 0);
+    ray_release(r);
+    PASS();
+}
+
+static test_result_t scan_options_admission(void) {
+    const char* invalid[] = {
+        "42", "{batch-rows: 0}", "{batch-rows: -1}", "{batch-rows: 4294967296}",
+        "{payload-bytes: -1}", "{scratch-bytes: 0Nl}", "{batch-rows: 2.0}",
+        "{batch-rows: true}", "{unknown: 1}", "{payload-bytes: \"1\"}"
+    };
+    for (unsigned i = 0; i < sizeof(invalid) / sizeof(*invalid); i++) {
+        char command[512];
+        snprintf(command, sizeof(command), "(.db.block.scan \"/missing-hdb-options\" 1024 %s)", invalid[i]);
+        ray_t* r = ray_eval_str(command);
+        TEST_ASSERT_TRUE(RAY_IS_ERR(r)); TEST_ASSERT_TRUE(strcmp(ray_err_code(r), "io") != 0); ray_release(r);
+        snprintf(command, sizeof(command),
+            "(select {from: {.hdb.block.source: \"/missing-hdb-options\" .hdb.block.limit: 1024 .hdb.block.options: %s} id: id})",
+            invalid[i]);
+        r = ray_eval_str(command);
+        TEST_ASSERT_TRUE(RAY_IS_ERR(r)); TEST_ASSERT_TRUE(strcmp(ray_err_code(r), "io") != 0); ray_release(r);
+    }
+    fixture(16, false);
+    char command[512];
+    snprintf(command, sizeof(command), "(select {from: (.db.block.scan \"%s\" 128 {}) id: id})", root);
+    ray_t* r = ray_eval_str(command);
+    TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r)); TEST_ASSERT_EQ_I(ray_table_nrows(r), 16); ray_release(r);
+    /* External descriptors can contain duplicate keys that the parser's
+     * dictionary builder would otherwise merge. Reject them at both gates. */
+    int64_t duplicate[] = {ray_sym_intern("batch-rows", 10), ray_sym_intern("batch-rows", 10)};
+    ray_t* keys = ray_vec_from_raw(RAY_SYM, duplicate, 2);
+    ray_t* vals = ray_list_new(2);
+    ((ray_t**)ray_data(vals))[0] = ray_i64(1); ((ray_t**)ray_data(vals))[1] = ray_i64(2); vals->len = 2;
+    ray_t* bad = ray_dict_new(keys, vals);
+    ray_t* args[] = {ray_str(root, strlen(root)), ray_i64(128), bad};
+    r = ray_block_source_fn(args, 3);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r)); TEST_ASSERT_STR_EQ(ray_err_code(r), "domain"); ray_release(r);
+    ray_t* descriptor = ray_block_source_fn(args, 2);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(descriptor));
+    ray_t* option_key = ray_sym(ray_sym_intern(".hdb.block.options", 18));
+    descriptor = ray_dict_upsert(descriptor, option_key, bad); ray_release(option_key);
+    TEST_ASSERT_EQ_I(ray_env_set(ray_sym_intern("forged", 6), descriptor), RAY_OK);
+    ray_release(descriptor);
+    r = ray_eval_str("(select {from: forged id: id})");
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r)); TEST_ASSERT_STR_EQ(ray_err_code(r), "domain"); ray_release(r);
+    for (unsigned i = 0; i < 3; i++) ray_release(args[i]);
+    PASS();
+}
+
+static test_result_t aggregate_batch_options(void) {
+    fixture(8207, false);
+    ray_t* raw = ray_env_get(ray_sym_intern("raw", 3));
+    ray_t* id = ray_table_get_col_idx(raw, 0);
+    for (int64_t i = 4096; i < 8192; i++) ray_vec_set_null(id, i, true);
+    ray_block_store_options_t write = {256, 1, false};
+    TEST_ASSERT_EQ_I(ray_block_store_save(raw, root, &write), RAY_OK);
+    ray_t* expected = ray_eval_str("(select {from: raw n: (count id) total: (sum id) mean: (avg id) lo: (min id) hi: (max id) ns: (count s)})");
+    TEST_ASSERT_NOT_NULL(expected); TEST_ASSERT_FALSE(RAY_IS_ERR(expected));
+    const uint32_t sizes[] = {1, 31, 4096, 8192, UINT32_MAX};
+    for (unsigned i = 0; i < sizeof(sizes) / sizeof(*sizes); i++) {
+        char command[512];
+        snprintf(command, sizeof(command),
+            "(select {from: (.db.block.scan \"%s\" 48 {batch-rows: %u}) n: (count id) total: (sum id) mean: (avg id) lo: (min id) hi: (max id) ns: (count s)})", root, sizes[i]);
+        ray_t* r = ray_eval_str(command);
+        TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r)); TEST_ASSERT_EQ_I(ray_table_nrows(r), 1);
+        for (int64_t c = 0; c < 6; c++) {
+            ray_t* a = ray_table_get_col_idx(r, c); ray_t* e = ray_table_get_col_idx(expected, c);
+            TEST_ASSERT_EQ_I(a->type, e->type);
+            TEST_ASSERT_TRUE(!memcmp(ray_data(a), ray_data(e), ray_type_sizes[(uint8_t)a->type]));
+        }
+        ray_release(r);
+    }
+    ray_release(expected);
+    PASS();
+}
+
 const test_entry_t block_source_entries[] = {
+    {"block_source/scan_work_limits", scan_work_limits, setup, teardown},
+    {"block_source/scan_options_admission", scan_options_admission, setup, teardown},
+    {"block_source/aggregate_batch_options", aggregate_batch_options, setup, teardown},
     {"block_source/aggregate_corruption", aggregate_corruption, setup, teardown},
     {"block_source/aggregate_parity", aggregate_parity, setup, teardown},
     {"block_source/aggregate_types", aggregate_types, setup, teardown},
