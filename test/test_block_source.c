@@ -272,6 +272,66 @@ static test_result_t descriptor_validation(void) {
     PASS();
 }
 
+static test_result_t block_store_api(void) {
+    fixture(17, false);
+    char target[128], command[512];
+    snprintf(target, sizeof(target), "%s/api", root);
+    snprintf(command, sizeof(command),
+        "(.db.block.set \"%s\" raw {block-bytes: 256 codec: 'snappy durable: false})",
+        target);
+    ray_t* r = ray_eval_str(command);
+    TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(r->type, RAY_TABLE); TEST_ASSERT_EQ_I(ray_table_nrows(r), 17);
+    ray_release(r);
+
+    snprintf(command, sizeof(command),
+        "(select {from: (.db.block.scan \"%s\" 4096) where: (== x 2) id: id text: s symbol: sy})",
+        target);
+    r = ray_eval_str(command);
+    TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(ray_table_nrows(r), 3);
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(ray_table_get_col_idx(r, 0)))[0], 2);
+    ray_release(r);
+
+    snprintf(command, sizeof(command),
+        "(.db.block.set \"%s/none\" raw {codec: 'none block-bytes: 256})", root);
+    r = ray_eval_str(command);
+    TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r)); ray_release(r);
+    snprintf(command, sizeof(command),
+        "(select {from: (.db.block.scan \"%s/none\" 4096) n: (count id)})", root);
+    r = ray_eval_str(command);
+    TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(*(int64_t*)ray_data(ray_table_get_col_idx(r, 0)), 17);
+    ray_release(r);
+
+    const char* invalid[] = {
+        "(.db.block.set \"%s/bad\" raw)",
+        "(.db.block.set 1 raw {block-bytes: 256 codec: 'snappy})",
+        "(.db.block.set \"%s/bad\" 1 {block-bytes: 256 codec: 'snappy})",
+        "(.db.block.set \"%s/bad\" raw {})",
+        "(.db.block.set \"%s/bad\" raw {block-bytes: 0 codec: 'snappy})",
+        "(.db.block.set \"%s/bad\" raw {block-bytes: 256 codec: 'other})",
+        "(.db.block.set \"%s/bad\" raw {block-bytes: 256 codec: \"snappy\"})",
+        "(.db.block.set \"%s/bad\" raw {block-bytes: 256 codec: 'none extra: 1})",
+        "(.db.block.set \"%s/bad\" raw {block-bytes: 256 codec: 'none durable: 1})"
+    };
+    for (unsigned i = 0; i < sizeof(invalid) / sizeof(*invalid); i++) {
+        snprintf(command, sizeof(command), invalid[i], root);
+        r = ray_eval_str(command);
+        TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_TRUE(RAY_IS_ERR(r)); ray_release(r);
+    }
+    char bad[128]; snprintf(bad, sizeof(bad), "%s/bad", root);
+    TEST_ASSERT_EQ_I(access(bad, F_OK), -1);
+
+    ray_eval_set_restricted(true);
+    snprintf(command, sizeof(command),
+        "(.db.block.set \"%s/restricted\" raw {block-bytes: 256 codec: 'none})", root);
+    r = ray_eval_str(command);
+    ray_eval_set_restricted(false);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r)); TEST_ASSERT_STR_EQ(ray_err_code(r), "access"); ray_release(r);
+    PASS();
+}
+
 static test_result_t builder_growth(void) {
     fixture(8207, false);
     ray_t* raw = ray_env_get(ray_sym_intern("raw", 3));
@@ -600,6 +660,7 @@ static test_result_t aggregate_batch_options(void) {
 }
 
 const test_entry_t block_source_entries[] = {
+    {"block_source/block_store_api", block_store_api, setup, teardown},
     {"block_source/mixed_format_parity", mixed_format_parity, setup, teardown},
     {"block_source/scan_work_limits", scan_work_limits, setup, teardown},
     {"block_source/scan_options_admission", scan_options_admission, setup, teardown},
