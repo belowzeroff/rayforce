@@ -221,7 +221,7 @@ ray_err_t ray_block_store_parse_options(ray_t* value, ray_block_store_options_t*
             else return RAY_ERR_DOMAIN;
         } else {
             if (!option || option->type != -RAY_BOOL) return RAY_ERR_TYPE;
-            out->durable = option->i64 != 0;
+            out->durable = option->b8 != 0;
         }
     }
     return RAY_OK;

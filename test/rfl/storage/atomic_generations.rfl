@@ -52,6 +52,6 @@
 (.db.splayed.set agLeaf (table ['x] (list [13 14])))
 (.db.splayed.set agLeaf (table ['x] (list [15 16])))
 (.sys.exec "test $(find /tmp/rf_test_atomic_generations/2026.09.28/t/.generations -mindepth 1 -maxdepth 1 -type d | wc -l) -eq 1") -- 0
-(.sys.exec "test \"$(ls -A /tmp/rf_test_atomic_generations/2026.09.28/t | tr '\\n' ' ')\" = '.current .generations .write.lock '") -- 0
+(.sys.exec "test \"$(ls -A /tmp/rf_test_atomic_generations/2026.09.28/t | tr '\\n' ' ')\" = '.current .generations .publish.lock .write.lock '") -- 0
 (sum (at (.db.splayed.get agLeaf) 'x)) -- 31
 (.sys.exec "rm -rf /tmp/rf_test_atomic_generations") -- 0

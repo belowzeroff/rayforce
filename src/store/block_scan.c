@@ -414,8 +414,14 @@ static uint32_t scan_auto_rows(const ray_block_scan_t* s) {
         int8_t type = scan_column_type(c);
         if (type == RAY_SYM) width += 8;
         else if (type != RAY_STR) width += ray_elem_size(type);
-        else if (c->raw) width += 32;
-        else {
+        else if (c->raw) {
+            /* Descriptor plus the column's average pooled (non-inline) bytes,
+             * which scan_raw_range_size charges against the payload. */
+            const ray_t* raw = c->raw->attrs & RAY_ATTR_SLICE ? c->raw->slice_parent : c->raw;
+            const ray_t* pool = raw->str_pool;
+            width += 16 + (raw->len > 0 && pool && !RAY_IS_ERR(pool) && pool->len > 0 ?
+                (double)pool->len / (double)raw->len : 0);
+        } else {
             const ray_col_block_reader_t* r = ray_col_block_file_reader(c->file);
             ray_col_block_summary_t sum;
             double avg = r->rows && !ray_col_block_summary(r, &sum) ?

@@ -117,6 +117,9 @@ bool ray_snappy_decompress(const uint8_t* src, size_t len,
         if (!(b & 128)) break;
     }
     if (expected != size) return false;
+    /* An empty block is only its length; dst may be NULL, so no pointer
+     * arithmetic on it. */
+    if (!size) return in == len;
     /* Fast loop while both buffers have slack for unconditional wide moves:
      * 20 input bytes cover a tag, its operands and a 16-byte literal move;
      * 80 output bytes cover a 64-byte copy plus a trailing 8-byte move. Long

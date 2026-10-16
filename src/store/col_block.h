@@ -43,7 +43,9 @@ typedef struct {
     uint8_t* verified;
     /* Optional block_bytes buffer (allocated on first use) holding the last
      * partially read fixed-width block, so consecutive ranges inside one
-     * block decode it once. Outside scratch budgets. NULL disables reuse. */
+     * block decode it once. Outside scratch budgets. NULL disables reuse.
+     * Not synchronized: read_range on one reader with a cache must not run
+     * concurrently. Pool workers use ray_col_block_read, which skips it. */
     ray_col_block_cache_t* cache;
 } ray_col_block_reader_t;
 

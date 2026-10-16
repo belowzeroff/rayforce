@@ -42,6 +42,8 @@ static test_result_t test_snappy_bounds(void) {
     TEST_ASSERT_EQ_I(ray_snappy_compress(NULL, 0, encoded, bound, workspace), 1);
     TEST_ASSERT_EQ_I(encoded[0], 0);
     TEST_ASSERT_TRUE(ray_snappy_decompress(encoded, 1, NULL, 0));
+    const uint8_t trailing[] = {0, 0};
+    TEST_ASSERT_FALSE(ray_snappy_decompress(trailing, 2, NULL, 0));
     TEST_ASSERT_FALSE(ray_snappy_decompress(NULL, 0, NULL, 0));
     TEST_ASSERT_FALSE(ray_snappy_decompress(encoded, 0, decoded, 0));
     TEST_ASSERT_FALSE(ray_snappy_decompress(encoded, 1, NULL, 1));
