@@ -546,6 +546,44 @@ static bool charge(ray_t* table, size_t* remaining) {
     return true;
 }
 
+/* Result vectors shaped like schema's columns; SYM keeps its domain. */
+static ray_t* collect_vectors(ray_t* schema, ray_t** vectors, size_t count) {
+    for (size_t c = 0; c < count; c++) {
+        ray_t* col = ray_table_get_col_idx(schema, (int64_t)c);
+        ray_t* v = col->type == RAY_SYM ? ray_sym_vec_new(RAY_SYM_W64, 0) : ray_vec_new(col->type, 0);
+        if (!v || RAY_IS_ERR(v)) return v ? v : ray_error("oom", NULL);
+        vectors[c] = v;
+        if (col->type == RAY_SYM) ray_sym_vec_adopt_domain(v, col);
+    }
+    return NULL;
+}
+
+/* Append a batch to singly owned vectors, so they grow geometrically instead
+ * of being copied by table concatenation. NULL or an owned error. */
+static ray_t* collect_append(ray_t** vectors, size_t count, ray_t* batch) {
+    for (size_t c = 0; c < count; c++) {
+        ray_t* src = ray_table_get_col_idx(batch, (int64_t)c);
+        if (src->type != vectors[c]->type || (src->type == RAY_SYM &&
+            (ray_sym_elem_size(src->type, src->attrs) != 8 ||
+             ray_sym_vec_domain(src) != ray_sym_vec_domain(vectors[c]))))
+            return ray_error("schema", "block select: inconsistent batch column");
+        if (src->type == RAY_STR) {
+            for (int64_t i = 0; i < src->len; i++) {
+                size_t len; const char* s = ray_str_vec_get(src, i, &len);
+                ray_t* v = ray_str_vec_append(vectors[c], s, len);
+                if (!v || RAY_IS_ERR(v)) return v ? v : ray_error("oom", NULL);
+                vectors[c] = v;
+            }
+        } else {
+            ray_t* v = ray_vec_append_raw(vectors[c], ray_data(src), src->len);
+            if (!v || RAY_IS_ERR(v)) return v ? v : ray_error("oom", NULL);
+            vectors[c] = v;
+        }
+        vectors[c]->attrs |= src->attrs & RAY_ATTR_HAS_NULLS;
+    }
+    return NULL;
+}
+
 static ray_t* collect(ray_block_query_t* cursor, const int64_t* aliases,
                       size_t count, size_t remaining) {
     ray_t** vectors = calloc(count, sizeof(*vectors));
@@ -553,13 +591,8 @@ static ray_t* collect(ray_block_query_t* cursor, const int64_t* aliases,
     ray_t* schema = ray_block_query_schema(cursor);
     ray_t* result = NULL;
     if (!schema || RAY_IS_ERR(schema)) { result = schema; schema = NULL; goto done; }
-    for (size_t c = 0; c < count; c++) {
-        ray_t* col = ray_table_get_col_idx(schema, (int64_t)c);
-        ray_t* v = col->type == RAY_SYM ? ray_sym_vec_new(RAY_SYM_W64, 0) : ray_vec_new(col->type, 0);
-        if (!v || RAY_IS_ERR(v)) { result = v; goto done; }
-        vectors[c] = v;
-        if (col->type == RAY_SYM) ray_sym_vec_adopt_domain(v, col);
-    }
+    result = collect_vectors(schema, vectors, count);
+    if (result) goto done;
     ray_release(schema); schema = NULL;
     size_t budget = remaining;
     for (;;) {
@@ -589,30 +622,7 @@ static ray_t* collect(ray_block_query_t* cursor, const int64_t* aliases,
             result = ray_error(ray_err_code_str(reserve_err), "block select: copy working set exceeds limit");
             goto done;
         }
-        /* These vectors have a single owner until final table construction, so
-         * append can grow geometrically instead of copying via table concat. */
-        for (size_t c = 0; c < count; c++) {
-            ray_t* src = ray_table_get_col_idx(batch, (int64_t)c);
-            if (src->type != vectors[c]->type || (src->type == RAY_SYM &&
-                (ray_sym_elem_size(src->type, src->attrs) != 8 ||
-                 ray_sym_vec_domain(src) != ray_sym_vec_domain(vectors[c])))) {
-                result = ray_error("schema", "block select: inconsistent batch column"); break;
-            }
-            if (src->type == RAY_STR) {
-                for (int64_t i = 0; i < src->len; i++) {
-                    size_t len; const char* s = ray_str_vec_get(src, i, &len);
-                    ray_t* v = ray_str_vec_append(vectors[c], s, len);
-                    if (!v || RAY_IS_ERR(v)) { result = v ? v : ray_error("oom", NULL); break; }
-                    vectors[c] = v;
-                }
-            } else {
-                ray_t* v = ray_vec_append_raw(vectors[c], ray_data(src), src->len);
-                if (!v || RAY_IS_ERR(v)) result = v ? v : ray_error("oom", NULL);
-                else vectors[c] = v;
-            }
-            if (result) break;
-            vectors[c]->attrs |= src->attrs & RAY_ATTR_HAS_NULLS;
-        }
+        result = collect_append(vectors, count, batch);
         ray_release(batch);
         if (result) goto done;
     }
@@ -924,4 +934,40 @@ ray_t* ray_block_select_source(ray_t* source, ray_t* query) {
 done:
     ray_block_query_close(&cursor);
     return result ? result : ray_error("oom", NULL);
+}
+
+ray_t* ray_block_materialize(const char* dir, const ray_block_scan_source_t* source, size_t limit) {
+    ray_block_scan_options_t read = {0, UINT64_MAX, RAY_BLOCK_SCAN_AUTO_ROWS,
+                                     BLOCK_SOURCE_PAYLOAD_BYTES, 8u * 1024 * 1024, 0};
+    ray_block_scan_t* scan = NULL;
+    ray_err_t err = ray_block_scan_open_source(dir, source, NULL, 0, &read, &scan);
+    if (err) return ray_error(ray_err_code_str(err), "materialize: cannot open %s", dir);
+    ray_t* schema = ray_block_scan_schema(scan);
+    size_t count = schema && !RAY_IS_ERR(schema) ? (size_t)ray_table_ncols(schema) : 0;
+    ray_t** vectors = count ? calloc(count, sizeof(*vectors)) : NULL;
+    ray_t* result = !schema || RAY_IS_ERR(schema) ? (schema ? schema : ray_error("oom", NULL)) :
+        !vectors ? ray_error("oom", NULL) : collect_vectors(schema, vectors, count);
+    if (schema && RAY_IS_ERR(schema)) schema = NULL;
+    size_t remaining = limit;
+    while (!result) {
+        if (ray_eval_is_interrupted()) { result = ray_error("cancel", "materialize: interrupted"); break; }
+        ray_t* batch = ray_block_scan_next(scan);
+        if (!batch) break;
+        if (RAY_IS_ERR(batch)) { result = batch; break; }
+        if (!charge(batch, &remaining))
+            result = ray_error("limit", "materialize: %s exceeds %zu bytes", dir, limit);
+        else result = collect_append(vectors, count, batch);
+        ray_release(batch);
+    }
+    if (!result) {
+        result = ray_table_new((int64_t)count);
+        for (size_t c = 0; result && !RAY_IS_ERR(result) && c < count; c++)
+            result = ray_table_add_col(result, ray_table_col_name(schema, (int64_t)c), vectors[c]);
+        if (!result) result = ray_error("oom", NULL);
+    }
+    for (size_t c = 0; vectors && c < count; c++) ray_release(vectors[c]);
+    free(vectors);
+    if (schema) ray_release(schema);
+    ray_block_scan_close(&scan);
+    return result;
 }

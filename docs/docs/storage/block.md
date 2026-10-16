@@ -10,7 +10,7 @@ Compared with raw splayed and partitioned tables:
 - **Smaller on disk.** Snappy typically stores market data at a fraction of its raw size (2.9× in the benchmark below).
 - **Faster selective queries.** Zone maps let a filtered read skip whole blocks without reading or decoding them, and partition predicates skip whole partitions before any of their files are opened.
 - **Slower full scans.** Every byte read is decoded and checksummed. Decoding and global aggregates run on the native pool, but a full scan still costs more CPU than reading mmapped columns.
-- **Not a drop-in replacement.** Block tables are read through explicit scan descriptors that support a bounded `select` subset; `.db.splayed.get` and `.db.parted.get` do not read them.
+- **Not a drop-in replacement.** Block tables are read through explicit scan descriptors that support a bounded `select` subset. `.db.splayed.get` and `.db.parted.get` refuse them with a `version` error that names these descriptors; `(.db.splayed.get "dir" {materialize: bytes})` loads a whole table into memory when that is really wanted.
 
 ## Writing
 
@@ -60,6 +60,10 @@ A whole partitioned database converts with `(.db.block.convert "src-root" 'table
 (.db.block.convert "/data/raw/2024.01.02/trades" "/data/block/2024.01.02/trades"
   {block-bytes: 65536 codec: snappy durable: true} {immutable: true})
 ```
+
+## Loading into memory
+
+`(.db.splayed.get "dir" [sym_path] {materialize: bytes})` reads every row of a block or raw table through a block scan into an ordinary in-memory table and fails with `limit` once its logical size would exceed `bytes`. Nothing is decompressed implicitly: without the option, compressed columns are refused. `(.db.splayed.set "dir" table [sym_path] options)` with an options dictionary writes a block table, as `.db.block.set`; its symbols go to the generation's own dictionary, not `sym_path`.
 
 ## Reading
 
