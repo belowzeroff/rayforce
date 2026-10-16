@@ -11,6 +11,8 @@
 #include "ops/block_source.h"
 #include "table/sym.h"
 #include "table/domain.h"
+#include "store/part.h"
+#include "ops/ops.h"
 #include <stdlib.h>
 #include <unistd.h>
 
@@ -707,7 +709,231 @@ static test_result_t aggregate_batch_options(void) {
     PASS();
 }
 
+/* ---- Partitioned block sources ---- */
+
+/* Partition p of a small HDB: its own vocabulary plus one shared symbol, so
+ * compressed partitions carry different generation dictionaries. */
+static ray_t* parted_table(unsigned p, unsigned rows, int8_t x_type) {
+    ray_t* id = ray_vec_new(RAY_I64, rows);
+    ray_t* x = ray_vec_new(x_type, rows);
+    ray_t* sy = ray_sym_vec_new(RAY_SYM_W64, rows);
+    ray_t* s = ray_vec_new(RAY_STR, rows);
+    for (unsigned i = 0; i < rows; i++) {
+        ((int64_t*)ray_data(id))[i] = p * 1000 + i;
+        if (x_type == RAY_I64) ((int64_t*)ray_data(x))[i] = i % 7;
+        else ((int32_t*)ray_data(x))[i] = (int32_t)(i % 7);
+        char name[32];
+        int n = i % 5 ? snprintf(name, sizeof(name), "p%u_%u", p, i % 5) :
+            snprintf(name, sizeof(name), "common");
+        ((int64_t*)ray_data(sy))[i] = ray_sym_intern(name, (size_t)n);
+        const char* text = i % 3 ? "a longer pooled string" : "short";
+        s = ray_str_vec_append(s, text, strlen(text));
+    }
+    id->len = x->len = sy->len = (int64_t)rows;
+    ray_t* t = ray_table_new(4);
+    t = ray_table_add_col(t, ray_sym_intern("id", 2), id);
+    t = ray_table_add_col(t, ray_sym_intern("x", 1), x);
+    t = ray_table_add_col(t, ray_sym_intern("sy", 2), sy);
+    t = ray_table_add_col(t, ray_sym_intern("s", 1), s);
+    ray_release(id); ray_release(x); ray_release(sy); ray_release(s);
+    return t;
+}
+
+static const char* const parted_days[] = {"2024.01.01", "2024.01.02", "2024.01.03", "2024.01.04"};
+
+/* Save one partition flat and raw (ordinary .db.splayed.set layout, root
+ * .sym) or as a compressed block generation. */
+static void parted_save(const char* db, unsigned p, ray_t* t, bool block) {
+    char dir[256], sym[256];
+    snprintf(dir, sizeof(dir), "%s/%s/t", db, parted_days[p]);
+    snprintf(sym, sizeof(sym), "%s/.sym", db);
+    ray_block_store_options_t options = {256, 1, false};
+    ray_err_t err = block ? ray_block_store_save(t, dir, &options) : ray_splay_save(t, dir, sym);
+    if (err) ray_test_fatal("parted partition save");
+}
+
+static void parted_fixture(const char* name, unsigned block_mask) {
+    char db[128];
+    snprintf(db, sizeof(db), "%s/%s", root, name);
+    for (unsigned p = 0; p < 4; p++) {
+        ray_t* t = parted_table(p, 300 + 97 * p, RAY_I64);
+        parted_save(db, p, t, block_mask & (1u << p));
+        ray_release(t);
+    }
+}
+
+static bool cells_equal(ray_t* a, ray_t* e, int64_t i) {
+    if (a->type == RAY_SYM) {
+        ray_t* x = ray_sym_vec_cell(a, i); ray_t* y = ray_sym_vec_cell(e, i);
+        return x && y && ray_str_len(x) == ray_str_len(y) &&
+            !memcmp(ray_str_ptr(x), ray_str_ptr(y), ray_str_len(x));
+    }
+    if (a->type == RAY_STR) {
+        size_t n, m; const char* x = ray_str_vec_get(a, i, &n);
+        const char* y = ray_str_vec_get(e, i, &m);
+        return n == m && (!n || !memcmp(x, y, n));
+    }
+    size_t w = ray_type_sizes[(uint8_t)a->type];
+    return !memcmp((const char*)ray_data(a) + i * w, (const char*)ray_data(e) + i * w, w);
+}
+
+static test_result_t tables_equal(ray_t* actual, ray_t* expected) {
+    TEST_ASSERT_NOT_NULL(expected); TEST_ASSERT_FALSE(RAY_IS_ERR(expected));
+    TEST_ASSERT_NOT_NULL(actual); TEST_ASSERT_FALSE(RAY_IS_ERR(actual));
+    TEST_ASSERT_EQ_I(ray_table_ncols(actual), ray_table_ncols(expected));
+    TEST_ASSERT_EQ_I(ray_table_nrows(actual), ray_table_nrows(expected));
+    for (int64_t c = 0; c < ray_table_ncols(actual); c++) {
+        TEST_ASSERT_EQ_I(ray_table_col_name(actual, c), ray_table_col_name(expected, c));
+        ray_t* a = ray_table_get_col_idx(actual, c); ray_t* e = ray_table_get_col_idx(expected, c);
+        TEST_ASSERT_EQ_I(a->type, e->type); TEST_ASSERT_EQ_I(a->len, e->len);
+        for (int64_t i = 0; i < a->len; i++) TEST_ASSERT_TRUE(cells_equal(a, e, i));
+    }
+    PASS();
+}
+
+static ray_t* parted_select(const char* source, const char* clauses) {
+    char command[768];
+    snprintf(command, sizeof(command), "(select {from: %s %s})", source, clauses);
+    return ray_eval_str(command);
+}
+
+static test_result_t parted_parity(void) {
+    parted_fixture("raw", 0);
+    parted_fixture("mixed", 0x6); /* 01 and 04 flat raw, 02 and 03 compressed */
+    char raw[256], mixed[256];
+    snprintf(raw, sizeof(raw), "(.db.parted.get \"%s/raw\" (quote t))", root);
+    snprintf(mixed, sizeof(mixed),
+        "(.db.block.parted \"%s/mixed\" (quote t) 100000000 {batch-rows: 64 immutable: true})", root);
+    const char* clauses[] = {
+        "d: date i: id k: sy t: s",
+        "where: (== date 2024.01.02) i: id k: sy",
+        "where: (and (>= date 2024.01.02) (> x 3)) d: date i: id t: s",
+        "where: (and (< date 2024.01.03) (== x 2)) k: sy i: id",
+        "where: (> date 2030.01.01) i: id",
+        "where: (> x 3) n: (count id) total: (sum id) lo: (min date) hi: (max date) m: (avg x)",
+        "where: (> date 2030.01.01) n: (count id) total: (sum id) lo: (min date)",
+        "where: (!= date 2024.01.03) n: (count sy) top: (max id)"
+    };
+    for (unsigned c = 0; c < sizeof(clauses) / sizeof(*clauses); c++) {
+        ray_t* expected = parted_select(raw, clauses[c]);
+        ray_t* actual = parted_select(mixed, clauses[c]);
+        test_result_t r = tables_equal(actual, expected);
+        ray_release(expected); ray_release(actual);
+        if (r.status != TEST_PASS) return r;
+    }
+    /* SYM batches from different dictionaries share the runtime domain. */
+    ray_t* t = parted_select(mixed, "k: sy");
+    TEST_ASSERT_FALSE(RAY_IS_ERR(t));
+    TEST_ASSERT_TRUE(ray_sym_vec_domain(ray_table_get_col_idx(t, 0)) == ray_sym_runtime_domain());
+    ray_release(t);
+    PASS();
+}
+
+static void parted_damage_schema(const char* db, unsigned p) {
+    char table[256], dir[1024], path[1100];
+    snprintf(table, sizeof(table), "%s/%s/t", db, parted_days[p]);
+    if (ray_splay_resolve_dir(table, dir, sizeof(dir))) ray_test_fatal("parted resolve");
+    snprintf(path, sizeof(path), "%s/.d", dir);
+    if (truncate(path, 0)) ray_test_fatal("parted damage");
+}
+
+static test_result_t parted_pruning(void) {
+    /* 01 compressed, 02 flat raw, 03 compressed but damaged, 04 compressed. */
+    parted_fixture("db", 0xd);
+    char db[128], leased[256], flat[256];
+    snprintf(db, sizeof(db), "%s/db", root);
+    parted_damage_schema(db, 2);
+    snprintf(leased, sizeof(leased), "(.db.block.parted \"%s\" (quote t) 100000000)", db);
+    snprintf(flat, sizeof(flat), "(.db.block.parted \"%s\" (quote t) 100000000 {immutable: true})", db);
+    /* Pruned partitions are never opened: neither the damaged one nor the
+     * flat one that has no lease. */
+    ray_t* r = parted_select(leased, "where: (and (!= date 2024.01.02) (!= date 2024.01.03)) n: (count id) lo: (min date) hi: (max date)");
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(ray_table_get_col_idx(r, 0)))[0], 300 + 591);
+    TEST_ASSERT_EQ_I(((int32_t*)ray_data(ray_table_get_col_idx(r, 1)))[0],
+                     ray_parted_dir_key("2024.01.01", RAY_MC_DATE));
+    TEST_ASSERT_EQ_I(((int32_t*)ray_data(ray_table_get_col_idx(r, 2)))[0],
+                     ray_parted_dir_key("2024.01.04", RAY_MC_DATE));
+    ray_release(r);
+    r = parted_select(leased, "where: (< date 2024.01.03) i: id");
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r)); TEST_ASSERT_STR_EQ(ray_err_code(r), "nyi"); ray_release(r);
+    r = parted_select(flat, "where: (< date 2024.01.03) i: id");
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r)); TEST_ASSERT_EQ_I(ray_table_nrows(r), 300 + 397); ray_release(r);
+    r = parted_select(flat, "i: id");
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r)); TEST_ASSERT_STR_EQ(ray_err_code(r), "corrupt"); ray_release(r);
+    PASS();
+}
+
+static test_result_t parted_rejections(void) {
+    char db[128], source[256];
+    snprintf(db, sizeof(db), "%s/db", root);
+    for (unsigned p = 0; p < 3; p++) {
+        ray_t* t = parted_table(p, 40, p == 2 ? RAY_I32 : RAY_I64);
+        parted_save(db, p, t, true);
+        ray_release(t);
+    }
+    snprintf(source, sizeof(source), "(.db.block.parted \"%s\" (quote t) 100000000)", db);
+    /* A later partition with another type for a selected column. */
+    ray_t* r = parted_select(source, "i: id v: x");
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r)); TEST_ASSERT_STR_EQ(ray_err_code(r), "schema"); ray_release(r);
+    r = parted_select(source, "where: (< date 2024.01.03) i: id v: x");
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r)); TEST_ASSERT_EQ_I(ray_table_nrows(r), 80); ray_release(r);
+    const char* invalid[] = {
+        "d: date",                                  /* no stored column */
+        "where: (== date 1) i: id",                 /* key literal type */
+        "where: (== date 0Nd) i: id"                /* null key literal */
+    };
+    for (unsigned i = 0; i < sizeof(invalid) / sizeof(*invalid); i++) {
+        r = parted_select(source, invalid[i]);
+        TEST_ASSERT_TRUE(RAY_IS_ERR(r)); ray_release(r);
+    }
+    const char* descriptors[] = {
+        "(.db.block.parted \"%s\" \"t\" 100)", "(.db.block.parted \"%s\" (quote .t) 100)",
+        "(.db.block.parted \"%s\" (quote t) 0)", "(.db.block.parted \"%s\" (quote t) 100 {immutable: 1})",
+        "(.db.block.parted \"%s\" (quote t))"
+    };
+    for (unsigned i = 0; i < sizeof(descriptors) / sizeof(*descriptors); i++) {
+        char command[256];
+        snprintf(command, sizeof(command), descriptors[i], db);
+        r = ray_eval_str(command);
+        TEST_ASSERT_TRUE(RAY_IS_ERR(r)); ray_release(r);
+    }
+    char command[512];
+    snprintf(command, sizeof(command), "(select {from: (.db.block.parted \"%s/none\" (quote t) 100) i: id})", root);
+    r = ray_eval_str(command);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r)); ray_release(r);
+    /* The stored schema may not shadow the partition key. */
+    ray_t* t = parted_table(0, 8, RAY_I64);
+    ray_t* date = ray_vec_new(RAY_DATE, 8); date->len = 8;
+    memset(ray_data(date), 0, 8 * sizeof(int32_t));
+    t = ray_table_add_col(t, ray_sym_intern("date", 4), date); ray_release(date);
+    char other[128];
+    snprintf(other, sizeof(other), "%s/keyed", root);
+    parted_save(other, 0, t, true); ray_release(t);
+    snprintf(command, sizeof(command), "(select {from: (.db.block.parted \"%s\" (quote t) 100000) i: id})", other);
+    r = ray_eval_str(command);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r)); ray_release(r);
+    ray_eval_set_restricted(true);
+    r = parted_select(source, "i: id");
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r)); TEST_ASSERT_STR_EQ(ray_err_code(r), "access"); ray_release(r);
+    ray_eval_set_restricted(false);
+    /* Result and work limits apply across partitions. */
+    snprintf(command, sizeof(command), "(select {from: (.db.block.parted \"%s\" (quote t) 640) where: (< date 2024.01.03) i: id})", db);
+    r = ray_eval_str(command);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r)); TEST_ASSERT_EQ_I(ray_table_nrows(r), 80); ray_release(r);
+    snprintf(command, sizeof(command), "(select {from: (.db.block.parted \"%s\" (quote t) 639) where: (< date 2024.01.03) i: id})", db);
+    r = ray_eval_str(command);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r)); TEST_ASSERT_STR_EQ(ray_err_code(r), "limit"); ray_release(r);
+    snprintf(command, sizeof(command), "(select {from: (.db.block.parted \"%s\" (quote t) 100000 {work-bytes: 64}) where: (< date 2024.01.03) d: date i: id})", db);
+    r = ray_eval_str(command);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r)); TEST_ASSERT_STR_EQ(ray_err_code(r), "limit"); ray_release(r);
+    PASS();
+}
+
 const test_entry_t block_source_entries[] = {
+    {"block_source/parted_parity", parted_parity, setup, teardown},
+    {"block_source/parted_pruning", parted_pruning, setup, teardown},
+    {"block_source/parted_rejections", parted_rejections, setup, teardown},
     {"block_source/block_store_api", block_store_api, setup, teardown},
     {"block_source/mixed_format_parity", mixed_format_parity, setup, teardown},
     {"block_source/scan_work_limits", scan_work_limits, setup, teardown},

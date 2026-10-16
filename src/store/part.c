@@ -258,6 +258,27 @@ static ray_t* collect_part_dirs(const char* db_root, char*** out_dirs,
     return NULL;
 }
 
+ray_t* ray_parted_dirs(const char* db_root, char*** dirs, int64_t* count,
+                       uint8_t* mc_type) {
+    if (!db_root || !dirs || !count) return ray_error("domain", NULL);
+    return collect_part_dirs(db_root, dirs, count, mc_type);
+}
+
+void ray_parted_dirs_free(char** dirs, int64_t count) {
+    for (int64_t i = 0; dirs && i < count; i++) ray_free_raw(dirs[i]);
+    ray_free_raw(dirs);
+}
+
+int64_t ray_parted_dir_key(const char* name, uint8_t mc_type) {
+    if (mc_type == RAY_MC_DATE) return parse_date_dir(name);
+    if (mc_type == RAY_MC_I64) {
+        int64_t v = 0;
+        parse_int_dir(name, &v);
+        return v;
+    }
+    return ray_sym_intern(name, strlen(name));
+}
+
 /* --------------------------------------------------------------------------
  * Partition reuse across mounts
  *

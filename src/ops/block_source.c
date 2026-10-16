@@ -41,9 +41,10 @@ static const char* name(ray_t* s) {
         string(ray_sym_str(s->i64)) : NULL;
 }
 
-static ray_err_t scan_options(ray_t* opts, ray_block_scan_options_t* out) {
+static ray_err_t scan_options(ray_t* opts, ray_block_scan_options_t* out, bool* immutable) {
     *out = (ray_block_scan_options_t){0, UINT64_MAX, BLOCK_SOURCE_BATCH_ROWS,
                                     8u * 1024 * 1024, 8u * 1024 * 1024, 0};
+    *immutable = false;
     if (!opts) return RAY_OK;
     /* The parser represents {} using empty LIST keys and values. */
     ray_t* empty_keys = ray_dict_keys(opts); ray_t* empty_vals = ray_dict_vals(opts);
@@ -51,16 +52,21 @@ static ray_err_t scan_options(ray_t* opts, ray_block_scan_options_t* out) {
         !empty_keys->len && !empty_vals->len) return RAY_OK;
     if (!dictionary(opts)) return RAY_ERR_TYPE;
     ray_t* keys = ray_dict_keys(opts); ray_t* vals = ray_dict_vals(opts);
-    if (keys->len > 4) return RAY_ERR_DOMAIN;
+    if (keys->len > 5) return RAY_ERR_DOMAIN;
     unsigned seen = 0;
     for (int64_t i = 0; i < keys->len; i++) {
         const char* key = string(ray_sym_vec_cell(keys, i));
         unsigned bit = !key ? 0 : !strcmp(key, "batch-rows") ? 1 :
             !strcmp(key, "payload-bytes") ? 2 : !strcmp(key, "scratch-bytes") ? 4 :
-            !strcmp(key, "work-bytes") ? 8 : 0;
+            !strcmp(key, "work-bytes") ? 8 : !strcmp(key, "immutable") ? 16 : 0;
         if (!bit || (seen & bit)) return RAY_ERR_DOMAIN;
         seen |= bit;
         ray_t* value = ray_list_get(vals, i);
+        if (bit == 16) {
+            if (!value || value->type != -RAY_BOOL) return RAY_ERR_TYPE;
+            *immutable = value->b8;
+            continue;
+        }
         if (!value || value->type != -RAY_I64) return RAY_ERR_TYPE;
         if (value->i64 < 0 || (uint64_t)value->i64 > SIZE_MAX) return RAY_ERR_RANGE;
         if (bit == 1) {
@@ -76,18 +82,18 @@ static ray_err_t scan_options(ray_t* opts, ray_block_scan_options_t* out) {
     return RAY_OK;
 }
 
-ray_t* ray_block_source_fn(ray_t** args, int64_t n) {
-    if (ray_eval_get_restricted()) return ray_error("access", "restricted");
-    if (n != 2 && n != 3) return ray_error("arity", ".db.block.scan: path result-bytes [options]");
-    if (!string(args[0]) || args[1]->type != -RAY_I64 || args[1]->i64 <= 0 ||
-        (uint64_t)args[1]->i64 > SIZE_MAX)
-        return ray_error("domain", ".db.block.scan: nonempty path and positive I64 result limit required");
-    ray_block_scan_options_t options;
-    ray_err_t err = scan_options(n == 3 ? args[2] : NULL, &options);
-    if (err) return ray_error(ray_err_code_str(err), "invalid block scan options");
-    int64_t names[] = {ray_sym_intern(".hdb.block.source", 17), ray_sym_intern(".hdb.block.limit", 16),
-                       ray_sym_intern(".hdb.block.options", 18)};
-    if (names[0] < 0 || names[1] < 0 || names[2] < 0) return ray_error("oom", NULL);
+static const char* table_name(ray_t* s) {
+    if (!s || s->type != -RAY_SYM) return NULL;
+    const char* p = string(ray_sym_str(s->i64));
+    return p && *p != '.' && !strchr(p, '/') && !strchr(p, '\\') && strlen(p) <= 255 ? p : NULL;
+}
+
+static ray_t* descriptor(const char* const* fields, ray_t** args, int64_t n) {
+    int64_t names[4];
+    for (int64_t i = 0; i < n; i++) {
+        names[i] = ray_sym_intern(fields[i], strlen(fields[i]));
+        if (names[i] < 0) return ray_error("oom", NULL);
+    }
     ray_t* keys = ray_vec_from_raw(RAY_SYM, names, n);
     ray_t* vals = ray_list_new(n);
     if (!keys || RAY_IS_ERR(keys) || !vals || RAY_IS_ERR(vals)) {
@@ -96,6 +102,36 @@ ray_t* ray_block_source_fn(ray_t** args, int64_t n) {
     for (int64_t i = 0; i < n; i++) { ray_retain(args[i]); ((ray_t**)ray_data(vals))[i] = args[i]; }
     vals->len = n;
     return ray_dict_new(keys, vals);
+}
+
+ray_t* ray_block_source_fn(ray_t** args, int64_t n) {
+    if (ray_eval_get_restricted()) return ray_error("access", "restricted");
+    if (n != 2 && n != 3) return ray_error("arity", ".db.block.scan: path result-bytes [options]");
+    if (!string(args[0]) || args[1]->type != -RAY_I64 || args[1]->i64 <= 0 ||
+        (uint64_t)args[1]->i64 > SIZE_MAX)
+        return ray_error("domain", ".db.block.scan: nonempty path and positive I64 result limit required");
+    ray_block_scan_options_t options;
+    bool immutable;
+    ray_err_t err = scan_options(n == 3 ? args[2] : NULL, &options, &immutable);
+    if (err) return ray_error(ray_err_code_str(err), "invalid block scan options");
+    static const char* const keys[] = {".hdb.block.source", ".hdb.block.limit", ".hdb.block.options"};
+    return descriptor(keys, args, n);
+}
+
+/* (.db.block.parted root table result-bytes [options]) */
+ray_t* ray_block_parted_fn(ray_t** args, int64_t n) {
+    if (ray_eval_get_restricted()) return ray_error("access", "restricted");
+    if (n != 3 && n != 4) return ray_error("arity", ".db.block.parted: root table result-bytes [options]");
+    if (!string(args[0]) || !table_name(args[1]) || args[2]->type != -RAY_I64 ||
+        args[2]->i64 <= 0 || (uint64_t)args[2]->i64 > SIZE_MAX)
+        return ray_error("domain", ".db.block.parted: nonempty root, table symbol and positive I64 result limit required");
+    ray_block_scan_options_t options;
+    bool immutable;
+    ray_err_t err = scan_options(n == 4 ? args[3] : NULL, &options, &immutable);
+    if (err) return ray_error(ray_err_code_str(err), "invalid block scan options");
+    static const char* const keys[] = {".hdb.block.parted", ".hdb.block.table", ".hdb.block.limit",
+                                       ".hdb.block.options"};
+    return descriptor(keys, args, n);
 }
 
 typedef struct {
@@ -281,7 +317,12 @@ static ray_t* aggregate_result(ray_block_query_t* cursor, const aggregate_t* con
     size_t output_bytes = 0;
     /* Match select's empty-source projection rule, distinct from a WHERE
      * that filters all rows of a nonempty source (one aggregate row). */
-    int64_t output_rows = ray_block_query_rows(cursor) ? 1 : 0;
+    bool empty_source;
+    ray_err_t empty_err = ray_block_query_source_empty(cursor, &empty_source);
+    if (empty_err) {
+        result = ray_error(ray_err_code_str(empty_err), "block select: source size unavailable"); goto done;
+    }
+    int64_t output_rows = empty_source ? 0 : 1;
     for (size_t a = 0; a < count; a++) {
         int8_t type = ray_table_get_col_idx(schema, (int64_t)positions[a])->type;
         uint16_t op = kinds[a]->opcode;
@@ -389,15 +430,19 @@ done:
 
 ray_t* ray_block_select_source(ray_t* source, ray_t* query) {
     ray_t* path = field(source, ".hdb.block.source");
-    if (!path) return NULL;
+    ray_t* parted = path ? NULL : field(source, ".hdb.block.parted");
+    if (!path && !parted) return NULL;
     if (ray_eval_get_restricted()) return ray_error("access", "restricted");
+    ray_t* table = parted ? field(source, ".hdb.block.table") : NULL;
     ray_t* limit = field(source, ".hdb.block.limit");
     ray_t* opts = field(source, ".hdb.block.options");
-    if (ray_dict_len(source) != (opts ? 3 : 2) || !string(path) || !limit || limit->type != -RAY_I64 ||
+    if (ray_dict_len(source) != (opts ? 3 : 2) + (parted ? 1 : 0) || !string(path ? path : parted) ||
+        (parted && !table_name(table)) || !limit || limit->type != -RAY_I64 ||
         limit->i64 <= 0 || (uint64_t)limit->i64 > SIZE_MAX)
         return ray_error("domain", "invalid block source descriptor");
     ray_block_scan_options_t options;
-    ray_err_t option_err = scan_options(opts, &options);
+    bool immutable;
+    ray_err_t option_err = scan_options(opts, &options, &immutable);
     if (option_err) return ray_error(ray_err_code_str(option_err), "invalid block scan options");
     if (!dictionary(query)) return ray_error("type", "invalid block query");
     const char* columns[RAY_BLOCK_SCAN_MAX_COLUMNS];
@@ -440,7 +485,15 @@ ray_t* ray_block_select_source(ray_t* source, ray_t* query) {
     if (where && !predicates(where, pred, &n_pred, 0))
         return ray_error("nyi", "block select requires builtin comparisons and binary AND with typed literals");
     ray_block_query_t* cursor = NULL;
-    ray_err_t err = ray_block_query_open(string(path), columns, n_columns, pred, n_pred, &options, &cursor);
+    ray_block_scan_source_t flat = {NULL, immutable};
+    ray_err_t err = parted ?
+        ray_block_query_open_parted(string(parted), table_name(table), immutable, columns, n_columns,
+                                    pred, n_pred, &options, &cursor) :
+        ray_block_query_open_source(string(path), &flat, columns, n_columns, pred, n_pred,
+                                    &options, &cursor);
+    if (err && parted && err == RAY_ERR_NYI)
+        return ray_error("nyi", "block select: %s/%s: first partition is flat (immutable: true reads it) "
+                         "or the projection has no stored column", string(parted), table_name(table));
     if (err) return ray_error(ray_err_code_str(err), "block select: source or predicate admission failed");
     ray_t* result = NULL;
     /* Query scope can shadow call heads with even an unprojected column.
