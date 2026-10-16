@@ -1,5 +1,5 @@
 /* Copyright (c) 2026 Anton Kundenko. MIT license; see LICENSE. */
-#define _POSIX_C_SOURCE 200809L
+#define _DEFAULT_SOURCE   /* mkdtemp, strdup */
 #include "test.h"
 #include "store/block_scan.h"
 #include "store/block_store.h"
