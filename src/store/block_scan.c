@@ -23,7 +23,9 @@ typedef struct {
 
 struct ray_block_scan_s {
     ray_splay_lease_t* lease;
+    char dir[1024];
     ray_sym_domain_t* domain;
+    ray_sym_domain_t* raw_domain; /* source->sym_path, when given */
     ray_t* names;
     scan_column_t* columns;
     size_t count;
@@ -45,6 +47,7 @@ void ray_block_scan_close(ray_block_scan_t** scan) {
     free(s->columns);
     ray_release(s->names);
     if (s->domain) ray_sym_domain_release(s->domain);
+    if (s->raw_domain) ray_sym_domain_release(s->raw_domain);
     ray_splay_lease_release(&s->lease);
     free(s);
     *scan = NULL;
@@ -73,6 +76,30 @@ static ray_err_t scan_open_domain(ray_block_scan_t* s, const char* dir,
     *count = s->domain_count;
     *crc = s->domain_crc;
     return RAY_OK;
+}
+
+static ray_err_t scan_open_raw_domain(ray_block_scan_t* s, const char* path) {
+    struct stat st;
+    if (stat(path, &st) != 0) return RAY_ERR_IO;
+    s->raw_domain = ray_sym_domain_open(path);
+    return s->raw_domain ? RAY_OK : RAY_ERR_CORRUPT;
+}
+
+/* An immutable flat root is the table directory itself. A root that has
+ * published generations is never read this way: its columns live below. */
+static ray_err_t scan_flat_dir(const char* root, char* dir, size_t size) {
+    size_t len = strlen(root);
+    while (len > 1 && root[len - 1] == '/') len--;
+    if (len >= size) return RAY_ERR_RANGE;
+    memcpy(dir, root, len);
+    dir[len] = '\0';
+    char path[1100];
+    int n = snprintf(path, sizeof(path), "%s/.current", dir);
+    if (n < 0 || (size_t)n >= sizeof(path)) return RAY_ERR_RANGE;
+    struct stat st;
+    if (stat(path, &st) == 0) return RAY_ERR_NYI;
+    if (stat(dir, &st) != 0) return RAY_ERR_IO;
+    return S_ISDIR(st.st_mode) ? RAY_OK : RAY_ERR_IO;
 }
 
 static int8_t scan_column_type(const scan_column_t* column) {
@@ -134,6 +161,14 @@ static ray_err_t scan_check_schema(const char* dir, const char* const* columns, 
 ray_err_t ray_block_scan_open(const char* root, const char* const* columns,
                               size_t count, const ray_block_scan_options_t* options,
                               ray_block_scan_t** out) {
+    return ray_block_scan_open_source(root, NULL, columns, count, options, out);
+}
+
+ray_err_t ray_block_scan_open_source(const char* root, const ray_block_scan_source_t* source,
+                                     const char* const* columns, size_t count,
+                                     const ray_block_scan_options_t* options,
+                                     ray_block_scan_t** out) {
+    const char* sym_path = source ? source->sym_path : NULL;
     if (!out || *out || !options || !options->batch_rows || !columns || !count)
         return RAY_ERR_DOMAIN;
     if (count > RAY_BLOCK_SCAN_MAX_COLUMNS) return RAY_ERR_LIMIT;
@@ -151,25 +186,33 @@ ray_err_t ray_block_scan_open(const char* root, const char* const* columns,
     if (!s->columns) { free(s); return RAY_ERR_OOM; }
     s->count = count;
     ray_err_t err = ray_splay_lease_acquire(root, &s->lease);
-    if (!err) err = scan_check_schema(ray_splay_lease_dir(s->lease), columns, count, &s->names);
+    if (err == RAY_ERR_NYI && source && source->immutable)
+        err = scan_flat_dir(root, s->dir, sizeof(s->dir));
+    else if (!err) {
+        const char* dir = ray_splay_lease_dir(s->lease);
+        if (strlen(dir) >= sizeof(s->dir)) err = RAY_ERR_RANGE;
+        else memcpy(s->dir, dir, strlen(dir) + 1);
+    }
+    if (!err) err = scan_check_schema(s->dir, columns, count, &s->names);
     uint64_t rows = 0, generation = 0, sym_count = 0;
     uint64_t actual_sym_count = 0;
     uint32_t sym_crc = 0, actual_sym_crc = 0;
     bool have_generation = false;
     for (size_t i = 0; !err && i < count; i++) {
         char path[1300];
-        int n = snprintf(path, sizeof(path), "%s/%s", ray_splay_lease_dir(s->lease), columns[i]);
+        int n = snprintf(path, sizeof(path), "%s/%s", s->dir, columns[i]);
         if (n < 0 || (size_t)n >= sizeof(path)) { err = RAY_ERR_RANGE; break; }
         err = ray_col_block_file_open(path, &s->columns[i].file);
         uint64_t column_rows;
         if (err == RAY_ERR_VERSION) {
             err = RAY_OK;
-            ray_t* raw = ray_col_mmap_splayed_dom(path, s->domain);
-            if (RAY_IS_ERR(raw) && !strcmp(ray_err_code(raw), "sym") && !s->domain) {
+            ray_sym_domain_t** dom = sym_path ? &s->raw_domain : &s->domain;
+            ray_t* raw = ray_col_mmap_splayed_dom(path, *dom);
+            if (RAY_IS_ERR(raw) && !strcmp(ray_err_code(raw), "sym") && !*dom) {
                 ray_error_free(raw);
-                err = scan_open_domain(s, ray_splay_lease_dir(s->lease),
-                                       &actual_sym_count, &actual_sym_crc);
-                if (!err) raw = ray_col_mmap_splayed_dom(path, s->domain);
+                err = sym_path ? scan_open_raw_domain(s, sym_path) :
+                    scan_open_domain(s, s->dir, &actual_sym_count, &actual_sym_crc);
+                if (!err) raw = ray_col_mmap_splayed_dom(path, *dom);
             }
             if (!err) {
                 err = scan_value_error(raw);
@@ -197,8 +240,7 @@ ray_err_t ray_block_scan_open(const char* root, const char* const* columns,
         if (s->columns[i].name < 0) err = RAY_ERR_OOM;
     }
     if (!err && sym_count) {
-        err = scan_open_domain(s, ray_splay_lease_dir(s->lease),
-                               &actual_sym_count, &actual_sym_crc);
+        err = scan_open_domain(s, s->dir, &actual_sym_count, &actual_sym_crc);
         if (!err && (actual_sym_count != sym_count || actual_sym_crc != sym_crc))
             err = RAY_ERR_CORRUPT;
     }
