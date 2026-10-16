@@ -72,7 +72,7 @@ Block tables are read with `select` over a scan descriptor:
 
 | Key | Default | Meaning |
 |---|---|---|
-| `batch-rows` | 65536 | Rows decoded per read. |
+| `batch-rows` | automatic | Rows decoded per read. By default half the payload limit over the projection's row width, no more rows than `scratch-bytes` holds of decoded strings, at most 1Mi. |
 | `payload-bytes` | 64 MiB | Decoded bytes per read. |
 | `scratch-bytes` | 8 MiB | Temporary decode memory per read. String columns decode a read's blocks once into it when they fit, otherwise twice through one block; results are the same. |
 | `work-bytes` | none | Optional cap on retained result plus the current read, masks and aggregate state. |
@@ -114,14 +114,15 @@ Ordinary reads check each block's checksums the first time it is decoded through
 
 | Query | raw | block none | block snappy |
 |---|---|---|---|
-| One minute of one day | 531 ms | 32 ms | 34 ms |
-| One minute across all days | 104 ms | 39 ms | 41 ms |
-| One column of one day (5M rows) | 198 ms | 113 ms | 150 ms |
-| 0.5% of one day, six columns | 242 ms | 382 ms | 961 ms |
-| Full scan, four aggregates | 330 ms | 839 ms | 1594 ms |
+| One minute of one day | 244 ms | 13 ms | 15 ms |
+| One minute across all days | 125 ms | 21 ms | 22 ms |
+| One column of one day (5M rows) | 206 ms | 107 ms | 112 ms |
+| 0.5% of one day, six columns | 236 ms | 380–690 ms | 590–840 ms |
+| Full scan, four aggregates | 332 ms | 314 ms | 604 ms |
+| Full scan, cold cache | 1529 ms | 2441 ms | 1136 ms |
 | Disk | 7.36 GiB | 5.92 GiB | 2.56 GiB |
 
-Selective and time-range queries benefit most; full scans and wide late materialization pay for decoding, which scales with core count. Zone maps prune whole reads: a smaller `batch-rows`, down to the rows per block, prunes narrow ranges more finely at the cost of more reads.
+Selective and time-range queries benefit most. Full scans decode in parallel and keep up with raw scans when warm; cold, Snappy wins by reading a seventh of the bytes. Scattered matches across wide rows still cost more than raw, which reads only the rows it needs. Zone maps prune within a read at block granularity, so large reads keep narrow ranges cheap.
 
 ## Errors
 
