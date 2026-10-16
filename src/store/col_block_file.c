@@ -5,6 +5,7 @@
 
 struct ray_col_block_file_s {
     ray_col_block_reader_t reader;
+    ray_col_block_cache_t cache;
     void* mapping;
     size_t size;
 };
@@ -19,6 +20,8 @@ ray_err_t ray_col_block_file_open(const char* path, ray_col_block_file_t** out) 
     if (!err) {
         file->reader.verified = calloc((size_t)(file->reader.blocks / 8 + 1), 1);
         if (!file->reader.verified) err = RAY_ERR_OOM;
+        file->cache.block = UINT64_MAX;
+        file->reader.cache = &file->cache;
     }
     if (err) {
         ray_vm_unmap_file(file->mapping, file->size);
@@ -37,6 +40,7 @@ void ray_col_block_file_close(ray_col_block_file_t** file) {
     if (!file || !*file) return;
     ray_vm_unmap_file((*file)->mapping, (*file)->size);
     free((*file)->reader.verified);
+    free((*file)->cache.data);
     free(*file);
     *file = NULL;
 }

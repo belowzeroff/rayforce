@@ -20,6 +20,12 @@
  * hosts only. The mapped bytes must remain immutable and alive until the
  * reader is discarded. Opening checks all metadata, not payload CRCs; an
  * uncompressed block must carry equal payload and decoded CRCs. */
+/* One decoded block kept for reuse; block is UINT64_MAX when empty. */
+typedef struct ray_col_block_cache_s {
+    uint8_t* data;
+    uint64_t block;
+} ray_col_block_cache_t;
+
 typedef struct {
     const uint8_t* data;
     size_t size;
@@ -31,6 +37,10 @@ typedef struct {
     /* Optional bit per block whose checksums already passed over these
      * immutable bytes; read skips them again. NULL checks every read. */
     uint8_t* verified;
+    /* Optional block_bytes buffer (allocated on first use) holding the last
+     * partially read fixed-width block, so consecutive ranges inside one
+     * block decode it once. Outside scratch budgets. NULL disables reuse. */
+    ray_col_block_cache_t* cache;
 } ray_col_block_reader_t;
 
 typedef enum {
