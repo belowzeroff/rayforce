@@ -152,6 +152,7 @@ nav:
           - Pivot: docs/queries/pivot.md
       - Storage & IPC:
           - Columnar Storage: docs/storage/index.md
+          - Compressed Block Tables: docs/storage/block.md
           - IPC & Serialization: docs/storage/ipc.md
           - IPC Connection Hooks: docs/storage/ipc-hooks.md
       - Graph Engine:
