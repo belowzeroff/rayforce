@@ -42,6 +42,7 @@
 #include "core/qlog.h"      /* g_qlog — (.sys.querylog) */
 #include "store/serde.h"
 #include "store/block_store.h"
+#include "ops/block_source.h"
 #include "store/splay.h"
 #include "store/part.h"
 #include "core/ipc.h"
@@ -247,6 +248,15 @@ ray_t* ray_block_store_fn(ray_t** args, int64_t n) {
 
 /* (.db.splayed.set "dir" table) or (.db.splayed.set "dir" table "sym_path") */
 ray_t* ray_set_splayed_fn(ray_t** args, int64_t n) {
+    /* A trailing options dictionary, after the dir and table or after an
+     * explicit sym path, writes compressed blocks (see .db.block.set): their
+     * symbols live in the generation's own dictionary, not the sym path. */
+    if ((n == 3 || n == 4) && args[n - 1] && args[n - 1]->type == RAY_DICT) {
+        if (n == 4 && (!args[2] || args[2]->type != -RAY_STR))
+            return ray_error("type", ".db.splayed.set: dir table [sym_path] options");
+        ray_t* forward[3] = {args[0], args[1], args[n - 1]};
+        return ray_block_store_fn(forward, 3);
+    }
     if (n < 2 || n > 3)
         return ray_error("domain", ".db.splayed.set expects 2 or 3 arguments, got %lld", (long long)n);
 
@@ -273,7 +283,30 @@ ray_t* ray_set_splayed_fn(ray_t** args, int64_t n) {
 }
 
 /* (.db.splayed.get "dir") or (.db.splayed.get "dir" "sym_path") */
+/* {materialize: I64}: the byte limit of an in-memory load, else 0. */
+static ray_err_t splayed_get_options(ray_t* opts, size_t* limit) {
+    ray_t* keys = ray_dict_keys(opts);
+    ray_t* vals = ray_dict_vals(opts);
+    if (!keys || !vals || keys->type != RAY_SYM || vals->type != RAY_LIST || keys->len != 1)
+        return RAY_ERR_DOMAIN;
+    ray_t* key = ray_sym_vec_cell(keys, 0);
+    ray_t* value = ray_list_get(vals, 0);
+    if (!key || ray_str_len(key) != 11 || memcmp(ray_str_ptr(key), "materialize", 11)) return RAY_ERR_DOMAIN;
+    if (!value || value->type != -RAY_I64) return RAY_ERR_TYPE;
+    if (value->i64 <= 0) return RAY_ERR_RANGE;
+    *limit = (size_t)value->i64;
+    return RAY_OK;
+}
+
 ray_t* ray_get_splayed_fn(ray_t** args, int64_t n) {
+    /* A trailing {materialize: bytes} loads every row into memory through a
+     * block scan, which also reads compressed tables. */
+    size_t limit = 0;
+    if (n >= 2 && args[n - 1] && args[n - 1]->type == RAY_DICT) {
+        ray_err_t err = splayed_get_options(args[n - 1], &limit);
+        if (err) return ray_error(ray_err_code_str(err), ".db.splayed.get: options are {materialize: bytes}");
+        n--;
+    }
     if (n < 1 || n > 2)
         return ray_error("domain", ".db.splayed.get expects 1 or 2 arguments, got %lld", (long long)n);
 
@@ -292,6 +325,10 @@ ray_t* ray_get_splayed_fn(ray_t** args, int64_t n) {
      * dir/sym, no partition root/sym).  The load layer raises the loud
      * "sym" error if the table actually has SYM columns; symbol-free
      * tables load fine without one. */
+    if (limit) {
+        ray_block_scan_source_t source = {sym_path, true};
+        return ray_block_materialize(dir, &source, limit);
+    }
     return ray_read_splayed(dir, sym_path);
 }
 

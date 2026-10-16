@@ -13,6 +13,7 @@
 #include "table/domain.h"
 #include "store/part.h"
 #include "io/csv.h"
+#include "core/runtime.h"
 #include "mem/heap.h"
 #include "ops/ops.h"
 #include <stdlib.h>
@@ -1524,7 +1525,64 @@ static test_result_t block_defaults(void) {
     PASS();
 }
 
+/* Existing loaders name the block format; materialize and splayed.set
+ * options reach it explicitly. */
+static test_result_t splayed_integration(void) {
+    fixture(300, false);   /* root holds a block generation of raw's rows */
+    char command[512];
+    snprintf(command, sizeof(command), "(.db.splayed.get \"%s\")", root);
+    ray_t* r = ray_eval_str(command);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r)); TEST_ASSERT_STR_EQ(ray_err_code(r), "version");
+    const char* msg = ray_error_msg();
+    TEST_ASSERT_TRUE(msg && strstr(msg, ".db.block.scan") && strstr(msg, "materialize"));
+    ray_release(r);
+    snprintf(command, sizeof(command), "(.db.splayed.get \"%s\" {materialize: 100000000})", root);
+    ray_t* loaded = ray_eval_str(command);
+    ray_t* expected = ray_eval_str("(select {from: raw id: id x: x s: s sy: sy})");
+    test_result_t tr = tables_equal(loaded, expected);
+    ray_release(loaded);
+    if (tr.status != TEST_PASS) { ray_release(expected); return tr; }
+    snprintf(command, sizeof(command), "(.db.splayed.get \"%s\" {materialize: 100})", root);
+    r = ray_eval_str(command);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r)); TEST_ASSERT_STR_EQ(ray_err_code(r), "limit"); ray_release(r);
+    const char* invalid[] = {"(.db.splayed.get \"%s\" {materialize: 0})", "(.db.splayed.get \"%s\" {other: 1})",
+                             "(.db.splayed.get \"%s\" {materialize: 1.5})"};
+    for (unsigned i = 0; i < 3; i++) {
+        snprintf(command, sizeof(command), invalid[i], root);
+        r = ray_eval_str(command);
+        TEST_ASSERT_TRUE(RAY_IS_ERR(r)); ray_release(r);
+    }
+    /* .db.splayed.set with options writes blocks; without, raw as before. */
+    snprintf(command, sizeof(command), "(.db.splayed.set \"%s/viaset\" raw {codec: none})", root);
+    r = ray_eval_str(command);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r)); ray_release(r);
+    snprintf(command, sizeof(command), "(.db.splayed.set \"%s/viaset2\" raw \"%s/unused.sym\" {})", root, root);
+    r = ray_eval_str(command);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r)); ray_release(r);
+    for (unsigned i = 0; i < 2; i++) {
+        snprintf(command, sizeof(command), "(.db.storage.info \"%s/viaset%s\")", root, i ? "2" : "");
+        r = ray_eval_str(command);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+        TEST_ASSERT_TRUE(storage_sym(r, "format", 0, "block"));
+        TEST_ASSERT_TRUE(storage_sym(r, "codec", 0, i ? "snappy" : "none"));
+        ray_release(r);
+    }
+    snprintf(command, sizeof(command), "(.db.splayed.set \"%s/flat/\" raw)", root);
+    r = ray_eval_str(command);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r)); ray_release(r);
+    snprintf(command, sizeof(command), "(.db.splayed.get \"%s/flat\" {materialize: 100000000})", root);
+    loaded = ray_eval_str(command);
+    tr = tables_equal(loaded, expected);
+    ray_release(loaded); ray_release(expected);
+    if (tr.status != TEST_PASS) return tr;
+    snprintf(command, sizeof(command), "(.db.splayed.set \"%s/x\" raw 1 {})", root);
+    r = ray_eval_str(command);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r)); ray_release(r);
+    PASS();
+}
+
 const test_entry_t block_source_entries[] = {
+    {"block_source/splayed_integration", splayed_integration, setup, teardown},
     {"block_source/block_defaults", block_defaults, setup, teardown},
     {"block_source/block_convert_parted", block_convert_parted, setup, teardown},
     {"block_source/string_arena_fallback", string_arena_fallback, setup, teardown},
