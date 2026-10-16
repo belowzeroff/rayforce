@@ -13,6 +13,7 @@
 #include "table/domain.h"
 #include "store/part.h"
 #include "io/csv.h"
+#include "mem/heap.h"
 #include "ops/ops.h"
 #include <stdlib.h>
 #include <unistd.h>
@@ -1193,6 +1194,20 @@ static test_result_t block_convert(void) {
         TEST_ASSERT_TRUE(RAY_IS_ERR(r)); ray_release(r);
     }
     snprintf(command, sizeof(command), "%s/x/.current", root);
+    TEST_ASSERT_EQ_I(access(command, F_OK), -1);
+    /* A persisted SORTED column cannot be represented: refused, not dropped. */
+    t = parted_table(8, 40, RAY_I64);
+    ray_table_get_col_idx(t, 0)->attrs |= RAY_ATTR_SORTED;
+    char sorted[256];
+    snprintf(sorted, sizeof(sorted), "%s/sorted", root);
+    snprintf(command, sizeof(command), "%s/sorted/.sym", root);
+    TEST_ASSERT_EQ_I(ray_splay_save(t, sorted, command), RAY_OK);
+    ray_release(t);
+    snprintf(command, sizeof(command),
+        "(.db.block.convert \"%s\" \"%s/sorted-block\" {block-bytes: 128 codec: snappy} {immutable: true})", sorted, root);
+    r = ray_eval_str(command);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r)); TEST_ASSERT_STR_EQ(ray_err_code(r), "nyi"); ray_release(r);
+    snprintf(command, sizeof(command), "%s/sorted-block/.current", root);
     TEST_ASSERT_EQ_I(access(command, F_OK), -1);
     PASS();
 }

@@ -74,6 +74,9 @@ bool ray_block_scan_has_column(const ray_block_scan_t* scan, const char* name);
 /* Borrowed full name schema (STR vector) of the pinned generation, valid
  * until close; retain it to keep it longer. */
 ray_t* ray_block_scan_names(const ray_block_scan_t* scan);
+/* Attributes persisted with a selected raw column (SORTED, HAS_NULLS); a
+ * compressed column persists none. Batches never carry SORTED. */
+uint8_t ray_block_scan_column_attrs(const ray_block_scan_t* scan, size_t column);
 /* Configured row-range cardinality, before filtering; stable across next(). */
 uint64_t ray_block_scan_rows(const ray_block_scan_t* scan);
 /* Inspect the next batch range without reading payload or moving the cursor. */

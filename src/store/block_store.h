@@ -52,7 +52,8 @@ void ray_block_table_abort(ray_block_table_writer_t** writer);
  * flat root needs source->immutable), as a new block generation of dest.
  * Streams batches of RAY_BLOCK_CONVERT_BATCH_ROWS rows; a batch whose payload
  * or scratch exceeds RAY_BLOCK_CONVERT_BATCH_BYTES fails with limit. dest may
- * not equal, contain or lie inside src: the source is never modified. On
+ * not equal, contain or lie inside src: the source is never modified. A raw
+ * column persisted as SORTED is nyi: block files cannot keep the attribute. On
  * failure nothing is published. *rows (optional) receives the row count. */
 #define RAY_BLOCK_CONVERT_BATCH_ROWS 65536u
 #define RAY_BLOCK_CONVERT_BATCH_BYTES ((size_t)1 << 30)
