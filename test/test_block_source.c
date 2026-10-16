@@ -1301,7 +1301,61 @@ static test_result_t storage_info_verify(void) {
     PASS();
 }
 
+/* Large reads decode their whole blocks on the pool; values and errors are
+ * the same as serial decoding. */
+static test_result_t parallel_decode(void) {
+    const int64_t rows = 1 << 20;
+    ray_t* v = ray_vec_new(RAY_I64, rows);
+    for (int64_t i = 0; i < rows; i++) ((int64_t*)ray_data(v))[i] = (i * 2654435761) % 1000003;
+    v->len = rows;
+    ray_t* t = ray_table_new(1);
+    t = ray_table_add_col(t, ray_sym_intern("v", 1), v);
+    ray_block_store_options_t store = {4096, 1, false};
+    TEST_ASSERT_EQ_I(ray_block_store_save(t, root, &store), RAY_OK);
+    ray_release(t);
+    char command[256];
+    snprintf(command, sizeof(command),
+        "(select {from: (.db.block.scan \"%s\" 100000000 {batch-rows: 262144}) x: v})", root);
+    ray_t* r = ray_eval_str(command);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    ray_t* x = ray_table_get_col_idx(r, 0);
+    TEST_ASSERT_EQ_I(x->len, rows);
+    TEST_ASSERT_TRUE(!memcmp(ray_data(x), ray_data(v), (size_t)rows * 8));
+    ray_release(r);
+    snprintf(command, sizeof(command),
+        "(select {from: (.db.block.scan \"%s\" 100000000 {batch-rows: 262144}) s: (sum v) n: (count v)})", root);
+    r = ray_eval_str(command);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    int64_t sum = 0;
+    for (int64_t i = 0; i < rows; i++) sum += ((int64_t*)ray_data(v))[i];
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(ray_table_get_col_idx(r, 0)))[0], sum);
+    ray_release(r);
+    /* A damaged block in the middle of a parallel run fails the read. */
+    char dir[1024], path[1100];
+    TEST_ASSERT_EQ_I(ray_splay_resolve_dir(root, dir, sizeof(dir)), RAY_OK);
+    snprintf(path, sizeof(path), "%s/v", dir);
+    ray_col_block_file_t* file = NULL;
+    TEST_ASSERT_EQ_I(ray_col_block_file_open(path, &file), RAY_OK);
+    const ray_col_block_reader_t* reader = ray_col_block_file_reader(file);
+    const uint8_t* e = reader->data + reader->directory + 100 * RAY_COL_BLOCK_ENTRY;
+    uint64_t offset = 0;
+    for (unsigned i = 0; i < 8; i++) offset |= (uint64_t)e[16 + i] << (8 * i);
+    ray_col_block_file_close(&file);
+    FILE* f = fopen(path, "r+b"); TEST_ASSERT_NOT_NULL(f);
+    TEST_ASSERT_EQ_I(fseek(f, (long)offset + 5, SEEK_SET), 0);
+    int b = fgetc(f); TEST_ASSERT_TRUE(b != EOF);
+    TEST_ASSERT_EQ_I(fseek(f, (long)offset + 5, SEEK_SET), 0);
+    TEST_ASSERT_TRUE(fputc(b ^ 0x40, f) != EOF); TEST_ASSERT_EQ_I(fclose(f), 0);
+    snprintf(command, sizeof(command),
+        "(select {from: (.db.block.scan \"%s\" 100000000 {batch-rows: 262144}) x: v})", root);
+    r = ray_eval_str(command);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r)); TEST_ASSERT_STR_EQ(ray_err_code(r), "corrupt"); ray_release(r);
+    ray_release(v);
+    PASS();
+}
+
 const test_entry_t block_source_entries[] = {
+    {"block_source/parallel_decode", parallel_decode, setup, teardown},
     {"block_source/storage_info_verify", storage_info_verify, setup, teardown},
     {"block_source/block_convert", block_convert, setup, teardown},
     {"block_source/csv_block", csv_block, setup, teardown},
