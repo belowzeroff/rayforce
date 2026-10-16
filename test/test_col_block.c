@@ -403,6 +403,11 @@ static int64_t mapped_bytes(void) {
     return current;
 }
 
+/* sys-mapped counts file mappings in whole 4 KiB pages (#786). */
+static int64_t mapped_pages(size_t bytes) {
+    return ((int64_t)bytes + 4095) & ~(int64_t)4095;
+}
+
 static test_result_t file_lifetime(void) {
     const int64_t values[] = {1, INT64_MIN, 3, 4, 5, 6, 7, 8};
     TEST_ASSERT_EQ_I(ray_col_block_begin(&writer, file, RAY_I64, 64, 1, 0), RAY_OK);
@@ -411,14 +416,14 @@ static test_result_t file_lifetime(void) {
     snapshot();
     int64_t baseline = mapped_bytes();
     TEST_ASSERT_EQ_I(ray_col_block_file_open(path, &owned_file), RAY_OK);
-    TEST_ASSERT_EQ_I(mapped_bytes(), baseline + (int64_t)file_size);
+    TEST_ASSERT_EQ_I(mapped_bytes(), baseline + mapped_pages(file_size));
     const ray_col_block_reader_t* r = ray_col_block_file_reader(owned_file);
     TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_EQ_I(r->rows, 8);
     TEST_ASSERT_EQ_I(ray_col_block_file_open(path, &owned_file), RAY_ERR_DOMAIN);
     TEST_ASSERT_TRUE(ray_col_block_file_reader(owned_file) == r);
     ray_t* v = ray_col_block_load_range(path, 1, 2, 16, 64);
     TEST_ASSERT_FALSE(RAY_IS_ERR(v)); TEST_ASSERT_TRUE(ray_vec_is_null(v, 0));
-    TEST_ASSERT_EQ_I(mapped_bytes(), baseline + (int64_t)file_size);
+    TEST_ASSERT_EQ_I(mapped_bytes(), baseline + mapped_pages(file_size));
     ray_col_block_file_close(&owned_file);
     TEST_ASSERT_TRUE(owned_file == NULL);
     TEST_ASSERT_EQ_I(mapped_bytes(), baseline);
