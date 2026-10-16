@@ -38,6 +38,8 @@ struct ray_block_query_s {
     ray_t* schema;
     ray_t* mask;
     uint64_t start, position, remaining;
+    uint64_t mask_base;   /* absolute row of mask[0] */
+    uint64_t probe_rows;  /* finest zone-map block among filter columns, 0: none */
     size_t external_reserve;
     uint64_t batches_skipped;
     bool failed, cancelled;
@@ -140,6 +142,10 @@ ray_err_t ray_block_query_open_source(const char* root, const ray_block_scan_sou
         ray_t* col = ray_table_get_col(schema,
             ray_sym_intern(q->predicates[i].column, strlen(q->predicates[i].column)));
         if (!col || col->type != -q->predicates[i].value->type) err = RAY_ERR_TYPE;
+    }
+    for (size_t i = 0; !err && i < n_predicates; i++) {
+        uint64_t g = ray_block_scan_zone_rows(q->scan, q->predicates[i].scan_index);
+        if (g && (!q->probe_rows || g < q->probe_rows)) q->probe_rows = g;
     }
     if (!err) {
         q->remaining = ray_block_scan_rows(q->scan);
@@ -354,7 +360,7 @@ ray_t* ray_block_query_next(ray_block_query_t* q) {
             if (q->position > begin) {
                 result = query_reserve_error(q, (size_t)q->mask->len);
                 if (!result) result = ray_block_scan_read_columns(q->scan, NULL, q->count,
-                                                        q->start + begin, q->position - begin);
+                                                        q->mask_base + begin, q->position - begin);
                 if (fragmented && result && !RAY_IS_ERR(result)) {
                     ray_t* window = result;
                     result = query_compact(window, mask + begin);
@@ -371,6 +377,27 @@ ray_t* ray_block_query_next(ray_block_query_t* q) {
         bool may_match;
         range_err = query_batch_may_match(q, batch_start, scan_rows, &may_match);
         if (range_err) { result = ray_error(ray_err_code_str(range_err), "block query statistics failed"); break; }
+        /* Trim blocks at either end of the read that zone maps exclude, so a
+         * narrow range decodes only its own blocks of a large read. */
+        uint64_t lo = 0, hi = scan_rows;
+        for (uint64_t g = q->probe_rows; may_match && g && g < scan_rows && lo < hi;) {
+            uint64_t s = batch_start + lo, e = (s / g + 1) * g;
+            if (e > batch_start + hi) e = batch_start + hi;
+            bool m;
+            range_err = query_batch_may_match(q, s, e - s, &m);
+            if (range_err || m) break;
+            lo = e - batch_start;
+        }
+        for (uint64_t g = q->probe_rows; !range_err && may_match && g && g < scan_rows && lo < hi;) {
+            uint64_t e = batch_start + hi, s = (e - 1) / g * g;
+            if (s < batch_start + lo) s = batch_start + lo;
+            bool m;
+            range_err = query_batch_may_match(q, s, e - s, &m);
+            if (range_err || m) break;
+            hi = s - batch_start;
+        }
+        if (range_err) { result = ray_error(ray_err_code_str(range_err), "block query statistics failed"); break; }
+        if (lo == hi) may_match = false;
         if (!may_match) {
             range_err = ray_block_scan_skip_next(q->scan, &q->start);
             if (range_err) { result = ray_error(ray_err_code_str(range_err), "block query skip failed"); break; }
@@ -382,13 +409,21 @@ ray_t* ray_block_query_next(ray_block_query_t* q) {
         if (scan_rows > SIZE_MAX / mask_vectors) {
             result = ray_error("limit", "block query mask workspace exceeds size limit"); break;
         }
-        result = query_reserve_error(q, (size_t)scan_rows * mask_vectors);
+        result = query_reserve_error(q, (size_t)(hi - lo) * mask_vectors);
         if (result) break;
-        ray_t* batch = ray_block_scan_next_columns(q->scan, q->filter_indices,
-                                                   q->n_filters, &q->start);
+        ray_t* batch;
+        if (lo == 0 && hi == scan_rows) {
+            batch = ray_block_scan_next_columns(q->scan, q->filter_indices, q->n_filters, &q->start);
+        } else {
+            batch = ray_block_scan_read_columns(q->scan, q->filter_indices, q->n_filters,
+                                                batch_start + lo, hi - lo);
+            range_err = batch && !RAY_IS_ERR(batch) ? ray_block_scan_skip_next(q->scan, &q->start) : RAY_OK;
+            if (range_err) { ray_release(batch); result = ray_error(ray_err_code_str(range_err), "block query skip failed"); break; }
+        }
         if (!batch || RAY_IS_ERR(batch)) { result = batch; break; }
+        q->mask_base = batch_start + lo;
         int64_t rows = ray_table_nrows(batch);
-        q->remaining -= (uint64_t)rows;
+        q->remaining -= scan_rows;
         ray_t* mask = query_mask(q, batch);
         ray_release(batch);
         if (!mask) { result = ray_error("oom", "block query mask allocation failed"); break; }

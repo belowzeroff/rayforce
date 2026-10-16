@@ -1370,11 +1370,12 @@ static test_result_t query_zone_pruning(void) {
 static test_result_t gate_range_pruning(void) {
     struct { uint32_t rows, block_bytes, batch_rows, lo, hi; uint64_t blocks; } cases[] = {
         {4096, 512, 64, 1000, 1064, 4},               /* batch == I64 block */
+        {4096, 512, 4096, 1000, 1064, 4},             /* one read: trimmed to the range's blocks */
         /* Default batch, 64 KiB blocks: batches are finer than blocks, so the
          * next batch inside the matching t block decodes that block again. */
         {524288, 65536, 4096, 100000, 100100, 3}
     };
-    for (unsigned c = 0; c < 2; c++) {
+    for (unsigned c = 0; c < sizeof(cases) / sizeof(*cases); c++) {
         uint32_t rows = cases[c].rows;
         ray_t* t = ray_vec_new(RAY_I64, rows);
         ray_t* v = ray_vec_new(RAY_I32, rows);
@@ -1411,7 +1412,7 @@ static test_result_t gate_range_pruning(void) {
         TEST_ASSERT_EQ_I(stats.scan.blocks_decoded, cases[c].blocks);
         TEST_ASSERT_EQ_I(stats.scan.raw_rows, 0);
         uint64_t batches = (rows + cases[c].batch_rows - 1) / cases[c].batch_rows;
-        TEST_ASSERT_TRUE(stats.batches_skipped >= batches - 2);
+        TEST_ASSERT_TRUE(batches <= 2 || stats.batches_skipped >= batches - 2);
         TEST_ASSERT_TRUE(stats.scan.blocks_decoded * 10 <= total_blocks);
         ray_block_query_close(&query);
     }
