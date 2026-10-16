@@ -17,6 +17,9 @@ typedef struct {
  * arbitrary expressions, aggregates, ordering, or hidden full materialization.
  * One scan pins the union of filter and output columns. Filter-only batches
  * precede output-only contiguous matching ranges, in original row order.
+ * Conjunctive predicates use compressed integer/temporal zone metadata to
+ * skip provably nonmatching batches; raw, legacy, and unsupported data remain
+ * conservative and are evaluated normally.
  * Output batch sizes may vary. Every returned table owns its data.
  * payload/scratch options bound each scan read independently. A nonzero
  * work_limit additionally combines decoded payload, scratch, logical predicate

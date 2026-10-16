@@ -232,6 +232,93 @@ static test_result_t fallback_and_bits(void) {
     PASS();
 }
 
+static test_result_t zone_maps(void) {
+    const int64_t values[] = {-5, 0, 10, INT64_MIN, -1, 3, 8, 9,
+                              7, 7, 7, 7, 7, 7, 7, 7,
+                              INT64_MIN, INT64_MIN, INT64_MIN, INT64_MIN,
+                              INT64_MIN, INT64_MIN, INT64_MIN, INT64_MIN};
+    TEST_ASSERT_EQ_I(ray_col_block_begin(&writer, file, RAY_I64, 64, 1, 0), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_block_append(&writer, values, 24), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_block_finish(&writer), RAY_OK);
+    snapshot();
+    ray_col_block_reader_t r;
+    TEST_ASSERT_EQ_I(ray_col_block_open(&r, bytes, file_size), RAY_OK);
+    TEST_ASSERT_EQ_I(r.blocks, 3);
+    bool match = true;
+    TEST_ASSERT_EQ_I(ray_col_block_range_may_match(&r, 0, 8,
+                     RAY_COL_BLOCK_EQ, 11, false, &match), RAY_OK);
+    TEST_ASSERT_FALSE(match);
+    TEST_ASSERT_EQ_I(ray_col_block_range_may_match(&r, 0, 8,
+                     RAY_COL_BLOCK_EQ, 0, true, &match), RAY_OK);
+    TEST_ASSERT_TRUE(match);
+    TEST_ASSERT_EQ_I(ray_col_block_range_may_match(&r, 0, 8,
+                     RAY_COL_BLOCK_LT, -5, false, &match), RAY_OK);
+    TEST_ASSERT_TRUE(match); /* Null sorts below non-null values. */
+    TEST_ASSERT_EQ_I(ray_col_block_range_may_match(&r, 0, 8,
+                     RAY_COL_BLOCK_GT, 10, false, &match), RAY_OK);
+    TEST_ASSERT_FALSE(match);
+    TEST_ASSERT_EQ_I(ray_col_block_range_may_match(&r, 8, 8,
+                     RAY_COL_BLOCK_NE, 7, false, &match), RAY_OK);
+    TEST_ASSERT_FALSE(match);
+    TEST_ASSERT_EQ_I(ray_col_block_range_may_match(&r, 8, 8,
+                     RAY_COL_BLOCK_EQ, 7, false, &match), RAY_OK);
+    TEST_ASSERT_TRUE(match);
+    TEST_ASSERT_EQ_I(ray_col_block_range_may_match(&r, 8, 8,
+                     RAY_COL_BLOCK_EQ, 0, true, &match), RAY_OK);
+    TEST_ASSERT_FALSE(match);
+    TEST_ASSERT_EQ_I(ray_col_block_range_may_match(&r, 8, 8,
+                     RAY_COL_BLOCK_LT, 0, true, &match), RAY_OK);
+    TEST_ASSERT_FALSE(match);
+    TEST_ASSERT_EQ_I(ray_col_block_range_may_match(&r, 8, 8,
+                     RAY_COL_BLOCK_GT, 0, true, &match), RAY_OK);
+    TEST_ASSERT_TRUE(match);
+    TEST_ASSERT_EQ_I(ray_col_block_range_may_match(&r, 0, 16,
+                     RAY_COL_BLOCK_EQ, 7, false, &match), RAY_OK);
+    TEST_ASSERT_TRUE(match);
+    TEST_ASSERT_EQ_I(ray_col_block_range_may_match(&r, 16, 8,
+                     RAY_COL_BLOCK_EQ, 0, true, &match), RAY_OK);
+    TEST_ASSERT_TRUE(match);
+    TEST_ASSERT_EQ_I(ray_col_block_range_may_match(&r, 16, 8,
+                     RAY_COL_BLOCK_NE, 0, true, &match), RAY_OK);
+    TEST_ASSERT_FALSE(match);
+    TEST_ASSERT_EQ_I(ray_col_block_range_may_match(&r, 16, 8,
+                     RAY_COL_BLOCK_LT, 0, false, &match), RAY_OK);
+    TEST_ASSERT_TRUE(match);
+    TEST_ASSERT_EQ_I(ray_col_block_range_may_match(&r, 16, 8,
+                     RAY_COL_BLOCK_GT, 0, false, &match), RAY_OK);
+    TEST_ASSERT_FALSE(match);
+    TEST_ASSERT_EQ_I(ray_col_block_range_may_match(&r, 24, 0,
+                     RAY_COL_BLOCK_EQ, 7, false, &match), RAY_OK);
+    TEST_ASSERT_FALSE(match);
+    TEST_ASSERT_EQ_I(ray_col_block_range_may_match(&r, 25, 0,
+                     RAY_COL_BLOCK_EQ, 7, false, &match), RAY_ERR_RANGE);
+    TEST_ASSERT_EQ_I(ray_col_block_range_may_match(&r, 0, 1,
+                     (ray_col_block_cmp_t)99, 7, false, &match), RAY_ERR_DOMAIN);
+    TEST_ASSERT_EQ_I(ray_col_block_range_may_match(&r, 0, 1,
+                     RAY_COL_BLOCK_EQ, 7, false, NULL), RAY_ERR_DOMAIN);
+
+    size_t dir = (size_t)r.directory;
+    memcpy(copy, bytes, file_size);
+    for (uint64_t i = 0; i < r.blocks; i++) {
+        uint8_t* e = copy + dir + i * RAY_COL_BLOCK_ENTRY;
+        e[34] = 0; memset(e + 48, 0, 16);
+    }
+    rechecksum(copy);
+    TEST_ASSERT_EQ_I(ray_col_block_open(&r, copy, file_size), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_block_range_may_match(&r, 0, 8,
+                     RAY_COL_BLOCK_EQ, 11, false, &match), RAY_OK);
+    TEST_ASSERT_TRUE(match); /* Legacy directory entries are conservative. */
+
+    memcpy(copy, bytes, file_size); copy[dir + 34] = 0x80; rechecksum(copy);
+    TEST_ASSERT_EQ_I(ray_col_block_open(&r, copy, file_size), RAY_ERR_CORRUPT);
+    memcpy(copy, bytes, file_size); copy[dir + 34] = 1; rechecksum(copy);
+    TEST_ASSERT_EQ_I(ray_col_block_open(&r, copy, file_size), RAY_ERR_CORRUPT);
+    memcpy(copy, bytes, file_size); copy[dir + 34] = 5;
+    put(copy + dir + 48, 2, 8); put(copy + dir + 56, 1, 8); rechecksum(copy);
+    TEST_ASSERT_EQ_I(ray_col_block_open(&r, copy, file_size), RAY_ERR_CORRUPT);
+    PASS();
+}
+
 static test_result_t ranges(void) {
     int64_t values[24];
     uint8_t scratch[65];
@@ -558,6 +645,7 @@ const test_entry_t col_block_entries[] = {
     {"col_block/empty_and_bounds", empty_and_bounds, setup, teardown},
     {"col_block/corruption", corruption, setup, teardown},
     {"col_block/fallback_and_bits", fallback_and_bits, setup, teardown},
+    {"col_block/zone_maps", zone_maps, setup, teardown},
     {"col_block/io_failure", io_failure, setup, teardown},
     {"col_block/ranges", ranges, setup, teardown},
     {"col_block/materialize", materialize, setup, teardown},

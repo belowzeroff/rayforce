@@ -219,6 +219,51 @@ uint64_t ray_block_scan_rows(const ray_block_scan_t* s) {
     return s ? s->end - s->options.start : 0;
 }
 
+ray_err_t ray_block_scan_next_range(const ray_block_scan_t* s,
+                                    uint64_t* start, uint64_t* rows) {
+    if (!s || !start || !rows || s->failed) return RAY_ERR_DOMAIN;
+    *start = s->cursor;
+    *rows = s->end - s->cursor;
+    if (*rows > s->options.batch_rows) *rows = s->options.batch_rows;
+    return RAY_OK;
+}
+
+static ray_col_block_cmp_t scan_col_cmp(ray_block_scan_cmp_t op) {
+    switch (op) {
+    case RAY_BLOCK_SCAN_EQ: return RAY_COL_BLOCK_EQ;
+    case RAY_BLOCK_SCAN_NE: return RAY_COL_BLOCK_NE;
+    case RAY_BLOCK_SCAN_LT: return RAY_COL_BLOCK_LT;
+    case RAY_BLOCK_SCAN_LE: return RAY_COL_BLOCK_LE;
+    case RAY_BLOCK_SCAN_GT: return RAY_COL_BLOCK_GT;
+    default: return RAY_COL_BLOCK_GE;
+    }
+}
+
+ray_err_t ray_block_scan_range_may_match(const ray_block_scan_t* s,
+                                        size_t column, uint64_t start, uint64_t rows,
+                                        ray_block_scan_cmp_t op, int64_t value,
+                                        bool value_is_null, bool* may_match) {
+    if (!s || !may_match || s->failed || column >= s->count || op > RAY_BLOCK_SCAN_GE)
+        return RAY_ERR_DOMAIN;
+    if (start < s->options.start || start > s->end || rows > s->end - start)
+        return RAY_ERR_RANGE;
+    scan_column_t* c = &s->columns[column];
+    if (c->raw) { *may_match = true; return RAY_OK; }
+    return ray_col_block_range_may_match(ray_col_block_file_reader(c->file), start, rows,
+        scan_col_cmp(op), value, value_is_null, may_match);
+}
+
+ray_err_t ray_block_scan_skip_next(ray_block_scan_t* s, uint64_t* row_start) {
+    if (!s || s->failed) return RAY_ERR_DOMAIN;
+    if (s->cancelled) return RAY_ERR_CANCEL;
+    uint64_t rows = s->end - s->cursor;
+    if (rows > s->options.batch_rows) rows = s->options.batch_rows;
+    if (!rows) return RAY_OK;
+    if (row_start) *row_start = s->cursor;
+    s->cursor += rows;
+    return RAY_OK;
+}
+
 bool ray_block_scan_has_column(const ray_block_scan_t* s, const char* name) {
     if (!s || !name) return false;
     size_t len = strlen(name);

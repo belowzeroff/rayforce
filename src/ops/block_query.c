@@ -8,6 +8,7 @@
 typedef struct {
     char column[256];
     uint16_t opcode;
+    size_t scan_index;
     ray_t* value;
 } predicate_t;
 
@@ -19,7 +20,6 @@ struct ray_block_query_s {
     ray_t* schema;
     ray_t* mask;
     uint64_t start, position, remaining;
-    uint32_t batch_rows;
     size_t external_reserve;
     bool failed, cancelled;
 };
@@ -80,7 +80,8 @@ ray_err_t ray_block_query_open(const char* root, const char* const* columns,
     ray_err_t err = RAY_OK;
     for (size_t i = 0; i < n_predicates; i++) {
         predicate_t* p = &q->predicates[i];
-        strcpy(p->column, predicates[i].column);
+        size_t column_len = strlen(predicates[i].column);
+        memcpy(p->column, predicates[i].column, column_len + 1);
         p->opcode = predicates[i].opcode;
         p->value = ray_i64(0);
         if (!p->value || RAY_IS_ERR(p->value)) { err = RAY_ERR_OOM; break; }
@@ -89,11 +90,12 @@ ray_err_t ray_block_query_open(const char* root, const char* const* columns,
         memcpy(&p->value->i64, &predicates[i].value->i64, sizeof(int64_t));
         p->value->aux[0] = predicates[i].value->aux[0] & 1;
         size_t index = 0;
-        while (index < n && strcmp(names[index], p->column)) index++;
+        while (index < n && strcmp(names[index], p->column) != 0) index++;
         if (index == n) {
             if (n == RAY_BLOCK_SCAN_MAX_COLUMNS) { err = RAY_ERR_LIMIT; break; }
             names[n++] = p->column;
         }
+        p->scan_index = index;
         size_t j = 0;
         while (j < q->n_filters && q->filter_indices[j] != index) j++;
         if (j == q->n_filters) q->filter_indices[q->n_filters++] = index;
@@ -111,7 +113,6 @@ ray_err_t ray_block_query_open(const char* root, const char* const* columns,
     }
     if (!err) {
         q->remaining = ray_block_scan_rows(q->scan);
-        q->batch_rows = options->batch_rows;
         q->schema = ray_table_new((int64_t)count);
         if (!q->schema || RAY_IS_ERR(q->schema)) err = RAY_ERR_OOM;
         for (size_t i = 0; !err && i < count; i++) {
@@ -189,6 +190,42 @@ static ray_t* query_reserve_error(ray_block_query_t* q, size_t bytes) {
     return err ? ray_error(ray_err_code_str(err), "block query working set exceeds limit") : NULL;
 }
 
+static ray_block_scan_cmp_t query_scan_op(uint16_t op) {
+    switch (op) {
+    case OP_EQ: return RAY_BLOCK_SCAN_EQ;
+    case OP_NE: return RAY_BLOCK_SCAN_NE;
+    case OP_LT: return RAY_BLOCK_SCAN_LT;
+    case OP_LE: return RAY_BLOCK_SCAN_LE;
+    case OP_GT: return RAY_BLOCK_SCAN_GT;
+    default: return RAY_BLOCK_SCAN_GE;
+    }
+}
+
+static int64_t query_atom_value(const ray_t* value) {
+    switch (-value->type) {
+    case RAY_BOOL: return value->b8;
+    case RAY_U8: return value->u8;
+    case RAY_I16: return value->i16;
+    case RAY_I32: case RAY_DATE: case RAY_TIME: return value->i32;
+    default: return value->i64;
+    }
+}
+
+static ray_err_t query_batch_may_match(ray_block_query_t* q, uint64_t start,
+                                       uint64_t rows, bool* may_match) {
+    *may_match = true;
+    for (size_t i = 0; i < q->n_predicates; i++) {
+        predicate_t* p = &q->predicates[i];
+        bool predicate_may_match;
+        ray_err_t err = ray_block_scan_range_may_match(q->scan, p->scan_index,
+            start, rows, query_scan_op(p->opcode), query_atom_value(p->value),
+            RAY_ATOM_IS_NULL(p->value), &predicate_may_match);
+        if (err) return err;
+        if (!predicate_may_match) { *may_match = false; break; }
+    }
+    return RAY_OK;
+}
+
 ray_t* ray_block_query_next(ray_block_query_t* q) {
     if (!q) return ray_error("domain", "null block query");
     if (q->failed) return ray_error("domain", "block query is terminal; close it");
@@ -216,12 +253,24 @@ ray_t* ray_block_query_next(ray_block_query_t* q) {
             }
             ray_release(q->mask); q->mask = NULL;
         }
-        uint64_t batch_rows = q->remaining < q->batch_rows ? q->remaining : q->batch_rows;
+        uint64_t batch_start, scan_rows;
+        ray_err_t range_err = ray_block_scan_next_range(q->scan, &batch_start, &scan_rows);
+        if (range_err) { result = ray_error(ray_err_code_str(range_err), "block query range failed"); break; }
+        if (!scan_rows) { result = NULL; break; }
+        bool may_match;
+        range_err = query_batch_may_match(q, batch_start, scan_rows, &may_match);
+        if (range_err) { result = ray_error(ray_err_code_str(range_err), "block query statistics failed"); break; }
+        if (!may_match) {
+            range_err = ray_block_scan_skip_next(q->scan, &q->start);
+            if (range_err) { result = ray_error(ray_err_code_str(range_err), "block query skip failed"); break; }
+            q->remaining -= scan_rows;
+            continue;
+        }
         size_t mask_vectors = q->n_predicates * 2 - 1;
-        if (batch_rows > SIZE_MAX / mask_vectors) {
+        if (scan_rows > SIZE_MAX / mask_vectors) {
             result = ray_error("limit", "block query mask workspace exceeds size limit"); break;
         }
-        result = query_reserve_error(q, (size_t)batch_rows * mask_vectors);
+        result = query_reserve_error(q, (size_t)scan_rows * mask_vectors);
         if (result) break;
         ray_t* batch = ray_block_scan_next_columns(q->scan, q->filter_indices,
                                                    q->n_filters, &q->start);
