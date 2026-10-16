@@ -97,6 +97,13 @@ size_t ray_snappy_compress(const uint8_t* src, size_t size, uint8_t* dst,
     return out;
 }
 
+/* Unaligned 8-byte copy; the compiler emits one load and one store. */
+static inline void snappy_copy8(uint8_t* dst, const uint8_t* src) {
+    uint64_t v;
+    memcpy(&v, src, 8);
+    memcpy(dst, &v, 8);
+}
+
 bool ray_snappy_decompress(const uint8_t* src, size_t len,
                            uint8_t* dst, size_t size) {
     if (!src || !len || (!dst && size) || size > UINT32_MAX) return false;
@@ -124,7 +131,12 @@ bool ray_snappy_decompress(const uint8_t* src, size_t len,
                 n = (uint64_t)last + 1;
             }
             if (n > size - at || n > len - in) return false;
-            memcpy(dst + at, src + in, (size_t)n);
+            /* Short literals with 16 bytes of slack on both sides: two wide
+             * copies, the excess output rewritten by later tags. */
+            if (n <= 16 && len - in >= 16 && size - at >= 16) {
+                snappy_copy8(dst + at, src + in);
+                snappy_copy8(dst + at + 8, src + in + 8);
+            } else memcpy(dst + at, src + in, (size_t)n);
             in += (size_t)n;
             at += (size_t)n;
         } else {
@@ -142,6 +154,19 @@ bool ray_snappy_decompress(const uint8_t* src, size_t len,
                 n = 1 + (tag >> 2);
             }
             if (!off || off > at || n > size - at) return false;
+            if (off >= 8 && size - at - n >= 8) {
+                /* Each 8-byte source ends at or before its destination, so it
+                 * is already decoded; writes past n stay inside the slack. */
+                for (size_t i = 0; i < n; i += 8)
+                    snappy_copy8(dst + at + i, dst + at + i - off);
+                at += n;
+                continue;
+            }
+            if (off == 1) {
+                memset(dst + at, dst[at - 1], n);
+                at += n;
+                continue;
+            }
             /* Grow nonoverlapping spans to decode overlapping backreferences. */
             size_t copied = 0;
             while (copied < n) {
