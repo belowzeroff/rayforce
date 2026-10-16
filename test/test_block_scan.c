@@ -306,22 +306,28 @@ static test_result_t crash_publication(void) {
     long window = save_us + save_us / 2 + 1;
     int64_t current = 1;
     int published = 0, kept = 0;
-    for (int64_t attempt = 2; attempt < 42; attempt++) {
-        t = epoch_table(attempt, rows);
-        fflush(stdout); fflush(stderr);
-        pid_t pid = fork();
-        TEST_ASSERT_TRUE(pid >= 0);
-        if (!pid) _exit(ray_block_store_save(t, root, &store) ? 1 : 0);
-        sleep_us(window * (attempt - 2) / 40);
-        kill(pid, SIGKILL);
-        int status = 0;
-        TEST_ASSERT_EQ_I(waitpid(pid, &status, 0), pid);
-        ray_release(t);
-        int64_t epoch = 0;
-        TEST_ASSERT_EQ_I(epoch_read(rows, &epoch), 0);
-        TEST_ASSERT_TRUE(epoch == current || epoch == attempt);
-        if (epoch == attempt) published++; else kept++;
-        current = epoch;
+    /* A forked writer can run slower than the timed saves: widen the sweep
+     * until kills land after publication too, narrow it if never before. */
+    for (int64_t attempt = 2, round = 0; round < 3 && !(published && kept); round++) {
+        if (round && !published) window *= 2;
+        else if (round && !kept) window /= 2;
+        for (int k = 0; k < 40; k++, attempt++) {
+            t = epoch_table(attempt, rows);
+            fflush(stdout); fflush(stderr);
+            pid_t pid = fork();
+            TEST_ASSERT_TRUE(pid >= 0);
+            if (!pid) _exit(ray_block_store_save(t, root, &store) ? 1 : 0);
+            sleep_us(window * k / 40);
+            kill(pid, SIGKILL);
+            int status = 0;
+            TEST_ASSERT_EQ_I(waitpid(pid, &status, 0), pid);
+            ray_release(t);
+            int64_t epoch = 0;
+            TEST_ASSERT_EQ_I(epoch_read(rows, &epoch), 0);
+            TEST_ASSERT_TRUE(epoch == current || epoch == attempt);
+            if (epoch == attempt) published++; else kept++;
+            current = epoch;
+        }
     }
     /* Both outcomes occurred, so kills landed on both sides of publication. */
     TEST_ASSERT_TRUE(published > 0 && kept > 0);
