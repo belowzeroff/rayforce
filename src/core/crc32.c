@@ -78,9 +78,8 @@ __attribute__((constructor)) static void crc32_slice_init(void) {
         }
 }
 
-uint32_t ray_crc32(uint32_t seed, const void* data, size_t n) {
-    const uint8_t* p = (const uint8_t*)data;
-    uint32_t c = seed ^ 0xFFFFFFFFu;
+/* Table-driven update of the raw (uninverted) register. */
+static uint32_t crc32_table(uint32_t c, const uint8_t* p, size_t n) {
     for (; n >= 8; p += 8, n -= 8) {
         uint32_t lo = c ^ ((uint32_t)p[0] | (uint32_t)p[1] << 8 |
                            (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24);
@@ -92,5 +91,79 @@ uint32_t ray_crc32(uint32_t seed, const void* data, size_t n) {
             CRC32_SLICE[1][(hi >> 16) & 0xFF] ^ CRC32_SLICE[0][hi >> 24];
     }
     while (n--) c = CRC32_TABLE[(c ^ *p++) & 0xFF] ^ (c >> 8);
-    return c ^ 0xFFFFFFFFu;
+    return c;
+}
+
+uint32_t ray_crc32_portable(uint32_t seed, const void* data, size_t n) {
+    return crc32_table(seed ^ 0xFFFFFFFFu, (const uint8_t*)data, n) ^ 0xFFFFFFFFu;
+}
+
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+#include <immintrin.h>
+#define RAY_CRC32_FOLD 1
+
+/* Carry-less multiplication folding for the reflected polynomial (Intel,
+ * "Fast CRC Computation for Generic Polynomials Using PCLMULQDQ"), with the
+ * Linux crc32-pclmul constants: R1/R2 fold 512 bits, R3/R4 128 bits, R5
+ * the final 64 -> 32 bits, then a Barrett reduction by P' and u'. Raw
+ * register in and out; n >= 64 and a multiple of 16. */
+__attribute__((target("pclmul,sse4.1")))
+static uint32_t crc32_fold(uint32_t c, const uint8_t* p, size_t n) {
+    const __m128i r2r1 = _mm_set_epi64x(0x1c6e41596LL, 0x154442bd4LL);
+    const __m128i r4r3 = _mm_set_epi64x(0x0ccaa009eLL, 0x1751997d0LL);
+    const __m128i r5 = _mm_set_epi64x(0, 0x163cd6124LL);
+    const __m128i poly = _mm_set_epi64x(0x1f7011641LL, 0x1db710641LL);
+    const __m128i mask32 = _mm_set_epi32(0, 0, 0, -1);
+    __m128i x1 = _mm_loadu_si128((const __m128i*)p);
+    __m128i x2 = _mm_loadu_si128((const __m128i*)(p + 16));
+    __m128i x3 = _mm_loadu_si128((const __m128i*)(p + 32));
+    __m128i x4 = _mm_loadu_si128((const __m128i*)(p + 48));
+    x1 = _mm_xor_si128(x1, _mm_cvtsi32_si128((int)c));
+    p += 64; n -= 64;
+#define FOLD(x, k, next) _mm_xor_si128(_mm_xor_si128(_mm_clmulepi64_si128(x, k, 0x00), \
+                                                     _mm_clmulepi64_si128(x, k, 0x11)), next)
+    for (; n >= 64; p += 64, n -= 64) {
+        x1 = FOLD(x1, r2r1, _mm_loadu_si128((const __m128i*)p));
+        x2 = FOLD(x2, r2r1, _mm_loadu_si128((const __m128i*)(p + 16)));
+        x3 = FOLD(x3, r2r1, _mm_loadu_si128((const __m128i*)(p + 32)));
+        x4 = FOLD(x4, r2r1, _mm_loadu_si128((const __m128i*)(p + 48)));
+    }
+    x1 = FOLD(x1, r4r3, x2);
+    x1 = FOLD(x1, r4r3, x3);
+    x1 = FOLD(x1, r4r3, x4);
+    for (; n >= 16; p += 16, n -= 16)
+        x1 = FOLD(x1, r4r3, _mm_loadu_si128((const __m128i*)p));
+#undef FOLD
+    /* 128 -> 64 bits: R4 times the low half, appending 32 zero bits. */
+    __m128i t = _mm_clmulepi64_si128(r4r3, x1, 0x01);
+    x1 = _mm_xor_si128(_mm_srli_si128(x1, 8), t);
+    /* 64 -> 32 bits. */
+    t = _mm_clmulepi64_si128(_mm_and_si128(x1, mask32), r5, 0x00);
+    x1 = _mm_xor_si128(_mm_srli_si128(x1, 4), t);
+    /* Barrett reduction. */
+    t = _mm_and_si128(_mm_clmulepi64_si128(_mm_and_si128(x1, mask32), poly, 0x10), mask32);
+    t = _mm_clmulepi64_si128(t, poly, 0x00);
+    x1 = _mm_xor_si128(x1, t);
+    return (uint32_t)_mm_extract_epi32(x1, 1);
+}
+
+static int crc32_has_fold;
+
+__attribute__((constructor)) static void crc32_fold_init(void) {
+    __builtin_cpu_init();
+    crc32_has_fold = __builtin_cpu_supports("pclmul") && __builtin_cpu_supports("sse4.1");
+}
+#endif
+
+uint32_t ray_crc32(uint32_t seed, const void* data, size_t n) {
+    const uint8_t* p = (const uint8_t*)data;
+    uint32_t c = seed ^ 0xFFFFFFFFu;
+#ifdef RAY_CRC32_FOLD
+    if (crc32_has_fold && n >= 64) {
+        size_t k = n & ~(size_t)15;
+        c = crc32_fold(c, p, k);
+        p += k; n -= k;
+    }
+#endif
+    return crc32_table(c, p, n) ^ 0xFFFFFFFFu;
 }
