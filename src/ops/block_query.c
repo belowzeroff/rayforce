@@ -18,7 +18,9 @@ struct ray_block_query_s {
     size_t count, n_predicates, n_filters;
     ray_t* schema;
     ray_t* mask;
-    uint64_t start, position;
+    uint64_t start, position, remaining;
+    uint32_t batch_rows;
+    size_t external_reserve;
     bool failed, cancelled;
 };
 
@@ -108,6 +110,8 @@ ray_err_t ray_block_query_open(const char* root, const char* const* columns,
         if (!col || col->type != -q->predicates[i].value->type) err = RAY_ERR_TYPE;
     }
     if (!err) {
+        q->remaining = ray_block_scan_rows(q->scan);
+        q->batch_rows = options->batch_rows;
         q->schema = ray_table_new((int64_t)count);
         if (!q->schema || RAY_IS_ERR(q->schema)) err = RAY_ERR_OOM;
         for (size_t i = 0; !err && i < count; i++) {
@@ -124,6 +128,16 @@ ray_err_t ray_block_query_open(const char* root, const char* const* columns,
 
 uint64_t ray_block_query_rows(const ray_block_query_t* q) {
     return q ? ray_block_scan_rows(q->scan) : 0;
+}
+
+ray_err_t ray_block_query_reserve(ray_block_query_t* q, size_t bytes) {
+    if (!q || q->failed) return RAY_ERR_DOMAIN;
+    size_t mask_bytes = q->mask ? (size_t)q->mask->len : 0;
+    if (bytes > SIZE_MAX - mask_bytes) return RAY_ERR_LIMIT;
+    ray_err_t err = ray_block_scan_reserve(q->scan, bytes + mask_bytes);
+    if (err) return err;
+    q->external_reserve = bytes;
+    return RAY_OK;
 }
 
 bool ray_block_query_has_column(const ray_block_query_t* q, const char* name) {
@@ -165,6 +179,16 @@ oom:
     return ray_error("oom", "block query graph allocation failed");
 }
 
+static ray_err_t query_scan_reserve(ray_block_query_t* q, size_t query_bytes) {
+    if (query_bytes > SIZE_MAX - q->external_reserve) return RAY_ERR_LIMIT;
+    return ray_block_scan_reserve(q->scan, q->external_reserve + query_bytes);
+}
+
+static ray_t* query_reserve_error(ray_block_query_t* q, size_t bytes) {
+    ray_err_t err = query_scan_reserve(q, bytes);
+    return err ? ray_error(ray_err_code_str(err), "block query working set exceeds limit") : NULL;
+}
+
 ray_t* ray_block_query_next(ray_block_query_t* q) {
     if (!q) return ray_error("domain", "null block query");
     if (q->failed) return ray_error("domain", "block query is terminal; close it");
@@ -173,7 +197,11 @@ ray_t* ray_block_query_next(ray_block_query_t* q) {
         if (q->cancelled || ray_eval_is_interrupted()) {
             result = ray_error("cancel", "block query cancelled"); break;
         }
-        if (!q->n_predicates) { result = ray_block_scan_next(q->scan); break; }
+        if (!q->n_predicates) {
+            result = query_reserve_error(q, 0);
+            if (!result) result = ray_block_scan_next(q->scan);
+            break;
+        }
         if (q->mask) {
             const uint8_t* mask = ray_data(q->mask);
             uint64_t rows = (uint64_t)q->mask->len;
@@ -181,16 +209,25 @@ ray_t* ray_block_query_next(ray_block_query_t* q) {
             uint64_t begin = q->position;
             while (q->position < rows && mask[q->position]) q->position++;
             if (q->position > begin) {
-                result = ray_block_scan_read_columns(q->scan, NULL, q->count,
-                                                    q->start + begin, q->position - begin);
+                result = query_reserve_error(q, (size_t)q->mask->len);
+                if (!result) result = ray_block_scan_read_columns(q->scan, NULL, q->count,
+                                                        q->start + begin, q->position - begin);
                 break;
             }
             ray_release(q->mask); q->mask = NULL;
         }
+        uint64_t batch_rows = q->remaining < q->batch_rows ? q->remaining : q->batch_rows;
+        size_t mask_vectors = q->n_predicates * 2 - 1;
+        if (batch_rows > SIZE_MAX / mask_vectors) {
+            result = ray_error("limit", "block query mask workspace exceeds size limit"); break;
+        }
+        result = query_reserve_error(q, (size_t)batch_rows * mask_vectors);
+        if (result) break;
         ray_t* batch = ray_block_scan_next_columns(q->scan, q->filter_indices,
                                                    q->n_filters, &q->start);
         if (!batch || RAY_IS_ERR(batch)) { result = batch; break; }
         int64_t rows = ray_table_nrows(batch);
+        q->remaining -= (uint64_t)rows;
         ray_t* mask = query_mask(q, batch);
         ray_release(batch);
         if (!mask) { result = ray_error("oom", "block query mask allocation failed"); break; }
