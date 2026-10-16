@@ -223,21 +223,36 @@ struct ray_splay_lease_s {
  * shared .publish.lock no generation can be published or removed, so the
  * generation a reader resolves still exists when its lease is taken.  Locks
  * are flock()s on a descriptor opened per acquisition; the kernel drops them
- * when a process dies. */
-static ray_err_t splay_publish_lock(const char* root, bool exclusive, ray_fd_t* out) {
+ * when a process dies.  Both sides open .publish.lock read-only, creating it
+ * if missing: flock needs no write access, so whoever created it (reader or
+ * writer, any uid) never locks the other out.  A reader that can neither open
+ * nor create it (a read-only table directory before any new writer has
+ * published) takes .write.lock shared instead, the older protocol: it then
+ * waits for a write in progress, but stays correct, as a writer publishes
+ * holding both.
+ *
+ * The eager loaders (splay_load_impl) take neither lock nor lease: they
+ * resolve .current, map the files and resolve again if one went missing.
+ * Unlinked files stay readable while open or mapped on POSIX.  On Windows an
+ * open file cannot be deleted, so GC leaves such a generation for the next
+ * publication (removal is best-effort). */
+static ray_err_t splay_lock_file(const char* root, const char* name, bool exclusive,
+                                 bool create, ray_fd_t* out) {
     char path[1100];
-    int n = snprintf(path, sizeof(path), "%s/.publish.lock", root);
+    int n = snprintf(path, sizeof(path), "%s/%s", root, name);
     if (n < 0 || (size_t)n >= sizeof(path)) return RAY_ERR_RANGE;
-    /* Created by whichever side comes first, so its absence is no window. */
-    ray_fd_t fd = ray_file_open(path, RAY_OPEN_READ | RAY_OPEN_WRITE | RAY_OPEN_CREATE);
-    if (fd == RAY_FD_INVALID && !exclusive) fd = ray_file_open(path, RAY_OPEN_READ);
-    if (fd == RAY_FD_INVALID) return RAY_ERR_IO;
+    ray_fd_t fd = ray_file_open(path, RAY_OPEN_READ | (create ? RAY_OPEN_CREATE : 0));
+    if (fd == RAY_FD_INVALID) return errno == ENOENT ? RAY_ERR_NYI : RAY_ERR_IO;
     ray_err_t err;
     do err = exclusive ? ray_file_lock_ex(fd) : ray_file_lock_sh(fd);
     while (err && errno == EINTR);
     if (err) { ray_file_close(fd); return err; }
     *out = fd;
     return RAY_OK;
+}
+
+static ray_err_t splay_publish_lock(const char* root, bool exclusive, ray_fd_t* out) {
+    return splay_lock_file(root, ".publish.lock", exclusive, true, out);
 }
 
 static void splay_publish_unlock(ray_fd_t fd) {
@@ -255,6 +270,8 @@ ray_err_t ray_splay_lease_acquire(const char* root, ray_splay_lease_t** out) {
     if (stat(path, &st) != 0) return errno == ENOENT ? RAY_ERR_NYI : RAY_ERR_IO;
     ray_fd_t publish = RAY_FD_INVALID;
     ray_err_t err = splay_publish_lock(root, false, &publish);
+    if (err == RAY_ERR_NYI || err == RAY_ERR_IO)
+        err = splay_lock_file(root, ".write.lock", false, false, &publish);
     if (err) return err;
     ray_splay_lease_t* lease = calloc(1, sizeof(*lease));
     if (!lease) err = RAY_ERR_OOM;
@@ -863,6 +880,9 @@ static void splay_remove_created(const ray_splay_write_t* write, bool unlink_loc
     if (!splay_root_is_bare(write)) return;
     if (unlink_lock) {
         char lock[1100];
+        /* The only place a lock file changes inode: allowed only here, with
+         * the root empty (no .current, nothing to protect) under the
+         * exclusive .write.lock. */
         int n = snprintf(lock, sizeof(lock), "%s/.publish.lock", write->root);
         if (n > 0 && (size_t)n < sizeof(lock)) (void)unlink(lock);
         n = snprintf(lock, sizeof(lock), "%s/.write.lock", write->root);

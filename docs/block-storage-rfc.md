@@ -102,7 +102,24 @@ Readers never touch `.write.lock`, so a scan waits for a publication, never
 for a long import or conversion into the same table. Under the shared
 `.publish.lock` nothing is published or removed, so the resolved generation
 exists when its lease is taken; GC never waits. Either side creates
-`.publish.lock` on first use; a table without `.write.lock` is legacy (`nyi`).
+`.publish.lock` on first use and both open it read-only, so its owner never
+locks out another user; a reader that cannot create it in a read-only
+directory takes `.write.lock` shared instead (correct, but it then waits for a
+write in progress). A table without `.write.lock` is legacy (`nyi`).
+
+Known properties:
+
+- A steady stream of readers, each holding `.publish.lock` shared briefly, can
+  delay a writer's exclusive acquisition, so publication under heavy select
+  load waits longer, and other writers queue behind `.write.lock`.
+- A flat (legacy) table being published for the first time can be read
+  without its schema: the reader finds no `.current` and reads the flat
+  directory while the writer retires its `.d`. The query fails and succeeds
+  when repeated.
+- The eager loaders (`.db.splayed.get`, `.db.parted.get`) take neither lock nor
+  lease: they resolve `.current`, map the files and resolve again if one
+  disappeared, which is safe on POSIX because unlinked files stay readable
+  while open or mapped.
 
 Windows (rename over open or mapped files, lock semantics) and NFS (`flock`
 is not reliable there) are untested and not claimed.
