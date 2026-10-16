@@ -18,8 +18,9 @@
 #include <string.h>
 
 #define BLOCK_SOURCE_BATCH_ROWS 4096u   /* aggregate chunk: bounds group-id workspace */
-/* Reads span several blocks so their whole blocks decode in parallel. */
-#define BLOCK_SOURCE_READ_ROWS 65536u
+/* Reads span many blocks so whole blocks decode in parallel and per-batch
+ * barriers stay rare: the scan sizes batches from the payload limit. */
+#define BLOCK_SOURCE_READ_ROWS RAY_BLOCK_SCAN_AUTO_ROWS
 #define BLOCK_SOURCE_PAYLOAD_BYTES (64u * 1024 * 1024)
 
 static bool dictionary(ray_t* d) {
