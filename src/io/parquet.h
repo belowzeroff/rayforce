@@ -54,5 +54,11 @@ ray_t* ray_parquet_metadata_fn(ray_t* path);
 ray_t* ray_parquet_splayed_fn(ray_t** args, int64_t n);
 ray_t* ray_parquet_parted_fn(ray_t** args, int64_t n);
 ray_t* ray_parquet_each_fn(ray_t** args, int64_t n);
+/* (.parquet.block [read-options] path root block-options): stream batches into
+ * a compressed block generation of root; returns the row count. read-options
+ * are those of .parquet.read (a column vector or {columns types range strict});
+ * block-options those of .db.block.set. Memory is one batch plus one block per
+ * column. Types without a block encoding fail with nothing published. */
+ray_t* ray_parquet_block_fn(ray_t** args, int64_t n);
 
 #endif
