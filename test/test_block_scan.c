@@ -15,6 +15,10 @@
 #include "table/domain.h"
 #include <stdlib.h>
 #include <unistd.h>
+#include <dirent.h>
+#include <signal.h>
+#include <sys/wait.h>
+#include <time.h>
 
 static char root[64];
 static bool seeded;
@@ -237,6 +241,151 @@ static test_result_t auto_batch_rows(void) {
     options.batch_rows = 7;      /* explicit sizes are kept */
     TEST_ASSERT_EQ_I(ray_block_scan_open(root, names, 2, &options, &scan), RAY_OK);
     TEST_ASSERT_EQ_I(ray_block_scan_batch_rows(scan), 7);
+    PASS();
+}
+
+static void sleep_us(long us) {
+    struct timespec ts = {us / 1000000, (us % 1000000) * 1000};
+    nanosleep(&ts, NULL);
+}
+
+/* Generation e of a crash/concurrency table: x = y = e * 1000000 + row. */
+static ray_t* epoch_table(int64_t epoch, int64_t rows) {
+    ray_t* x = ray_vec_new(RAY_I64, rows);
+    ray_t* y = ray_vec_new(RAY_I64, rows);
+    for (int64_t i = 0; i < rows; i++)
+        ((int64_t*)ray_data(x))[i] = ((int64_t*)ray_data(y))[i] = epoch * 1000000 + i;
+    x->len = y->len = rows;
+    ray_t* t = ray_table_new(2);
+    t = ray_table_add_col(t, ray_sym_intern("x", 1), x);
+    t = ray_table_add_col(t, ray_sym_intern("y", 1), y);
+    ray_release(x); ray_release(y);
+    return t;
+}
+
+/* Read the whole table: 0 and *epoch when every row belongs to one complete
+ * generation, else -1. */
+static int epoch_read(int64_t rows, int64_t* epoch) {
+    ray_block_scan_t* sc = NULL;
+    ray_block_scan_options_t read = {0, UINT64_MAX, 1000, 1u << 20, 1u << 20, 0};
+    if (ray_block_scan_open(root, names, 2, &read, &sc)) return -1;
+    int64_t seen = 0, e = -1;
+    int bad = 0;
+    for (ray_t* b; !bad && (b = ray_block_scan_next(sc)); ray_release(b)) {
+        if (RAY_IS_ERR(b)) { bad = 1; break; }
+        const int64_t* x = ray_data(ray_table_get_col_idx(b, 0));
+        const int64_t* y = ray_data(ray_table_get_col_idx(b, 1));
+        for (int64_t i = 0; i < ray_table_nrows(b); i++, seen++) {
+            if (e < 0) e = x[i] / 1000000;
+            if (x[i] != y[i] || x[i] != e * 1000000 + seen) { bad = 1; break; }
+        }
+    }
+    ray_block_scan_close(&sc);
+    if (bad || seen != rows) return -1;
+    *epoch = e;
+    return 0;
+}
+
+/* A writer killed at any point publishes all of a generation or none of it. */
+static test_result_t crash_publication(void) {
+    const int64_t rows = 60000;
+    ray_block_store_options_t store = {4096, 1, true};
+    ray_t* t = epoch_table(1, rows);
+    long save_us = 0;
+    for (int i = 0; i < 3; i++) {
+        struct timespec t0, t1;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        TEST_ASSERT_EQ_I(ray_block_store_save(t, root, &store), RAY_OK);
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        long us = (long)((t1.tv_sec - t0.tv_sec) * 1000000 + (t1.tv_nsec - t0.tv_nsec) / 1000);
+        if (us > save_us) save_us = us;
+    }
+    ray_release(t);
+    /* Kill points sweep 0..150% of the slowest save: staging, sync,
+     * publication and after it. */
+    long window = save_us + save_us / 2 + 1;
+    int64_t current = 1;
+    int published = 0, kept = 0;
+    for (int64_t attempt = 2; attempt < 42; attempt++) {
+        t = epoch_table(attempt, rows);
+        fflush(stdout); fflush(stderr);
+        pid_t pid = fork();
+        TEST_ASSERT_TRUE(pid >= 0);
+        if (!pid) _exit(ray_block_store_save(t, root, &store) ? 1 : 0);
+        sleep_us(window * (attempt - 2) / 40);
+        kill(pid, SIGKILL);
+        int status = 0;
+        TEST_ASSERT_EQ_I(waitpid(pid, &status, 0), pid);
+        ray_release(t);
+        int64_t epoch = 0;
+        TEST_ASSERT_EQ_I(epoch_read(rows, &epoch), 0);
+        TEST_ASSERT_TRUE(epoch == current || epoch == attempt);
+        if (epoch == attempt) published++; else kept++;
+        current = epoch;
+    }
+    /* Both outcomes occurred, so kills landed on both sides of publication. */
+    TEST_ASSERT_TRUE(published > 0 && kept > 0);
+    /* A later writer succeeds over whatever the killed ones left. */
+    t = epoch_table(99, rows);
+    TEST_ASSERT_EQ_I(ray_block_store_save(t, root, &store), RAY_OK);
+    ray_release(t);
+    int64_t epoch = 0;
+    TEST_ASSERT_EQ_I(epoch_read(rows, &epoch), 0);
+    TEST_ASSERT_EQ_I(epoch, 99);
+    PASS();
+}
+
+/* Readers in other processes see one whole generation per scan while a
+ * writer publishes and collects old ones; collection keeps up. */
+static test_result_t concurrent_readers(void) {
+    const int64_t rows = 30000;
+    ray_block_store_options_t store = {4096, 1, false};
+    ray_t* t = epoch_table(1, rows);
+    TEST_ASSERT_EQ_I(ray_block_store_save(t, root, &store), RAY_OK);
+    ray_release(t);
+    pid_t readers[3];
+    fflush(stdout); fflush(stderr);
+    for (int r = 0; r < 3; r++) {
+        readers[r] = fork();
+        TEST_ASSERT_TRUE(readers[r] >= 0);
+        if (!readers[r]) {
+            int scans = 0;
+            for (int i = 0; i < 400; i++) {
+                int64_t epoch;
+                if (epoch_read(rows, &epoch)) _exit(1);
+                scans++;
+                sleep_us(500);
+            }
+            _exit(scans ? 0 : 2);
+        }
+    }
+    for (int64_t epoch = 2; epoch <= 31; epoch++) {
+        t = epoch_table(epoch, rows);
+        TEST_ASSERT_EQ_I(ray_block_store_save(t, root, &store), RAY_OK);
+        ray_release(t);
+        sleep_us(5000);
+    }
+    for (int r = 0; r < 3; r++) {
+        int status = 0;
+        TEST_ASSERT_EQ_I(waitpid(readers[r], &status, 0), readers[r]);
+        TEST_ASSERT_TRUE(WIFEXITED(status));
+        TEST_ASSERT_EQ_I(WEXITSTATUS(status), 0);
+    }
+    /* With readers gone, one more publication prunes to current + previous. */
+    t = epoch_table(32, rows);
+    TEST_ASSERT_EQ_I(ray_block_store_save(t, root, &store), RAY_OK);
+    ray_release(t);
+    char gens[128];
+    snprintf(gens, sizeof(gens), "%s/.generations", root);
+    DIR* d = opendir(gens);
+    TEST_ASSERT_NOT_NULL(d);
+    int count = 0;
+    for (struct dirent* e; (e = readdir(d));) if (e->d_name[0] != '.') count++;
+    closedir(d);
+    TEST_ASSERT_TRUE(count <= 2);
+    int64_t epoch = 0;
+    TEST_ASSERT_EQ_I(epoch_read(rows, &epoch), 0);
+    TEST_ASSERT_EQ_I(epoch, 32);
     PASS();
 }
 
@@ -1556,6 +1705,8 @@ static test_result_t query_budgets_and_errors(void) {
 const test_entry_t block_scan_entries[] = {
     {"block_scan/mixed_raw_scan", mixed_raw_scan, setup, teardown},
     {"block_scan/shared_work_limit", shared_work_limit, setup, teardown},
+    {"block_scan/crash_publication", crash_publication, setup, teardown},
+    {"block_scan/concurrent_readers", concurrent_readers, setup, teardown},
     {"block_scan/auto_batch_rows", auto_batch_rows, setup, teardown},
     {"block_scan/flat_immutable", flat_immutable, setup, teardown},
     {"block_scan/query_budgets_and_errors", query_budgets_and_errors, setup, teardown},
