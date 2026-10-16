@@ -2,6 +2,7 @@
 #ifndef RAY_BLOCK_STORE_H
 #define RAY_BLOCK_STORE_H
 #include <rayforce.h>
+#include "block_scan.h"
 
 typedef struct ray_block_store_options_s {
     uint32_t block_bytes;
@@ -46,4 +47,16 @@ ray_err_t ray_block_table_append(ray_block_table_writer_t* writer, ray_t* chunk)
 /* Always releases the writer and clears *writer. */
 ray_err_t ray_block_table_finish(ray_block_table_writer_t** writer);
 void ray_block_table_abort(ray_block_table_writer_t** writer);
+
+/* Rewrite the table at src, raw or compressed (as block scan reads it, so a
+ * flat root needs source->immutable), as a new block generation of dest.
+ * Streams batches of RAY_BLOCK_CONVERT_BATCH_ROWS rows; a batch whose payload
+ * or scratch exceeds RAY_BLOCK_CONVERT_BATCH_BYTES fails with limit. dest may
+ * not equal, contain or lie inside src: the source is never modified. On
+ * failure nothing is published. *rows (optional) receives the row count. */
+#define RAY_BLOCK_CONVERT_BATCH_ROWS 65536u
+#define RAY_BLOCK_CONVERT_BATCH_BYTES ((size_t)1 << 30)
+ray_err_t ray_block_store_convert(const char* src, const ray_block_scan_source_t* source,
+                                  const char* dest, const ray_block_store_options_t* options,
+                                  uint64_t* rows);
 #endif

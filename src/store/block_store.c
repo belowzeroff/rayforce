@@ -1,4 +1,7 @@
 /* Copyright (c) 2026 Anton Kundenko. MIT license; see LICENSE. */
+#if !defined(_WIN32) && !defined(__APPLE__)
+#define _DEFAULT_SOURCE /* realpath */
+#endif
 #include "block_store.h"
 #include "block_scan.h"
 #include "block_sym.h"
@@ -13,6 +16,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <limits.h>
 
 static ray_err_t sync_file(const char* path) {
     ray_fd_t fd = ray_file_open(path, RAY_OPEN_READ | RAY_OPEN_WRITE);
@@ -64,6 +68,12 @@ struct ray_block_table_writer_s {
     uint64_t rows;
     bool staged, failed;
 };
+
+static ray_err_t store_schema_options(const ray_block_store_options_t* o) {
+    if (!o || o->codec > 1) return RAY_ERR_DOMAIN;
+    if (!o->block_bytes || o->block_bytes > RAY_COL_BLOCK_MAX) return RAY_ERR_RANGE;
+    return RAY_OK;
+}
 
 /* Names, types, attrs and options: everything a schema can be judged on. */
 static ray_err_t store_schema(ray_t* table, const ray_block_store_options_t* o,
@@ -377,5 +387,86 @@ ray_err_t ray_block_store_save(ray_t* table, const char* root,
     if (!err) err = ray_block_table_append(w, table);
     if (!err) return ray_block_table_finish(&w);
     ray_block_table_abort(&w);
+    return err;
+}
+
+/* Canonical form of a path that may not exist yet: the resolved path of its
+ * deepest existing ancestor plus the remaining components. */
+static bool convert_resolve(const char* path, char* out, size_t size) {
+#ifdef _WIN32
+    return _fullpath(out, path, size) != NULL;
+#else
+    return size >= PATH_MAX && realpath(path, out) != NULL;
+#endif
+}
+
+static bool convert_canonical(const char* path, char* out, size_t size) {
+    char buf[PATH_MAX], tail[PATH_MAX] = "", resolved[PATH_MAX];
+    size_t len = strlen(path);
+    if (!len || len >= sizeof(buf)) return false;
+    memcpy(buf, path, len + 1);
+    while (len > 1 && buf[len - 1] == '/') buf[--len] = '\0';
+    while (!convert_resolve(buf, resolved, sizeof(resolved))) {
+        char* slash = strrchr(buf, '/');
+        char next[PATH_MAX];
+        int n = snprintf(next, sizeof(next), "/%s%s", slash ? slash + 1 : buf, tail);
+        if (n < 0 || (size_t)n >= sizeof(next)) return false;
+        memcpy(tail, next, (size_t)n + 1);
+        if (!slash) strcpy(buf, ".");
+        else if (slash == buf) strcpy(buf, "/");
+        else *slash = '\0';
+    }
+    int n = snprintf(out, size, "%s%s", strcmp(resolved, "/") ? resolved : "", tail);
+    return n > 0 && (size_t)n < size;
+}
+
+static bool convert_nested(const char* a, const char* b) {
+    size_t n = strlen(a);
+    return !n || (!strncmp(a, b, n) && (b[n] == '\0' || b[n] == '/'));
+}
+
+ray_err_t ray_block_store_convert(const char* src, const ray_block_scan_source_t* source,
+                                  const char* dest, const ray_block_store_options_t* options,
+                                  uint64_t* rows_out) {
+    if (!src || !*src || !dest || !*dest || !options) return RAY_ERR_DOMAIN;
+    char a[PATH_MAX + 256], b[PATH_MAX + 256];
+    if (!convert_canonical(src, a, sizeof(a)) || !convert_canonical(dest, b, sizeof(b)))
+        return RAY_ERR_RANGE;
+    /* Publishing over a flat table retires its schema: never write into,
+     * above or below the source. */
+    if (convert_nested(a, b) || convert_nested(b, a)) return RAY_ERR_DOMAIN;
+    ray_err_t err = store_schema_options(options);
+    if (err) return err;
+    ray_block_scan_options_t read = {0, UINT64_MAX, RAY_BLOCK_CONVERT_BATCH_ROWS,
+                                     RAY_BLOCK_CONVERT_BATCH_BYTES, RAY_BLOCK_CONVERT_BATCH_BYTES, 0};
+    ray_block_scan_t* scan = NULL;
+    err = ray_block_scan_open_source(src, source, NULL, 0, &read, &scan);
+    if (err) return err;
+    ray_block_table_writer_t* w = NULL;
+    uint64_t rows = 0;
+    for (;;) {
+        ray_t* batch = ray_block_scan_next(scan);
+        if (!batch) break;
+        if (RAY_IS_ERR(batch)) { err = ray_err_from_obj(batch); ray_error_free(batch); break; }
+        err = w ? RAY_OK : ray_block_table_begin(dest, batch, options, &w);
+        if (!err) err = ray_block_table_append(w, batch);
+        rows += (uint64_t)ray_table_nrows(batch);
+        ray_release(batch);
+        if (err) break;
+    }
+    if (!err && !w) {
+        ray_t* schema = ray_block_scan_schema(scan);
+        if (!schema || RAY_IS_ERR(schema)) {
+            err = schema ? ray_err_from_obj(schema) : RAY_ERR_OOM;
+            if (schema) ray_error_free(schema);
+        } else {
+            err = ray_block_table_begin(dest, schema, options, &w);
+            ray_release(schema);
+        }
+    }
+    ray_block_scan_close(&scan);
+    if (err) { ray_block_table_abort(&w); return err; }
+    err = ray_block_table_finish(&w);
+    if (!err && rows_out) *rows_out = rows;
     return err;
 }

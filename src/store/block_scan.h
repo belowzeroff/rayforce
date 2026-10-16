@@ -58,7 +58,9 @@ typedef enum {
 ray_err_t ray_block_scan_open(const char* root, const char* const* columns,
                               size_t count, const ray_block_scan_options_t* options,
                               ray_block_scan_t** out);
-/* As open, with an optional source description (NULL: generation-local). */
+/* As open, with an optional source description (NULL: generation-local).
+ * columns NULL with count 0 selects every column of the schema pinned by this
+ * open, in schema order; ray_block_scan_schema then names them. */
 ray_err_t ray_block_scan_open_source(const char* root, const ray_block_scan_source_t* source,
                                      const char* const* columns, size_t count,
                                      const ray_block_scan_options_t* options,

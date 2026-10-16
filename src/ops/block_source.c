@@ -8,6 +8,9 @@
 #include "lang/internal.h"
 #include "table/sym.h"
 #include "vec/vec.h"
+#include "store/block_store.h"
+#include <stdio.h>
+#include <sys/stat.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -132,6 +135,56 @@ ray_t* ray_block_parted_fn(ray_t** args, int64_t n) {
     static const char* const keys[] = {".hdb.block.parted", ".hdb.block.table", ".hdb.block.limit",
                                        ".hdb.block.options"};
     return descriptor(keys, args, n);
+}
+
+/* A partition table <root>/<digits and dots>/<table> shares <root>/.sym. */
+static const char* convert_default_sym(const char* src, char* buf, size_t size) {
+    size_t len = strlen(src);
+    while (len > 1 && src[len - 1] == '/') len--;
+    size_t table = len;
+    while (table > 0 && src[table - 1] != '/') table--;
+    if (table < 2) return NULL;
+    size_t part_end = table - 1, part = part_end;
+    while (part > 0 && src[part - 1] != '/') part--;
+    if (part == part_end || part < 1) return NULL;
+    for (size_t i = part; i < part_end; i++)
+        if (src[i] != '.' && (src[i] < '0' || src[i] > '9')) return NULL;
+    int n = snprintf(buf, size, "%.*s/.sym", (int)(part - 1), src);
+    struct stat st;
+    return n > 0 && (size_t)n < size && stat(buf, &st) == 0 ? buf : NULL;
+}
+
+/* (.db.block.convert src dest block-options [{immutable: BOOL sym: STR}]) */
+ray_t* ray_block_convert_fn(ray_t** args, int64_t n) {
+    if (ray_eval_get_restricted()) return ray_error("access", "restricted");
+    if (n != 3 && n != 4) return ray_error("arity", ".db.block.convert: src dest block-options [read-options]");
+    const char* src = string(args[0]);
+    const char* dest = string(args[1]);
+    if (!src || !dest) return ray_error("domain", ".db.block.convert: nonempty source and destination paths required");
+    ray_block_store_options_t options;
+    ray_err_t err = ray_block_store_parse_options(args[2], &options);
+    if (err) return ray_error(ray_err_code_str(err), ".db.block.convert: invalid block options");
+    ray_block_scan_source_t source = {NULL, false};
+    if (n == 4) {
+        ray_t* opts = args[3];
+        ray_t* keys = ray_dict_keys(opts); ray_t* vals = ray_dict_vals(opts);
+        bool empty = keys && vals && keys->type == RAY_LIST && vals->type == RAY_LIST && !keys->len;
+        if (!empty && !dictionary(opts)) return ray_error("type", ".db.block.convert: read options must be a dictionary");
+        for (int64_t i = 0; !empty && i < keys->len; i++) {
+            const char* key = string(ray_sym_vec_cell(keys, i));
+            ray_t* value = ray_list_get(vals, i);
+            if (key && !strcmp(key, "immutable") && value && value->type == -RAY_BOOL)
+                source.immutable = value->b8;
+            else if (key && !strcmp(key, "sym") && string(value)) source.sym_path = string(value);
+            else return ray_error("domain", ".db.block.convert: read options are immutable: BOOL and sym: STR");
+        }
+    }
+    char sym[1100];
+    if (!source.sym_path) source.sym_path = convert_default_sym(src, sym, sizeof(sym));
+    uint64_t rows = 0;
+    err = ray_block_store_convert(src, &source, dest, &options, &rows);
+    if (err) return ray_error(ray_err_code_str(err), ".db.block.convert: %s -> %s failed", src, dest);
+    return ray_i64((int64_t)rows);
 }
 
 typedef struct {
