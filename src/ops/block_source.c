@@ -10,6 +10,7 @@
 #include "table/sym.h"
 #include "vec/vec.h"
 #include "store/block_store.h"
+#include "core/pool.h"
 #include <stdio.h>
 #include <sys/stat.h>
 #include <stdlib.h>
@@ -473,12 +474,45 @@ typedef struct {
     void* state;
 } aggregate_state_t;
 
+/* One batch's aggregate inputs, updated chunk by chunk on the native pool:
+ * worker w accumulates into its own state copy (slot 0 is the result). */
+typedef struct {
+    const aggregate_state_t* states;
+    void** slots;           /* [workers * count], slot 0 unused */
+    size_t count;
+    ray_t* const* cols;
+    const uint32_t* gids;
+    uint64_t rows;
+    uint32_t chunk_rows;
+} aggregate_batch_t;
+
+static void aggregate_chunk(const aggregate_batch_t* b, uint32_t worker, uint64_t chunk) {
+    uint64_t offset = chunk * b->chunk_rows, n = b->rows - offset;
+    if (n > b->chunk_rows) n = b->chunk_rows;
+    for (size_t a = 0; a < b->count; a++) {
+        ray_t* col = b->cols[a];
+        const agg_vtable_t* k = b->states[a].kernel;
+        void* state = worker ? b->slots[worker * b->count + a] : b->states[a].state;
+        size_t width = ray_sym_elem_size(col->type, col->attrs);
+        /* Validity must use the same offset as vals. */
+        const uint8_t* data = (const uint8_t*)ray_data(col) + (size_t)offset * width;
+        ray_valid_t valid = {data, col->type, ray_vec_may_have_nulls(col)};
+        k->update_batch(state, k->state_size, b->gids, data, &valid, (int64_t)n, NULL);
+    }
+}
+
+static void aggregate_task(void* ctx, uint32_t worker, int64_t start, int64_t end) {
+    for (int64_t i = start; i < end; i++) aggregate_chunk(ctx, worker, (uint64_t)i);
+}
+
 static ray_t* aggregate_result(ray_block_query_t* cursor, const aggregate_t* const* kinds,
                                const size_t* positions, const int64_t* aliases,
                                size_t count, size_t remaining, uint32_t batch_rows) {
     aggregate_state_t* states = calloc(count, sizeof(*states));
     uint32_t chunk_rows = batch_rows < BLOCK_SOURCE_BATCH_ROWS ? batch_rows : BLOCK_SOURCE_BATCH_ROWS;
     uint32_t* gids = NULL;
+    void** slots = NULL;
+    uint32_t workers = 1;
     ray_t* schema = NULL;
     ray_t* result = NULL;
     if (!states) goto done;
@@ -535,6 +569,30 @@ static ray_t* aggregate_result(ray_block_query_t* cursor, const aggregate_t* con
         if (!states[a].state) goto done;
         states[a].kernel->init(states[a].state);
     }
+    /* Mergeable kernels also accumulate per pool worker; merged at EOF. */
+    ray_pool_t* pool = ray_pool_get();
+    workers = pool ? ray_pool_total_workers(pool) : 1;
+    for (size_t a = 0; a < count && workers > 1; a++)
+        if (!states[a].kernel->merge) workers = 1;
+    if (workers > 1) {
+        size_t extra = 0;
+        for (size_t a = 0; a < count; a++) extra += states[a].kernel->state_size;
+        if (extra > (SIZE_MAX - workspace) / (workers - 1)) workers = 1;
+        else if (ray_block_query_reserve(cursor, workspace + extra * (workers - 1))) workers = 1;
+        else workspace += extra * (workers - 1);
+    }
+    if (workers > 1) {
+        slots = calloc((size_t)workers * count, sizeof(*slots));
+        if (!slots) goto done;
+        for (uint32_t w = 1; w < workers; w++)
+            for (size_t a = 0; a < count; a++) {
+                void* state = malloc(states[a].kernel->state_size);
+                if (!state) goto done;
+                states[a].kernel->init(state);
+                slots[w * count + a] = state;
+            }
+    }
+    ray_t* cols[RAY_BLOCK_SCAN_MAX_COLUMNS];
     uint64_t total = 0;
     for (;;) {
         ray_t* batch = ray_block_query_next(cursor);
@@ -549,24 +607,22 @@ static ray_t* aggregate_result(ray_block_query_t* cursor, const aggregate_t* con
             ray_release(batch); result = ray_error("limit", "block select: aggregate row limit exceeded"); goto done;
         }
         total += rows;
-        for (size_t a = 0; a < count && !result; a++) {
-            ray_t* col = ray_table_get_col_idx(batch, (int64_t)positions[a]);
-            const agg_vtable_t* k = states[a].kernel;
-            size_t width = ray_sym_elem_size(col->type, col->attrs);
-            /* Keep the group-id workspace fixed even when the caller selects
-             * a larger input batch. Validity must use the same offset as vals. */
-            for (uint64_t offset = 0; offset < rows; offset += chunk_rows) {
-                if (ray_eval_is_interrupted()) { result = ray_error("cancel", "block aggregate interrupted"); break; }
-                uint64_t n = rows - offset;
-                if (n > chunk_rows) n = chunk_rows;
-                const uint8_t* data = (const uint8_t*)ray_data(col) + (size_t)offset * width;
-                ray_valid_t valid = {data, col->type, ray_vec_may_have_nulls(col)};
-                k->update_batch(states[a].state, k->state_size, gids, data, &valid, (int64_t)n, NULL);
-            }
+        if (ray_eval_is_interrupted()) {
+            ray_release(batch); result = ray_error("cancel", "block aggregate interrupted"); goto done;
         }
+        for (size_t a = 0; a < count; a++) cols[a] = ray_table_get_col_idx(batch, (int64_t)positions[a]);
+        /* The group-id workspace stays one chunk, whatever the input batch. */
+        aggregate_batch_t work = {states, slots, count, cols, gids, rows, chunk_rows};
+        uint64_t chunks = (rows + chunk_rows - 1) / chunk_rows;
+        if (slots && chunks >= 2 && ray_pool_par_dispatch_ok(pool, (int64_t)chunks, 2))
+            ray_pool_dispatch_n(pool, aggregate_task, &work, (uint32_t)chunks);
+        else
+            for (uint64_t c = 0; c < chunks; c++) aggregate_chunk(&work, 0, c);
         ray_release(batch);
-        if (result) goto done;
     }
+    for (uint32_t w = 1; slots && w < workers; w++)
+        for (size_t a = 0; a < count; a++)
+            states[a].kernel->merge(states[a].state, slots[w * count + a], NULL);
     if (output_bytes > SIZE_MAX - workspace) {
         result = ray_error("limit", "block select: aggregate working set exceeds size limit"); goto done;
     }
@@ -595,7 +651,8 @@ static ray_t* aggregate_result(ray_block_query_t* cursor, const aggregate_t* con
 done:
     ray_release(schema);
     if (states) for (size_t a = 0; a < count; a++) free(states[a].state);
-    free(states); free(gids);
+    for (size_t i = 0; slots && i < (size_t)workers * count; i++) free(slots[i]);
+    free(slots); free(states); free(gids);
     return result ? result : ray_error("oom", NULL);
 }
 
