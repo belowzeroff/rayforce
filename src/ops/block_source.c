@@ -10,6 +10,7 @@
 #include "table/sym.h"
 #include "vec/vec.h"
 #include "store/block_store.h"
+#include "store/part.h"
 #include "core/pool.h"
 #include <stdio.h>
 #include <sys/stat.h>
@@ -181,109 +182,201 @@ static ray_t* read_source(const char* who, const char* path, ray_t* opts,
     return NULL;
 }
 
-/* Every column of a stored table, pinned for metadata and verification. */
-static ray_t* storage_open(const char* who, ray_t** args, int64_t n, ray_block_scan_t** scan) {
-    if (ray_eval_get_restricted()) return ray_error("access", "restricted");
-    if (n != 1 && n != 2) return ray_error("arity", "%s: path [read-options]", who);
-    const char* path = string(args[0]);
-    if (!path) return ray_error("domain", "%s: nonempty path required", who);
+/* Storage reports over one table, or every partition <root>/<p>/<table>:
+ * (fn path [read-options]) or (fn root 'table [read-options]). */
+typedef struct {
+    const char* who;
+    const char* path;   /* table, or parted root */
+    const char* table;  /* NULL for a single table */
     ray_block_scan_source_t source;
     char sym[1100];
-    ray_t* bad = read_source(who, path, n == 2 ? args[1] : NULL, &source, sym, sizeof(sym));
+    char** dirs;
+    int64_t n_dirs;
+} storage_target_t;
+
+static ray_t* storage_target(const char* who, ray_t** args, int64_t n, storage_target_t* t) {
+    memset(t, 0, sizeof(*t));
+    t->who = who;
+    if (ray_eval_get_restricted()) return ray_error("access", "restricted");
+    if (n < 1 || n > 3) return ray_error("arity", "%s: path [read-options] or root 'table [read-options]", who);
+    t->path = string(args[0]);
+    if (!t->path) return ray_error("domain", "%s: nonempty path required", who);
+    int64_t next = 1;
+    if (n > 1 && args[1]->type == -RAY_SYM) {
+        t->table = table_name(args[1]);
+        if (!t->table) return ray_error("domain", "%s: invalid table name", who);
+        next = 2;
+    }
+    if (n > next + 1) return ray_error("arity", "%s: path [read-options] or root 'table [read-options]", who);
+    ray_t* opts = n > next ? args[next] : NULL;
+    if (!t->table) return read_source(who, t->path, opts, &t->source, t->sym, sizeof(t->sym));
+    /* Partitions share the root's symbol file unless options name another. */
+    ray_t* bad = read_source(who, t->path, opts, &t->source, t->sym, sizeof(t->sym));
     if (bad) return bad;
-    ray_block_scan_options_t read = {0, UINT64_MAX, 1, 0, 0, 0};
-    ray_err_t err = ray_block_scan_open_source(path, &source, NULL, 0, &read, scan);
-    return err ? ray_error(ray_err_code_str(err), "%s: cannot open %s", who, path) : NULL;
+    if (!t->source.sym_path) {
+        struct stat st;
+        int len = snprintf(t->sym, sizeof(t->sym), "%s/.sym", t->path);
+        if (len > 0 && (size_t)len < sizeof(t->sym) && stat(t->sym, &st) == 0) t->source.sym_path = t->sym;
+    }
+    ray_t* listed = ray_parted_dirs(t->path, &t->dirs, &t->n_dirs, &(uint8_t){0});
+    if (listed) return listed;
+    if (!t->n_dirs) return ray_error("io", "%s: %s has no partition directories", who, t->path);
+    return NULL;
 }
 
-static ray_t* storage_table(const char* const* names, ray_t** cols, size_t count) {
-    ray_t* t = ray_table_new((int64_t)count);
-    for (size_t i = 0; t && !RAY_IS_ERR(t) && i < count; i++)
-        t = ray_table_add_col(t, ray_sym_intern(names[i], strlen(names[i])), cols[i]);
-    for (size_t i = 0; i < count; i++) ray_release(cols[i]);
+static void storage_target_free(storage_target_t* t) {
+    ray_parted_dirs_free(t->dirs, t->n_dirs);
+    t->dirs = NULL; t->n_dirs = 0;
+}
+
+static int64_t storage_count(const storage_target_t* t) { return t->table ? t->n_dirs : 1; }
+
+/* Open target i: the table itself or one partition's table. */
+static ray_t* storage_open(storage_target_t* t, int64_t i, ray_block_scan_t** scan) {
+    char path[1300];
+    const char* where = t->path;
+    if (t->table) {
+        int len = snprintf(path, sizeof(path), "%s/%s/%s", t->path, t->dirs[i], t->table);
+        if (len < 0 || (size_t)len >= sizeof(path)) return ray_error("range", "%s: path too long", t->who);
+        where = path;
+    }
+    ray_block_scan_options_t read = {0, UINT64_MAX, 1, 0, 0, 0};
+    ray_err_t err = ray_block_scan_open_source(where, &t->source, NULL, 0, &read, scan);
+    return err ? ray_error(ray_err_code_str(err), "%s: cannot open %s", t->who, where) : NULL;
+}
+
+/* Result columns grow one row at a time: [partition] then the report's own. */
+typedef struct {
+    ray_t* cols[11];
+    int8_t types[11];
+    const char* names[11];
+    size_t count;
+} storage_rows_t;
+
+static ray_err_t storage_rows_init(storage_rows_t* r, const storage_target_t* t,
+                                   const char* const* names, const int8_t* types, size_t count) {
+    memset(r, 0, sizeof(*r));
+    if (t->table) { r->names[0] = "partition"; r->types[0] = RAY_SYM; r->count = 1; }
+    for (size_t i = 0; i < count; i++) {
+        r->names[r->count] = names[i];
+        r->types[r->count++] = types[i];
+    }
+    for (size_t i = 0; i < r->count; i++) {
+        r->cols[i] = r->types[i] == RAY_SYM ? ray_sym_vec_new(RAY_SYM_W64, 0) : ray_vec_new(r->types[i], 0);
+        if (!r->cols[i] || RAY_IS_ERR(r->cols[i])) { r->cols[i] = NULL; return RAY_ERR_OOM; }
+    }
+    return RAY_OK;
+}
+
+static ray_err_t storage_rows_push(storage_rows_t* r, size_t i, const void* value) {
+    ray_t* v = ray_vec_append_raw(r->cols[i], value, 1);
+    if (!v || RAY_IS_ERR(v)) return RAY_ERR_OOM;
+    r->cols[i] = v;
+    return RAY_OK;
+}
+
+static void storage_rows_free(storage_rows_t* r) {
+    for (size_t i = 0; i < r->count; i++) ray_release(r->cols[i]);
+}
+
+static ray_t* storage_rows_table(storage_rows_t* r) {
+    ray_t* t = ray_table_new((int64_t)r->count);
+    for (size_t i = 0; t && !RAY_IS_ERR(t) && i < r->count; i++)
+        t = ray_table_add_col(t, ray_sym_intern(r->names[i], strlen(r->names[i])), r->cols[i]);
+    storage_rows_free(r);
     return t ? t : ray_error("oom", NULL);
 }
 
 static int64_t storage_symbol(const char* s) { return ray_sym_intern(s, strlen(s)); }
 
-/* (.db.storage.info path [read-options]): one row per column, metadata only. */
+/* (.db.storage.info path|root 'table [read-options]): metadata only. */
 ray_t* ray_storage_info_fn(ray_t** args, int64_t n) {
-    ray_block_scan_t* scan = NULL;
-    ray_t* bad = storage_open(".db.storage.info", args, n, &scan);
-    if (bad) return bad;
-    ray_t* names = ray_block_scan_names(scan);
-    int64_t count = names->len;
+    storage_target_t t;
+    ray_t* result = storage_target(".db.storage.info", args, n, &t);
+    if (result) { storage_target_free(&t); return result; }
     static const char* const fields[] = {"column", "type", "format", "codec", "rows", "blocks",
                                          "block_bytes", "stored", "logical", "ratio"};
-    ray_t* cols[10];
-    for (int i = 0; i < 10; i++)
-        cols[i] = i < 4 ? ray_sym_vec_new(RAY_SYM_W64, count) : ray_vec_new(i == 9 ? RAY_F64 : RAY_I64, count);
-    ray_err_t err = RAY_OK;
-    for (int i = 0; i < 10; i++) if (!cols[i] || RAY_IS_ERR(cols[i])) err = RAY_ERR_OOM;
-    for (int64_t c = 0; !err && c < count; c++) {
-        ray_block_scan_column_info_t info;
-        err = ray_block_scan_column_info(scan, (size_t)c, &info);
-        if (err) break;
-        size_t len;
-        const char* name = ray_str_vec_get(names, c, &len);
-        uint64_t logical = info.compressed ? info.blocks.decoded_bytes : info.file_bytes;
-        const char* codec = !info.compressed || !info.blocks.snappy_blocks ? "none" :
-            info.blocks.snappy_blocks == info.blocks.blocks ? "snappy" : "mixed";
-        int64_t syms[] = {ray_sym_intern(name, len), storage_symbol(ray_type_name(info.type)),
-                          storage_symbol(info.compressed ? "block" : "raw"), storage_symbol(codec)};
-        for (int i = 0; i < 4; i++) ((int64_t*)ray_data(cols[i]))[c] = syms[i];
-        int64_t nums[] = {(int64_t)info.rows, (int64_t)info.blocks.blocks, info.block_bytes,
-                          (int64_t)info.file_bytes, (int64_t)logical};
-        for (int i = 0; i < 5; i++) ((int64_t*)ray_data(cols[4 + i]))[c] = nums[i];
-        ((double*)ray_data(cols[9]))[c] = info.file_bytes ? (double)logical / (double)info.file_bytes : 0.0;
+    static const int8_t types[] = {RAY_SYM, RAY_SYM, RAY_SYM, RAY_SYM, RAY_I64, RAY_I64,
+                                   RAY_I64, RAY_I64, RAY_I64, RAY_F64};
+    storage_rows_t rows;
+    ray_err_t err = storage_rows_init(&rows, &t, fields, types, 10);
+    size_t base = t.table ? 1 : 0;
+    for (int64_t p = 0; !err && !result && p < storage_count(&t); p++) {
+        ray_block_scan_t* scan = NULL;
+        result = storage_open(&t, p, &scan);
+        if (result) break;
+        ray_t* names = ray_block_scan_names(scan);
+        int64_t partition = t.table ? storage_symbol(t.dirs[p]) : 0;
+        for (int64_t c = 0; !err && c < names->len; c++) {
+            ray_block_scan_column_info_t info;
+            err = ray_block_scan_column_info(scan, (size_t)c, &info);
+            if (err) break;
+            size_t len;
+            const char* name = ray_str_vec_get(names, c, &len);
+            uint64_t logical = info.compressed ? info.blocks.decoded_bytes : info.file_bytes;
+            const char* codec = !info.compressed || !info.blocks.snappy_blocks ? "none" :
+                info.blocks.snappy_blocks == info.blocks.blocks ? "snappy" : "mixed";
+            int64_t values[] = {ray_sym_intern(name, len), storage_symbol(ray_type_name(info.type)),
+                                storage_symbol(info.compressed ? "block" : "raw"), storage_symbol(codec),
+                                (int64_t)info.rows, (int64_t)info.blocks.blocks, info.block_bytes,
+                                (int64_t)info.file_bytes, (int64_t)logical};
+            double ratio = info.file_bytes ? (double)logical / (double)info.file_bytes : 0.0;
+            if (t.table) err = storage_rows_push(&rows, 0, &partition);
+            for (size_t i = 0; !err && i < 9; i++) err = storage_rows_push(&rows, base + i, &values[i]);
+            if (!err) err = storage_rows_push(&rows, base + 9, &ratio);
+        }
+        ray_block_scan_close(&scan);
     }
-    ray_block_scan_close(&scan);
-    if (err) {
-        for (int i = 0; i < 10; i++) if (cols[i] && !RAY_IS_ERR(cols[i])) ray_release(cols[i]);
-        return ray_error(ray_err_code_str(err), ".db.storage.info: metadata unavailable");
-    }
-    for (int i = 0; i < 10; i++) cols[i]->len = count;
-    return storage_table(fields, cols, 10);
+    storage_target_free(&t);
+    if (!result && err) result = ray_error(ray_err_code_str(err), ".db.storage.info: metadata unavailable");
+    if (result) { storage_rows_free(&rows); return result; }
+    return storage_rows_table(&rows);
 }
 
-/* (.db.storage.verify path [read-options]): decode and check every block of
- * every compressed column; a corrupt block is an error naming its column. */
+/* (.db.storage.verify path|root 'table [read-options]): decode and check every
+ * block of every compressed column; corruption names partition, column, block. */
 ray_t* ray_storage_verify_fn(ray_t** args, int64_t n) {
-    ray_block_scan_t* scan = NULL;
-    ray_t* bad = storage_open(".db.storage.verify", args, n, &scan);
-    if (bad) return bad;
-    ray_t* names = ray_block_scan_names(scan);
-    int64_t count = names->len;
+    storage_target_t t;
+    ray_t* result = storage_target(".db.storage.verify", args, n, &t);
+    if (result) { storage_target_free(&t); return result; }
     static const char* const fields[] = {"column", "format", "blocks"};
-    ray_t* cols[3] = {ray_sym_vec_new(RAY_SYM_W64, count), ray_sym_vec_new(RAY_SYM_W64, count),
-                      ray_vec_new(RAY_I64, count)};
-    ray_t* result = NULL;
-    for (int i = 0; i < 3; i++)
-        if (!cols[i] || RAY_IS_ERR(cols[i])) result = ray_error("oom", NULL);
-    for (int64_t c = 0; !result && c < count; c++) {
-        if (ray_eval_is_interrupted()) { result = ray_error("cancel", ".db.storage.verify: interrupted"); break; }
-        size_t len;
-        const char* name = ray_str_vec_get(names, c, &len);
-        ray_block_scan_column_info_t info;
-        uint64_t checked = 0, block = 0;
-        ray_err_t err = ray_block_scan_column_info(scan, (size_t)c, &info);
-        if (!err) err = ray_block_scan_verify_column(scan, (size_t)c, &checked, &block);
-        if (err) {
-            result = ray_error(ray_err_code_str(err), ".db.storage.verify: %s column %.*s block %llu",
-                               string(args[0]), (int)len, name, (unsigned long long)block);
-            break;
+    static const int8_t types[] = {RAY_SYM, RAY_SYM, RAY_I64};
+    storage_rows_t rows;
+    ray_err_t err = storage_rows_init(&rows, &t, fields, types, 3);
+    size_t base = t.table ? 1 : 0;
+    for (int64_t p = 0; !err && !result && p < storage_count(&t); p++) {
+        ray_block_scan_t* scan = NULL;
+        result = storage_open(&t, p, &scan);
+        if (result) break;
+        ray_t* names = ray_block_scan_names(scan);
+        int64_t partition = t.table ? storage_symbol(t.dirs[p]) : 0;
+        for (int64_t c = 0; !err && !result && c < names->len; c++) {
+            if (ray_eval_is_interrupted()) { result = ray_error("cancel", ".db.storage.verify: interrupted"); break; }
+            size_t len;
+            const char* name = ray_str_vec_get(names, c, &len);
+            ray_block_scan_column_info_t info;
+            uint64_t checked = 0, block = 0;
+            ray_err_t bad = ray_block_scan_column_info(scan, (size_t)c, &info);
+            if (!bad) bad = ray_block_scan_verify_column(scan, (size_t)c, &checked, &block);
+            if (bad) {
+                result = t.table ?
+                    ray_error(ray_err_code_str(bad), ".db.storage.verify: %s partition %s column %.*s block %llu",
+                              t.path, t.dirs[p], (int)len, name, (unsigned long long)block) :
+                    ray_error(ray_err_code_str(bad), ".db.storage.verify: %s column %.*s block %llu",
+                              t.path, (int)len, name, (unsigned long long)block);
+                break;
+            }
+            int64_t values[] = {ray_sym_intern(name, len), storage_symbol(info.compressed ? "block" : "raw"),
+                                (int64_t)checked};
+            if (t.table) err = storage_rows_push(&rows, 0, &partition);
+            for (size_t i = 0; !err && i < 3; i++) err = storage_rows_push(&rows, base + i, &values[i]);
         }
-        ((int64_t*)ray_data(cols[0]))[c] = ray_sym_intern(name, len);
-        ((int64_t*)ray_data(cols[1]))[c] = storage_symbol(info.compressed ? "block" : "raw");
-        ((int64_t*)ray_data(cols[2]))[c] = (int64_t)checked;
+        ray_block_scan_close(&scan);
     }
-    ray_block_scan_close(&scan);
-    if (result) {
-        for (int i = 0; i < 3; i++) if (cols[i] && !RAY_IS_ERR(cols[i])) ray_release(cols[i]);
-        return result;
-    }
-    for (int i = 0; i < 3; i++) cols[i]->len = count;
-    return storage_table(fields, cols, 3);
+    storage_target_free(&t);
+    if (!result && err) result = ray_error(ray_err_code_str(err), ".db.storage.verify: report unavailable");
+    if (result) { storage_rows_free(&rows); return result; }
+    return storage_rows_table(&rows);
 }
 
 /* (.db.block.convert src dest block-options [{immutable: BOOL sym: STR}]) */

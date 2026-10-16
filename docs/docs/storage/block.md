@@ -99,6 +99,8 @@ A partitioned scan adds the virtual key column `date` (for `YYYY.MM.DD` partitio
 | `(.db.storage.info "dir" [read-options])` | One row per column: `column`, `type`, `format` (`raw`/`block`), `codec` (`none`/`snappy`/`mixed`), `rows`, `blocks`, `block_bytes`, `stored`, `logical`, `ratio`. Reads metadata only. |
 | `(.db.storage.verify "dir" [read-options])` | Decodes every block, checking both checksums, string framing, symbol bounds and that zone statistics describe the data. Returns blocks checked per column, or a `corrupt` error naming the column and block. |
 
+Both also accept a partitioned database, `(.db.storage.info "root" 'table [read-options])`: they report every partition `root/<partition>/table` with a leading `partition` column, raw `SYM` columns default to the root's `.sym`, and a corrupt block is reported with its partition.
+
 Ordinary reads check each block's checksums the first time it is decoded through an open file, and the directory and header checksums on open. `verify` is the full check to run after copying or restoring data.
 
 ```lisp
