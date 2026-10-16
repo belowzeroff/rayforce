@@ -101,6 +101,8 @@ ray_err_t ray_col_block_payload_size(const ray_col_block_reader_t* reader,
 /* Buffers must not overlap each other or the mapping. Capacities are checked
  * before any output write. CRC/decode errors may leave partial output.
  * Fixed-width only; STR uses materialization below. */
+/* Whole blocks of a large range decode in parallel on the native pool when
+ * called outside a pool dispatch; partial boundary blocks decode serially. */
 ray_err_t ray_col_block_read_range(const ray_col_block_reader_t* reader,
                                   uint64_t start, uint64_t count,
                                   void* output, size_t capacity,

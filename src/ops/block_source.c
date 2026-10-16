@@ -15,7 +15,10 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define BLOCK_SOURCE_BATCH_ROWS 4096u
+#define BLOCK_SOURCE_BATCH_ROWS 4096u   /* aggregate chunk: bounds group-id workspace */
+/* Reads span several blocks so their whole blocks decode in parallel. */
+#define BLOCK_SOURCE_READ_ROWS 65536u
+#define BLOCK_SOURCE_PAYLOAD_BYTES (64u * 1024 * 1024)
 
 static bool dictionary(ray_t* d) {
     if (!d || d->type != RAY_DICT) return false;
@@ -46,8 +49,8 @@ static const char* name(ray_t* s) {
 }
 
 static ray_err_t scan_options(ray_t* opts, ray_block_scan_options_t* out, bool* immutable) {
-    *out = (ray_block_scan_options_t){0, UINT64_MAX, BLOCK_SOURCE_BATCH_ROWS,
-                                    8u * 1024 * 1024, 8u * 1024 * 1024, 0};
+    *out = (ray_block_scan_options_t){0, UINT64_MAX, BLOCK_SOURCE_READ_ROWS,
+                                    BLOCK_SOURCE_PAYLOAD_BYTES, 8u * 1024 * 1024, 0};
     *immutable = false;
     if (!opts) return RAY_OK;
     /* The parser represents {} using empty LIST keys and values. */

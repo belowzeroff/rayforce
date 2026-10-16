@@ -2,6 +2,8 @@
 #include "col_block.h"
 #include "core/crc32.h"
 #include "core/snappy.h"
+#include "core/pool.h"
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -156,7 +158,9 @@ ray_err_t ray_col_block_read(const ray_col_block_reader_t* r, uint64_t block,
     size_t stored = (size_t)get_le(e + 24, 4), decoded = (size_t)get_le(e + 28, 4);
     if (capacity < decoded) return RAY_ERR_LIMIT;
     const uint8_t* payload = r->data + get_le(e + 16, 8);
-    bool checked = r->verified && (r->verified[block >> 3] >> (block & 7) & 1);
+    /* Parallel range reads share the bitmap: bits are set atomically. */
+    bool checked = r->verified &&
+        (__atomic_load_n(&r->verified[block >> 3], __ATOMIC_RELAXED) >> (block & 7) & 1);
     /* Uncompressed payload is the decoded block: open requires equal CRCs. */
     if (!checked && ray_crc32(0, payload, stored) != get_le(e + 40, 4)) return RAY_ERR_CORRUPT;
     if (!e[32]) memcpy(output, payload, decoded);
@@ -164,7 +168,8 @@ ray_err_t ray_col_block_read(const ray_col_block_reader_t* r, uint64_t block,
     if (!checked && e[32] && ray_crc32(0, output, decoded) != get_le(e + 44, 4)) return RAY_ERR_CORRUPT;
     if (r->type == RAY_STR && !strings_valid(output, decoded, get_le(e + 8, 8)))
         return RAY_ERR_CORRUPT;
-    if (r->verified) r->verified[block >> 3] |= (uint8_t)(1u << (block & 7));
+    if (r->verified)
+        __atomic_fetch_or(&r->verified[block >> 3], (uint8_t)(1u << (block & 7)), __ATOMIC_RELAXED);
     *row_start = get_le(e, 8); *row_count = get_le(e + 8, 8);
     return RAY_OK;
 }
@@ -321,6 +326,57 @@ ray_err_t ray_col_block_range_size(const ray_col_block_reader_t* r,
     return RAY_OK;
 }
 
+/* Whole blocks [first, end) decode into disjoint slices of one output. */
+typedef struct {
+    const ray_col_block_reader_t* r;
+    uint8_t* output;
+    uint64_t first, row;
+    unsigned width;
+    _Atomic int err;
+} range_run_t;
+
+static ray_err_t range_block(const range_run_t* run, uint64_t block) {
+    const uint8_t* e = run->r->data + run->r->directory + block * RAY_COL_BLOCK_ENTRY;
+    uint64_t row = get_le(e, 8), rows = get_le(e + 8, 8), ignored_row, ignored_count;
+    return ray_col_block_read(run->r, block, run->output + (size_t)(row - run->row) * run->width,
+                              (size_t)rows * run->width, &ignored_row, &ignored_count);
+}
+
+static void range_task(void* ctx, uint32_t worker, int64_t start, int64_t end) {
+    (void)worker;
+    range_run_t* run = ctx;
+    for (int64_t i = start; i < end; i++) {
+        if (atomic_load_explicit(&run->err, memory_order_relaxed)) return;
+        ray_err_t err = range_block(run, run->first + (uint64_t)i);
+        if (err) {
+            int ok = RAY_OK;
+            atomic_compare_exchange_strong_explicit(&run->err, &ok, (int)err,
+                                                    memory_order_relaxed, memory_order_relaxed);
+            return;
+        }
+    }
+}
+
+/* Runs of whole blocks totalling at least this many decoded bytes are
+ * decoded on the native pool, one block per task. */
+#define RANGE_PARALLEL_BYTES (256u * 1024u)
+
+static ray_err_t range_whole(const ray_col_block_reader_t* r, uint64_t first, uint64_t end,
+                             uint8_t* output, uint64_t row, unsigned width, size_t bytes) {
+    range_run_t run = {r, output, first, row, width, RAY_OK};
+    ray_pool_t* pool = ray_pool_get();
+    if (end - first >= 2 && bytes >= RANGE_PARALLEL_BYTES &&
+        ray_pool_par_dispatch_ok(pool, (int64_t)(end - first), 2)) {
+        ray_pool_dispatch_n(pool, range_task, &run, (uint32_t)(end - first));
+        return (ray_err_t)atomic_load(&run.err);
+    }
+    for (uint64_t b = first; b < end; b++) {
+        ray_err_t err = range_block(&run, b);
+        if (err) return err;
+    }
+    return RAY_OK;
+}
+
 ray_err_t ray_col_block_read_range(const ray_col_block_reader_t* r,
                                   uint64_t start, uint64_t count,
                                   void* output, size_t capacity,
@@ -346,8 +402,16 @@ ray_err_t ray_col_block_read_range(const ray_col_block_reader_t* r,
         if (!whole && cache && !cache->data) cache->data = malloc(r->block_bytes);
         const uint8_t* src;
         if (whole) {
-            err = ray_col_block_read(r, block, dst, n, &ignored_row, &ignored_count);
-            src = NULL;
+            /* Only the range's first and last blocks can be partial. */
+            uint64_t last = block_for_row(r, end - 1);
+            const uint8_t* le = r->data + r->directory + last * RAY_COL_BLOCK_ENTRY;
+            uint64_t run_end = get_le(le, 8) + get_le(le + 8, 8) == end ? last + 1 : last;
+            uint64_t run_stop = run_end == last + 1 ? end : get_le(le, 8);
+            n = (size_t)(run_stop - start) * esz;
+            err = range_whole(r, block, run_end, dst, row, esz, n);
+            if (err) return err;
+            dst += n; start = run_stop; block = run_end;
+            continue;
         } else if (cache && cache->data && cache->block == block) {
             src = cache->data;
         } else if (cache && cache->data) {
