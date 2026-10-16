@@ -442,6 +442,11 @@ ray_err_t ray_block_store_convert(const char* src, const ray_block_scan_source_t
     ray_block_scan_t* scan = NULL;
     err = ray_block_scan_open_source(src, source, NULL, 0, &read, &scan);
     if (err) return err;
+    /* The block format has no place for SORTED: refuse rather than drop it. */
+    ray_t* names = ray_block_scan_names(scan);
+    for (int64_t i = 0; !err && names && i < names->len; i++)
+        if (ray_block_scan_column_attrs(scan, (size_t)i) & RAY_ATTR_SORTED) err = RAY_ERR_NYI;
+    if (err) { ray_block_scan_close(&scan); return err; }
     ray_block_table_writer_t* w = NULL;
     uint64_t rows = 0;
     for (;;) {
