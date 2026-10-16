@@ -1442,7 +1442,45 @@ static test_result_t string_arena_fallback(void) {
     PASS();
 }
 
+static test_result_t block_convert_parted(void) {
+    parted_fixture("raw", 0);
+    char command[512];
+    snprintf(command, sizeof(command),
+        "(.db.block.convert \"%s/raw\" (quote t) \"%s/conv\" {block-bytes: 256 codec: snappy durable: false} {immutable: true})",
+        root, root);
+    ray_t* r = ray_eval_str(command);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(ray_table_nrows(r), 4);
+    TEST_ASSERT_TRUE(storage_sym(r, "partition", 0, "2024.01.01"));
+    for (int64_t p = 0; p < 4; p++) TEST_ASSERT_EQ_I(storage_cell(r, "rows", p), 300 + 97 * p);
+    ray_release(r);
+    char raw[256], conv[256];
+    snprintf(raw, sizeof(raw), "(.db.parted.get \"%s/raw\" (quote t))", root);
+    snprintf(conv, sizeof(conv), "(.db.block.parted \"%s/conv\" (quote t) 100000000)", root);
+    ray_t* expected = parted_select(raw, "d: date i: id v: x k: sy t: s");
+    ray_t* actual = parted_select(conv, "d: date i: id v: x k: sy t: s");
+    test_result_t tr = tables_equal(actual, expected);
+    ray_release(expected); ray_release(actual);
+    if (tr.status != TEST_PASS) return tr;
+    const char* invalid[] = {
+        "(.db.block.convert \"%s/raw\" (quote t) \"%s/raw/sub\" {block-bytes: 256 codec: snappy} {immutable: true})",
+        "(.db.block.convert \"%s/raw\" (quote t) \"%s/other\" {block-bytes: 256 codec: snappy})",
+        "(.db.block.convert \"%s/raw\" (quote .t) \"%s/other\" {block-bytes: 256 codec: snappy})",
+        "(.db.block.convert \"%s/missing\" (quote t) \"%s/other\" {block-bytes: 256 codec: snappy})"
+    };
+    const char* codes[] = {"domain", "nyi", "domain", "io"};
+    for (unsigned i = 0; i < 4; i++) {
+        snprintf(command, sizeof(command), invalid[i], root, root);
+        r = ray_eval_str(command);
+        TEST_ASSERT_TRUE(RAY_IS_ERR(r)); TEST_ASSERT_STR_EQ(ray_err_code(r), codes[i]); ray_release(r);
+    }
+    snprintf(command, sizeof(command), "%s/raw/2024.01.01/t/.current", root);
+    TEST_ASSERT_EQ_I(access(command, F_OK), -1);
+    PASS();
+}
+
 const test_entry_t block_source_entries[] = {
+    {"block_source/block_convert_parted", block_convert_parted, setup, teardown},
     {"block_source/string_arena_fallback", string_arena_fallback, setup, teardown},
     {"block_source/storage_parted", storage_parted, setup, teardown},
     {"block_source/parallel_decode", parallel_decode, setup, teardown},

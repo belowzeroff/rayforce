@@ -44,7 +44,11 @@ ray_t* ray_block_parted_fn(ray_t** args, int64_t n);
  * compressed table as a new block generation of dest; returns the row count.
  * read-options {immutable: BOOL sym: STR} describe the source as for scans;
  * a partition path <root>/<partition>/<table> defaults sym to <root>/.sym.
- * See ray_block_store_convert: dest never overlaps src. */
+ * See ray_block_store_convert: dest never overlaps src.
+ * (.db.block.convert src-root 'table dest-root block-options [read-options])
+ * converts every partition in key order (raw SYM defaulting to src-root's
+ * .sym) and returns partition/rows; a failure names its partition and leaves
+ * the partitions before it published. */
 ray_t* ray_block_convert_fn(ray_t** args, int64_t n);
 /* (.db.storage.info path [read-options]): column, type, format (raw|block),
  * codec (none|snappy|mixed), rows, blocks, block_bytes, stored (file bytes),
