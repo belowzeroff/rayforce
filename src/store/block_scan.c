@@ -19,6 +19,8 @@ typedef struct {
     ray_t* raw;
     int64_t name;
     size_t payload_bytes;
+    uint8_t* arena;     /* STR: the batch range decoded once, while reading */
+    size_t arena_bytes;
 } scan_column_t;
 
 struct ray_block_scan_s {
@@ -532,64 +534,110 @@ static bool scan_work_exceeds(const ray_block_scan_t* s, size_t payload, size_t 
     return payload > remaining || scratch > remaining - payload;
 }
 
-static ray_t* scan_materialize(ray_block_scan_t* s, const size_t* indices,
-                              size_t count, uint64_t start, uint64_t rows) {
-    size_t total = 0, scratch_bytes = 0;
+static void scan_free_arenas(ray_block_scan_t* s, const size_t* indices, size_t count) {
     for (size_t i = 0; i < count; i++) {
         scan_column_t* column = &s->columns[indices ? indices[i] : i];
-        size_t bytes, scratch;
-        ray_err_t err;
-        if (column->raw) {
-            err = scan_raw_range_size(column->raw, start, rows, &bytes);
-            scratch = 0;
-        } else {
-            err = ray_col_block_range_size(ray_col_block_file_reader(column->file),
-                                           start, rows, &bytes, &scratch);
+        free(column->arena);
+        column->arena = NULL;
+        column->arena_bytes = 0;
+    }
+}
+
+/* STR columns decode their whole range once into an arena when every arena
+ * of the batch fits the scratch limit (and the work limit with the payload);
+ * otherwise each STR block is decoded twice through one block of scratch:
+ * once to measure, once to fill. Either way the exact batch size is known
+ * before any output column is allocated. */
+static ray_t* scan_materialize(ray_block_scan_t* s, const size_t* indices,
+                              size_t count, uint64_t start, uint64_t rows) {
+    size_t total = 0, scratch_bytes = 0, scratch_fixed = 0, arena_total = 0;
+    bool strings = false, arenas = false;
+    void* scratch = NULL;
+    ray_err_t err = RAY_OK;
+    for (size_t i = 0; !err && i < count; i++) {
+        scan_column_t* column = &s->columns[indices ? indices[i] : i];
+        size_t bytes, needed = 0;
+        if (column->raw) err = scan_raw_range_size(column->raw, start, rows, &bytes);
+        else {
+            const ray_col_block_reader_t* r = ray_col_block_file_reader(column->file);
+            err = ray_col_block_range_size(r, start, rows, &bytes, &needed);
+            if (!err && r->type == RAY_STR) {
+                strings = true;
+                err = ray_col_block_range_decoded(r, start, rows, &column->arena_bytes);
+                if (!err) arena_total = column->arena_bytes > SIZE_MAX - arena_total ?
+                    SIZE_MAX : arena_total + column->arena_bytes;
+            }
         }
-        if (err) return scan_error(s, err);
-        if (bytes > s->options.payload_limit - total || scratch > s->options.scratch_limit)
-            return scan_error(s, RAY_ERR_LIMIT);
+        if (!err && (bytes > s->options.payload_limit - total || needed > s->options.scratch_limit))
+            err = RAY_ERR_LIMIT;
+        if (err) break;
         column->payload_bytes = bytes;
         total += bytes;
-        if (scratch_bytes < scratch) scratch_bytes = scratch;
+        if (scratch_bytes < needed) scratch_bytes = needed;
+        if (!column->arena_bytes && scratch_fixed < needed) scratch_fixed = needed;
     }
-    if (scan_work_exceeds(s, total, scratch_bytes)) return scan_error(s, RAY_ERR_LIMIT);
-    void* scratch = scratch_bytes ? malloc(scratch_bytes) : NULL;
-    if (scratch_bytes && !scratch) return scan_error(s, RAY_ERR_OOM);
+    if (!err && scan_work_exceeds(s, total, scratch_bytes)) err = RAY_ERR_LIMIT;
+    /* A pool never exceeds its decoded bytes: admit arenas only if the batch
+     * fits with that bound, so tight limits keep the exact two-pass path. */
+    if (!err && strings && arena_total <= s->options.scratch_limit &&
+        arena_total <= SIZE_MAX - scratch_fixed && arena_total <= SIZE_MAX - total &&
+        total + arena_total <= s->options.payload_limit &&
+        !scan_work_exceeds(s, total + arena_total, scratch_fixed + arena_total)) {
+        arenas = true;
+        for (size_t i = 0; arenas && i < count; i++) {
+            scan_column_t* column = &s->columns[indices ? indices[i] : i];
+            if (!column->raw && ray_col_block_file_reader(column->file)->type == RAY_STR) {
+                column->arena = malloc(column->arena_bytes ? column->arena_bytes : 1);
+                if (!column->arena) arenas = false;
+            }
+        }
+        if (!arenas) scan_free_arenas(s, indices, count);
+        else scratch_bytes = scratch_fixed;
+    }
+    if (!err && scratch_bytes) {
+        scratch = malloc(scratch_bytes);
+        if (!scratch) err = RAY_ERR_OOM;
+    }
     /* STR sizes depend on decoded lengths. Check the entire batch's exact
      * descriptor/pool sum before allocating any output column. */
     total = 0;
-    for (size_t i = 0; i < count; i++) {
+    for (size_t i = 0; !err && i < count; i++) {
         scan_column_t* column = &s->columns[indices ? indices[i] : i];
         size_t bytes = column->payload_bytes;
-        ray_err_t err = RAY_OK;
         const ray_col_block_reader_t* r = column->raw ? NULL :
             ray_col_block_file_reader(column->file);
         if (r && r->type == RAY_STR) {
             scan_count_blocks(s, r, start, rows);
-            err = ray_col_block_payload_size(r, start, rows, scratch, scratch_bytes, &bytes);
+            if (column->arena) {
+                err = ray_col_block_decode_arena(r, start, rows, column->arena, column->arena_bytes);
+                if (!err) err = ray_col_block_payload_size_arena(r, start, rows, column->arena, &bytes);
+            } else err = ray_col_block_payload_size(r, start, rows, scratch, scratch_bytes, &bytes);
         }
         if (!err && bytes > s->options.payload_limit - total) err = RAY_ERR_LIMIT;
-        if (err) { free(scratch); return scan_error(s, err); }
+        if (err) break;
         column->payload_bytes = bytes;
         total += bytes;
     }
-    if (scan_work_exceeds(s, total, scratch_bytes)) {
+    if (!err && scan_work_exceeds(s, total, scratch_bytes + (arenas ? arena_total : 0)))
+        err = RAY_ERR_LIMIT;
+    if (err) {
         free(scratch);
-        return scan_error(s, RAY_ERR_LIMIT);
+        scan_free_arenas(s, indices, count);
+        return scan_error(s, err);
     }
     ray_t* batch = ray_table_new((int64_t)count);
-    if (!batch) { free(scratch); return scan_error(s, RAY_ERR_OOM); }
+    if (!batch) batch = ray_error("oom", "block scan batch allocation failed");
     for (size_t i = 0; !RAY_IS_ERR(batch) && i < count; i++) {
         scan_column_t* column = &s->columns[indices ? indices[i] : i];
         const ray_col_block_reader_t* r = column->raw ? NULL :
             ray_col_block_file_reader(column->file);
-        if (r) scan_count_blocks(s, r, start, rows);
-        else s->stats.raw_rows += rows;
+        if (!r) s->stats.raw_rows += rows;
+        else if (!column->arena) scan_count_blocks(s, r, start, rows);
         ray_t* col = column->raw ? scan_raw_materialize(column->raw, start, rows) :
             r->type == RAY_STR ?
-            ray_col_block_materialize_str(r, start, rows,
-                column->payload_bytes, scratch, scratch_bytes) :
+            (column->arena ?
+                ray_col_block_materialize_str_arena(r, start, rows, column->payload_bytes, column->arena) :
+                ray_col_block_materialize_str(r, start, rows, column->payload_bytes, scratch, scratch_bytes)) :
             ray_col_block_materialize_dom(r, start, rows,
                 s->options.payload_limit, scratch, scratch_bytes, s->domain);
         if (RAY_IS_ERR(col)) { ray_release(batch); batch = col; break; }
@@ -598,6 +646,7 @@ static ray_t* scan_materialize(ray_block_scan_t* s, const size_t* indices,
         if (!batch) { batch = ray_error("oom", "block scan batch allocation failed"); break; }
     }
     free(scratch);
+    scan_free_arenas(s, indices, count);
     if (RAY_IS_ERR(batch)) s->failed = true;
     return batch;
 }

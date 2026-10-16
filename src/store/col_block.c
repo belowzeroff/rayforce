@@ -377,6 +377,81 @@ static ray_err_t range_whole(const ray_col_block_reader_t* r, uint64_t first, ui
     return RAY_OK;
 }
 
+ray_err_t ray_col_block_range_decoded(const ray_col_block_reader_t* r, uint64_t start,
+                                     uint64_t count, size_t* bytes) {
+    if (!bytes) return RAY_ERR_DOMAIN;
+    uint64_t first, end;
+    ray_err_t err = ray_col_block_range_blocks(r, start, count, &first, &end);
+    if (err) return err;
+    size_t total = 0;
+    for (uint64_t b = first; b < end; b++) {
+        size_t n = (size_t)get_le(r->data + r->directory + b * RAY_COL_BLOCK_ENTRY + 28, 4);
+        if (n > SIZE_MAX - total) return RAY_ERR_LIMIT;
+        total += n;
+    }
+    *bytes = total;
+    return RAY_OK;
+}
+
+/* Blocks [first, first + n) decode into one arena at prefix-sum offsets. */
+typedef struct {
+    const ray_col_block_reader_t* r;
+    uint8_t* arena;
+    const size_t* offsets;
+    uint64_t first;
+    _Atomic int err;
+} arena_run_t;
+
+static ray_err_t arena_block(const arena_run_t* run, uint64_t i) {
+    uint64_t row, rows;
+    return ray_col_block_read(run->r, run->first + i, run->arena + run->offsets[i],
+                              run->offsets[i + 1] - run->offsets[i], &row, &rows);
+}
+
+static void arena_task(void* ctx, uint32_t worker, int64_t start, int64_t end) {
+    (void)worker;
+    arena_run_t* run = ctx;
+    for (int64_t i = start; i < end; i++) {
+        if (atomic_load_explicit(&run->err, memory_order_relaxed)) return;
+        ray_err_t err = arena_block(run, (uint64_t)i);
+        if (err) {
+            int ok = RAY_OK;
+            atomic_compare_exchange_strong_explicit(&run->err, &ok, (int)err,
+                                                    memory_order_relaxed, memory_order_relaxed);
+            return;
+        }
+    }
+}
+
+ray_err_t ray_col_block_decode_arena(const ray_col_block_reader_t* r, uint64_t start,
+                                    uint64_t count, uint8_t* arena, size_t capacity) {
+    uint64_t first, end;
+    size_t bytes;
+    ray_err_t err = ray_col_block_range_blocks(r, start, count, &first, &end);
+    if (!err) err = ray_col_block_range_decoded(r, start, count, &bytes);
+    if (err) return err;
+    if (capacity < bytes) return RAY_ERR_LIMIT;
+    if (bytes && !arena) return RAY_ERR_DOMAIN;
+    uint64_t n = end - first;
+    if (!n) return RAY_OK;
+    size_t* offsets = malloc((size_t)(n + 1) * sizeof(*offsets));
+    if (!offsets) return RAY_ERR_OOM;
+    offsets[0] = 0;
+    for (uint64_t i = 0; i < n; i++)
+        offsets[i + 1] = offsets[i] +
+            (size_t)get_le(r->data + r->directory + (first + i) * RAY_COL_BLOCK_ENTRY + 28, 4);
+    arena_run_t run = {r, arena, offsets, first, RAY_OK};
+    ray_pool_t* pool = ray_pool_get();
+    if (n >= 2 && bytes >= RANGE_PARALLEL_BYTES && ray_pool_par_dispatch_ok(pool, (int64_t)n, 2)) {
+        ray_pool_dispatch_n(pool, arena_task, &run, (uint32_t)n);
+        err = (ray_err_t)atomic_load(&run.err);
+    } else {
+        for (uint64_t i = 0; !err && i < n; i++) err = arena_block(&run, i);
+    }
+    free(offsets);
+    return err;
+}
+
 ray_err_t ray_col_block_read_range(const ray_col_block_reader_t* r,
                                   uint64_t start, uint64_t count,
                                   void* output, size_t capacity,
