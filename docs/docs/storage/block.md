@@ -124,12 +124,12 @@ Ordinary reads check each block's checksums the first time it is decoded through
 | One minute of one day | 244 ms | 13 ms | 15 ms |
 | One minute across all days | 125 ms | 21 ms | 22 ms |
 | One column of one day (5M rows) | 206 ms | 107 ms | 112 ms |
-| 0.5% of one day, six columns | 236 ms | 200–440 ms | 480–490 ms |
+| 0.5% of one day, six columns | 152 ms | 145 ms | 170 ms |
 | Full scan, four aggregates | 332 ms | 314 ms | 604 ms |
 | Full scan, cold cache | 1529 ms | 2441 ms | 1136 ms |
 | Disk | 7.36 GiB | 5.92 GiB | 2.56 GiB |
 
-Selective and time-range queries benefit most. Full scans decode in parallel and keep up with raw scans when warm; cold, Snappy wins by reading a seventh of the bytes. Scattered matches across wide rows decode whole blocks of every projected column, though only matching rows are built; with Snappy that decoding keeps them behind raw, which reads only the rows it needs. Zone maps prune within a read at block granularity, so large reads keep narrow ranges cheap.
+Selective and time-range queries benefit most. Full scans decode in parallel and keep up with raw scans when warm; cold, Snappy wins by reading a seventh of the bytes. Scattered matches across wide rows decode whole blocks of every projected column, though only matching rows are built; with Snappy that decoding keeps them about 10% behind raw, which reads only the rows it needs (median of 35 runs measured separately; on the shared server the 90th percentile reached 300–340 ms for block tables against 178 ms raw). Zone maps prune within a read at block granularity, so large reads keep narrow ranges cheap.
 
 ## Errors
 

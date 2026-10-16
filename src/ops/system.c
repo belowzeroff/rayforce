@@ -228,7 +228,7 @@ ray_err_t ray_block_store_parse_options(ray_t* value, ray_block_store_options_t*
 }
 
 /* (.db.block.set path table {block-bytes: I64 codec: SYM durable: BOOL})
- * block-bytes and codec are required; durable defaults to true. */
+ * All keys are optional: 64 KiB blocks, Snappy, durable. */
 ray_t* ray_block_store_fn(ray_t** args, int64_t n) {
     if (n != 2 && n != 3) return ray_error("arity", ".db.block.set: path table [options]");
     char path[1024];
