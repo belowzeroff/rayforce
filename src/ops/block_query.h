@@ -18,9 +18,10 @@ typedef struct {
  * One scan pins the union of filter and output columns. Filter-only batches
  * precede output-only contiguous matching ranges, in original row order.
  * Output batch sizes may vary. Every returned table owns its data.
- * options bounds each scan read, NOT total query RSS: graph intermediates are
- * additional, bounded by batch_rows and predicate count; metadata, vocabulary,
- * allocator overhead and caller-retained results are also outside these caps.
+ * payload/scratch options bound each scan read independently. A nonzero
+ * work_limit additionally combines decoded payload, scratch, logical predicate
+ * masks, and bytes reserved by the caller. Metadata, vocabulary, allocator
+ * capacity, and graph node objects remain outside these logical-byte caps.
  * Names/options/literals may be discarded or mutated after open. *out must be
  * NULL. All calls require caller serialization and initialized heap/symbols. */
 ray_err_t ray_block_query_open(const char* root, const char* const* columns,
@@ -31,6 +32,9 @@ ray_err_t ray_block_query_open(const char* root, const char* const* columns,
 ray_t* ray_block_query_schema(const ray_block_query_t* query);
 bool ray_block_query_has_column(const ray_block_query_t* query, const char* name);
 uint64_t ray_block_query_rows(const ray_block_query_t* query);
+/* Logical bytes retained by the caller while query_next produces a batch.
+ * Combined with decoded payload, scratch, and predicate masks by work_limit. */
+ray_err_t ray_block_query_reserve(ray_block_query_t* query, size_t bytes);
 /* Owned table/error, NULL at EOF. Errors and cancellation are terminal. Cancel
  * and runtime interrupts are checked between calls and filter batches, not
  * during synchronous decode.

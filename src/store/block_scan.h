@@ -11,6 +11,7 @@ typedef struct {
     uint64_t start, count; /* count == UINT64_MAX means through EOF */
     uint32_t batch_rows;  /* nonzero; a batch that exceeds a budget fails */
     size_t payload_limit, scratch_limit;
+    size_t work_limit; /* 0 disables the combined logical-work cap */
 } ray_block_scan_options_t;
 
 /* Internal named-column scan over mixed major-0 raw and major-2 block files.
@@ -27,9 +28,11 @@ typedef struct {
  * Requires initialized runtime heap/symbol table. *out must initially be NULL.
  * Names are interned; caller may discard options/name strings after open.
  * Limits cover logical payload of one batch and temporary decode scratch,
- * including STR descriptors and pooled bytes. STR decodes selected blocks
+ * including STR descriptors and pooled bytes. A nonzero work_limit covers
+ * payload + scratch + caller-reserved live bytes. STR decodes selected blocks
  * twice: once to validate/size the whole batch, once to fill owned output.
- * not mapping/metadata/allocator overhead, symbol vocabulary, or retained batches.
+ * Limits exclude mappings, metadata, allocator capacity, symbol vocabulary,
+ * and retained batches unless the caller includes them through reserve().
  * The dictionary file is capped at 64 MiB; this is not a vocabulary heap cap. */
 ray_err_t ray_block_scan_open(const char* root, const char* const* columns,
                               size_t count, const ray_block_scan_options_t* options,
@@ -64,6 +67,9 @@ ray_t* ray_block_scan_next_columns(ray_block_scan_t* scan, const size_t* indices
  * repeated small ranges may decode the same boundary block again. */
 ray_t* ray_block_scan_read_columns(ray_block_scan_t* scan, const size_t* indices,
                                    size_t count, uint64_t start, uint64_t rows);
+/* Set logical bytes retained by the caller while the next batch is produced.
+ * The reservation persists until replaced and is only charged by work_limit. */
+ray_err_t ray_block_scan_reserve(ray_block_scan_t* scan, size_t bytes);
 void ray_block_scan_cancel(ray_block_scan_t* scan);
 void ray_block_scan_close(ray_block_scan_t** scan);
 #endif

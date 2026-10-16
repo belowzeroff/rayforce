@@ -29,6 +29,7 @@ struct ray_block_scan_s {
     size_t count;
     uint64_t domain_count;
     uint32_t domain_crc;
+    size_t reserved_bytes;
     ray_block_scan_options_t options;
     uint64_t cursor, end;
     bool failed, cancelled;
@@ -311,6 +312,13 @@ void ray_block_scan_cancel(ray_block_scan_t* s) {
     if (s) s->cancelled = true;
 }
 
+ray_err_t ray_block_scan_reserve(ray_block_scan_t* s, size_t bytes) {
+    if (!s || s->failed) return RAY_ERR_DOMAIN;
+    if (s->options.work_limit && bytes > s->options.work_limit) return RAY_ERR_LIMIT;
+    s->reserved_bytes = bytes;
+    return RAY_OK;
+}
+
 static ray_t* scan_error(ray_block_scan_t* s, ray_err_t err) {
     s->failed = true;
     return ray_error(ray_err_code_str(err), "block scan failed");
@@ -328,6 +336,13 @@ static ray_err_t scan_validate_columns(const ray_block_scan_t* s,
         seen[index] = true;
     }
     return RAY_OK;
+}
+
+static bool scan_work_exceeds(const ray_block_scan_t* s, size_t payload, size_t scratch) {
+    if (!s->options.work_limit) return false;
+    if (s->reserved_bytes > s->options.work_limit) return true;
+    size_t remaining = s->options.work_limit - s->reserved_bytes;
+    return payload > remaining || scratch > remaining - payload;
 }
 
 static ray_t* scan_materialize(ray_block_scan_t* s, const size_t* indices,
@@ -351,6 +366,7 @@ static ray_t* scan_materialize(ray_block_scan_t* s, const size_t* indices,
         total += bytes;
         if (scratch_bytes < scratch) scratch_bytes = scratch;
     }
+    if (scan_work_exceeds(s, total, scratch_bytes)) return scan_error(s, RAY_ERR_LIMIT);
     void* scratch = scratch_bytes ? malloc(scratch_bytes) : NULL;
     if (scratch_bytes && !scratch) return scan_error(s, RAY_ERR_OOM);
     /* STR sizes depend on decoded lengths. Check the entire batch's exact
@@ -368,6 +384,10 @@ static ray_t* scan_materialize(ray_block_scan_t* s, const size_t* indices,
         if (err) { free(scratch); return scan_error(s, err); }
         column->payload_bytes = bytes;
         total += bytes;
+    }
+    if (scan_work_exceeds(s, total, scratch_bytes)) {
+        free(scratch);
+        return scan_error(s, RAY_ERR_LIMIT);
     }
     ray_t* batch = ray_table_new((int64_t)count);
     if (!batch) { free(scratch); return scan_error(s, RAY_ERR_OOM); }

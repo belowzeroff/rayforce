@@ -43,7 +43,7 @@ static const char* name(ray_t* s) {
 
 static ray_err_t scan_options(ray_t* opts, ray_block_scan_options_t* out) {
     *out = (ray_block_scan_options_t){0, UINT64_MAX, BLOCK_SOURCE_BATCH_ROWS,
-                                    8u * 1024 * 1024, 8u * 1024 * 1024};
+                                    8u * 1024 * 1024, 8u * 1024 * 1024, 0};
     if (!opts) return RAY_OK;
     /* The parser represents {} using empty LIST keys and values. */
     ray_t* empty_keys = ray_dict_keys(opts); ray_t* empty_vals = ray_dict_vals(opts);
@@ -51,12 +51,13 @@ static ray_err_t scan_options(ray_t* opts, ray_block_scan_options_t* out) {
         !empty_keys->len && !empty_vals->len) return RAY_OK;
     if (!dictionary(opts)) return RAY_ERR_TYPE;
     ray_t* keys = ray_dict_keys(opts); ray_t* vals = ray_dict_vals(opts);
-    if (keys->len > 3) return RAY_ERR_DOMAIN;
+    if (keys->len > 4) return RAY_ERR_DOMAIN;
     unsigned seen = 0;
     for (int64_t i = 0; i < keys->len; i++) {
         const char* key = string(ray_sym_vec_cell(keys, i));
         unsigned bit = !key ? 0 : !strcmp(key, "batch-rows") ? 1 :
-            !strcmp(key, "payload-bytes") ? 2 : !strcmp(key, "scratch-bytes") ? 4 : 0;
+            !strcmp(key, "payload-bytes") ? 2 : !strcmp(key, "scratch-bytes") ? 4 :
+            !strcmp(key, "work-bytes") ? 8 : 0;
         if (!bit || (seen & bit)) return RAY_ERR_DOMAIN;
         seen |= bit;
         ray_t* value = ray_list_get(vals, i);
@@ -66,7 +67,11 @@ static ray_err_t scan_options(ray_t* opts, ray_block_scan_options_t* out) {
             if (!value->i64 || (uint64_t)value->i64 > UINT32_MAX) return RAY_ERR_RANGE;
             out->batch_rows = (uint32_t)value->i64;
         } else if (bit == 2) out->payload_limit = (size_t)value->i64;
-        else out->scratch_limit = (size_t)value->i64;
+        else if (bit == 4) out->scratch_limit = (size_t)value->i64;
+        else {
+            if (!value->i64) return RAY_ERR_RANGE;
+            out->work_limit = (size_t)value->i64;
+        }
     }
     return RAY_OK;
 }
@@ -161,13 +166,33 @@ static ray_t* collect(ray_block_query_t* cursor, const int64_t* aliases,
         if (col->type == RAY_SYM) ray_sym_vec_adopt_domain(v, col);
     }
     ray_release(schema); schema = NULL;
+    size_t budget = remaining;
     for (;;) {
+        ray_err_t reserve_err = ray_block_query_reserve(cursor, budget - remaining);
+        if (reserve_err) {
+            result = ray_error(ray_err_code_str(reserve_err), "block select: working set exceeds limit");
+            goto done;
+        }
         ray_t* batch = ray_block_query_next(cursor);
         if (!batch) break;
         if (RAY_IS_ERR(batch)) { result = batch; goto done; }
+        size_t before = remaining;
         if (!charge(batch, &remaining)) {
             ray_release(batch);
             result = ray_error("limit", "block select: result exceeds explicit byte limit"); goto done;
+        }
+        size_t retained = budget - remaining;
+        size_t batch_bytes = before - remaining;
+        if (batch_bytes > SIZE_MAX - retained) {
+            ray_release(batch);
+            result = ray_error("limit", "block select: copy working set exceeds size limit");
+            goto done;
+        }
+        reserve_err = ray_block_query_reserve(cursor, retained + batch_bytes);
+        if (reserve_err) {
+            ray_release(batch);
+            result = ray_error(ray_err_code_str(reserve_err), "block select: copy working set exceeds limit");
+            goto done;
         }
         /* These vectors have a single owner until final table construction, so
          * append can grow geometrically instead of copying via table concat. */
@@ -246,13 +271,14 @@ static ray_t* aggregate_result(ray_block_query_t* cursor, const aggregate_t* con
                                size_t count, size_t remaining, uint32_t batch_rows) {
     aggregate_state_t* states = calloc(count, sizeof(*states));
     uint32_t chunk_rows = batch_rows < BLOCK_SOURCE_BATCH_ROWS ? batch_rows : BLOCK_SOURCE_BATCH_ROWS;
-    uint32_t* gids = calloc(chunk_rows, sizeof(*gids));
+    uint32_t* gids = NULL;
     ray_t* schema = NULL;
     ray_t* result = NULL;
-    if (!states || !gids) goto done;
+    if (!states) goto done;
     schema = ray_block_query_schema(cursor);
     if (!schema || RAY_IS_ERR(schema)) { result = schema; schema = NULL; goto done; }
     bool has_avg = false;
+    size_t output_bytes = 0;
     /* Match select's empty-source projection rule, distinct from a WHERE
      * that filters all rows of a nonempty source (one aggregate row). */
     int64_t output_rows = ray_block_query_rows(cursor) ? 1 : 0;
@@ -272,10 +298,26 @@ static ray_t* aggregate_result(ray_block_query_t* cursor, const aggregate_t* con
             result = ray_error("limit", "block select: aggregate result exceeds explicit byte limit"); goto done;
         }
         remaining -= bytes;
+        output_bytes += bytes;
         states[a].kernel = k;
         has_avg |= op == OP_AVG;
     }
     ray_release(schema); schema = NULL;
+    size_t workspace = (size_t)chunk_rows * sizeof(*gids);
+    for (size_t a = 0; a < count; a++) {
+        if (states[a].kernel->state_size > SIZE_MAX - workspace) {
+            result = ray_error("limit", "block select: aggregate workspace exceeds size limit");
+            goto done;
+        }
+        workspace += states[a].kernel->state_size;
+    }
+    ray_err_t reserve_err = ray_block_query_reserve(cursor, workspace);
+    if (reserve_err) {
+        result = ray_error(ray_err_code_str(reserve_err), "block select: working set exceeds limit");
+        goto done;
+    }
+    gids = calloc(chunk_rows, sizeof(*gids));
+    if (!gids) goto done;
     for (size_t a = 0; a < count; a++) {
         states[a].state = malloc(states[a].kernel->state_size);
         if (!states[a].state) goto done;
@@ -312,6 +354,14 @@ static ray_t* aggregate_result(ray_block_query_t* cursor, const aggregate_t* con
         }
         ray_release(batch);
         if (result) goto done;
+    }
+    if (output_bytes > SIZE_MAX - workspace) {
+        result = ray_error("limit", "block select: aggregate working set exceeds size limit"); goto done;
+    }
+    reserve_err = ray_block_query_reserve(cursor, workspace + output_bytes);
+    if (reserve_err) {
+        result = ray_error(ray_err_code_str(reserve_err), "block select: working set exceeds limit");
+        goto done;
     }
     result = ray_table_new((int64_t)count);
     for (size_t a = 0; result && !RAY_IS_ERR(result) && a < count; a++) {

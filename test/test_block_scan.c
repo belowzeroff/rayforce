@@ -109,7 +109,7 @@ static test_result_t mixed_raw_scan(void) {
     int64_t baseline = mapped();
     char pinned[1024];
     TEST_ASSERT_EQ_I(ray_splay_resolve_dir(root, pinned, sizeof(pinned)), RAY_OK);
-    ray_block_scan_options_t options = {2, 12, 5, 60, 64};
+    ray_block_scan_options_t options = {2, 12, 5, 60, 64, 0};
     TEST_ASSERT_EQ_I(ray_block_scan_open(root, names, 2, &options, &scan), RAY_OK);
     ray_t* retained = ray_block_scan_next(scan);
     TEST_ASSERT_NOT_NULL(retained); TEST_ASSERT_FALSE(RAY_IS_ERR(retained));
@@ -152,13 +152,37 @@ static test_result_t mixed_raw_scan(void) {
     PASS();
 }
 
+static test_result_t shared_work_limit(void) {
+    publish(1, 16, 16, 1);
+    int64_t baseline = mapped();
+    ray_block_scan_options_t options = {0, 5, 5, 60, 64, 131};
+    TEST_ASSERT_EQ_I(ray_block_scan_open(root, names, 2, &options, &scan), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_block_scan_reserve(scan, 7), RAY_OK);
+    ray_t* batch = ray_block_scan_next(scan);
+    TEST_ASSERT_NOT_NULL(batch); TEST_ASSERT_FALSE(RAY_IS_ERR(batch)); ray_release(batch);
+    ray_block_scan_close(&scan); TEST_ASSERT_EQ_I(mapped(), baseline);
+
+    options.work_limit = 130;
+    TEST_ASSERT_EQ_I(ray_block_scan_open(root, names, 2, &options, &scan), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_block_scan_reserve(scan, 7), RAY_OK);
+    batch = ray_block_scan_next(scan);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(batch)); TEST_ASSERT_STR_EQ(ray_err_code(batch), "limit");
+    ray_release(batch); ray_block_scan_close(&scan); TEST_ASSERT_EQ_I(mapped(), baseline);
+
+    options.work_limit = 6;
+    TEST_ASSERT_EQ_I(ray_block_scan_open(root, names, 2, &options, &scan), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_block_scan_reserve(scan, 7), RAY_ERR_LIMIT);
+    ray_block_scan_close(&scan); TEST_ASSERT_EQ_I(mapped(), baseline);
+    PASS();
+}
+
 static test_result_t batches(void) {
     publish(1, 16, 16, 1);
     char pinned[1024];
     TEST_ASSERT_EQ_I(ray_splay_resolve_dir(root, pinned, sizeof(pinned)), RAY_OK);
     int64_t baseline = mapped();
     const char* const projection[] = {"y", "x"};
-    ray_block_scan_options_t options = {2, 12, 5, 60, 64};
+    ray_block_scan_options_t options = {2, 12, 5, 60, 64, 0};
     TEST_ASSERT_EQ_I(ray_block_scan_open(root, projection, 2, &options, &scan), RAY_OK);
     uint64_t offset = 2;
     ray_t* retained = NULL;
@@ -194,7 +218,7 @@ static test_result_t batches(void) {
 static test_result_t failures(void) {
     publish(1, 16, 16, 1);
     int64_t baseline = mapped();
-    ray_block_scan_options_t options = {0, UINT64_MAX, 5, 60, 64};
+    ray_block_scan_options_t options = {0, UINT64_MAX, 5, 60, 64, 0};
     const char* const invalid[] = {"x", "../y"};
     const char* const duplicates[] = {"x", "x"};
     const char* const missing[] = {"x", "missing"};
@@ -245,7 +269,7 @@ static test_result_t failures(void) {
 
 static test_result_t cancel_after_batch(void) {
     publish(1, 16, 16, 1);
-    ray_block_scan_options_t options = {0, UINT64_MAX, 5, 60, 64};
+    ray_block_scan_options_t options = {0, UINT64_MAX, 5, 60, 64, 0};
     TEST_ASSERT_EQ_I(ray_block_scan_open(root, names, 2, &options, &scan), RAY_OK);
     TEST_ASSERT_EQ_I(ray_block_scan_open(root, names, 2, &options, &scan), RAY_ERR_DOMAIN);
     ray_t* t = ray_block_scan_next(scan);
@@ -265,7 +289,7 @@ static test_result_t cancel_after_batch(void) {
 static test_result_t projection(void) {
     publish(1, 16, 16, 1);
     int64_t baseline = mapped();
-    ray_block_scan_options_t options = {0, UINT64_MAX, 5, 60, 64};
+    ray_block_scan_options_t options = {0, UINT64_MAX, 5, 60, 64, 0};
     damage("y", 0); /* A corrupt unselected column must never be opened. */
     TEST_ASSERT_EQ_I(ray_block_scan_open(root, names, 1, &options, &scan), RAY_OK);
     ray_t* t = ray_block_scan_next(scan);
@@ -287,7 +311,7 @@ static test_result_t subset_ranges(void) {
     int64_t baseline = mapped();
     char pinned[1024];
     TEST_ASSERT_EQ_I(ray_splay_resolve_dir(root, pinned, sizeof(pinned)), RAY_OK);
-    ray_block_scan_options_t options = {2, 9, 5, 60, 64};
+    ray_block_scan_options_t options = {2, 9, 5, 60, 64, 0};
     TEST_ASSERT_EQ_I(ray_block_scan_open(root, names, 2, &options, &scan), RAY_OK);
     size_t y_only[] = {1};
     uint64_t start = UINT64_MAX;
@@ -335,7 +359,7 @@ static test_result_t subset_ranges(void) {
 static test_result_t subset_failures(void) {
     publish(1, 16, 16, 1);
     int64_t baseline = mapped();
-    ray_block_scan_options_t options = {2, 9, 5, 60, 64};
+    ray_block_scan_options_t options = {2, 9, 5, 60, 64, 0};
     const size_t invalid[] = {SIZE_MAX}, duplicate[] = {1, 1};
     for (unsigned which = 0; which < 14; which++) {
         TEST_ASSERT_EQ_I(ray_block_scan_open(root, names, 2, &options, &scan), RAY_OK);
@@ -382,7 +406,7 @@ static test_result_t subset_payloads(void) {
     /* Open validates y's metadata, but filter-only x reads must not decode y. */
     damage("y", RAY_COL_BLOCK_HEADER);
     int64_t baseline = mapped();
-    ray_block_scan_options_t options = {0, 5, 5, 40, 64};
+    ray_block_scan_options_t options = {0, 5, 5, 40, 64, 0};
     TEST_ASSERT_EQ_I(ray_block_scan_open(root, names, 2, &options, &scan), RAY_OK);
     ray_t* batch = ray_block_scan_next_columns(scan, NULL, 1, NULL);
     TEST_ASSERT_NOT_NULL(batch); TEST_ASSERT_FALSE(RAY_IS_ERR(batch)); ray_release(batch);
@@ -420,7 +444,7 @@ static void write_schema(ray_t* schema) {
 
 static test_result_t schema_membership(void) {
     publish(1, 16, 16, 1);
-    ray_block_scan_options_t options = {0, UINT64_MAX, 5, 60, 64};
+    ray_block_scan_options_t options = {0, UINT64_MAX, 5, 60, 64, 0};
     int64_t baseline = mapped();
     char dir[1024], from[1100], to[1100];
     TEST_ASSERT_EQ_I(ray_splay_resolve_dir(root, dir, sizeof(dir)), RAY_OK);
@@ -449,7 +473,7 @@ static test_result_t schema_membership(void) {
 
 static test_result_t schema_corruption(void) {
     publish(1, 16, 16, 1);
-    ray_block_scan_options_t options = {0, UINT64_MAX, 5, 60, 64};
+    ray_block_scan_options_t options = {0, UINT64_MAX, 5, 60, 64, 0};
     int64_t baseline = mapped();
     const char* bad[] = {"", ".hidden", "../y", "a/b", "a\\b", "y\0tail", "x"};
     const uint32_t sizes[] = {0, 7, 4, 3, 3, 6, 1};
@@ -479,7 +503,7 @@ static test_result_t schema_corruption(void) {
 
 static test_result_t schema_limits(void) {
     publish(1, 16, 16, 1);
-    ray_block_scan_options_t options = {0, UINT64_MAX, 5, 60, 64};
+    ray_block_scan_options_t options = {0, UINT64_MAX, 5, 60, 64, 0};
     int64_t baseline = mapped();
     ray_t* schema = ray_vec_new(RAY_STR, RAY_BLOCK_SCAN_MAX_COLUMNS);
     TEST_ASSERT_FALSE(RAY_IS_ERR(schema));
@@ -541,7 +565,7 @@ static test_result_t store_roundtrip(void) {
     snprintf(path, sizeof(path), "%s/.d", target); TEST_ASSERT_EQ_I(access(path, F_OK), -1);
     TEST_ASSERT_EQ_I(ray_splay_resolve_dir(target, pinned, sizeof(pinned)), RAY_OK);
     TEST_ASSERT_TRUE(strcmp(pinned, target) != 0);
-    ray_block_scan_options_t scan_options = {0, UINT64_MAX, 5, 60, 64};
+    ray_block_scan_options_t scan_options = {0, UINT64_MAX, 5, 60, 64, 0};
     TEST_ASSERT_EQ_I(ray_block_scan_open(target, names, 2, &scan_options, &scan), RAY_OK);
     ray_t* first = ray_block_scan_next(scan);
     TEST_ASSERT_NOT_NULL(first); TEST_ASSERT_FALSE(RAY_IS_ERR(first));
@@ -639,7 +663,7 @@ static test_result_t store_rollback(void) {
     TEST_ASSERT_EQ_I(access(staged, F_OK), -1);
     TEST_ASSERT_EQ_I(ray_splay_resolve_dir(target, after, sizeof(after)), RAY_OK);
     TEST_ASSERT_STR_EQ(before, after);
-    ray_block_scan_options_t scan_options = {0, UINT64_MAX, 5, 60, 64};
+    ray_block_scan_options_t scan_options = {0, UINT64_MAX, 5, 60, 64, 0};
     TEST_ASSERT_EQ_I(ray_block_scan_open(target, names, 2, &scan_options, &scan), RAY_OK);
     ray_t* batch = ray_block_scan_next(scan);
     TEST_ASSERT_NOT_NULL(batch); TEST_ASSERT_FALSE(RAY_IS_ERR(batch)); ray_release(batch);
@@ -676,7 +700,7 @@ static test_result_t store_symbols(void) {
     const char* projection[] = {"global", "local", "x"};
     const char* text[] = {"", "alpha", "beta"};
     ray_block_store_options_t options = {64, 1, true};
-    ray_block_scan_options_t read = {1, 15, 5, 120, 64};
+    ray_block_scan_options_t read = {1, 15, 5, 120, 64, 0};
     for (uint8_t width = RAY_SYM_W8; width <= RAY_SYM_W64; width++) {
         ray_t* table = symbol_table(width, 16);
         options.codec = width % 2;
@@ -738,7 +762,7 @@ static test_result_t store_symbols(void) {
 static test_result_t symbol_failures(void) {
     const char* projection[] = {"global", "local"};
     ray_block_store_options_t options = {64, 1, false};
-    ray_block_scan_options_t read = {0, UINT64_MAX, 5, 80, 64};
+    ray_block_scan_options_t read = {0, UINT64_MAX, 5, 80, 64, 0};
     ray_t* table = symbol_table(RAY_SYM_W64, 16);
     ray_t* col = ray_table_get_col_idx(table, 2);
     ((uint64_t*)ray_data(col))[0] = UINT64_MAX;
@@ -803,7 +827,7 @@ static test_result_t subset_variable_width(void) {
     const char* projection[] = {"s", "local", "x", "t"};
     const size_t numeric[] = {2}, result[] = {1, 0};
     ray_block_store_options_t options = {64, 1, false};
-    ray_block_scan_options_t read = {0, UINT64_MAX, 4, 109, 64};
+    ray_block_scan_options_t read = {0, UINT64_MAX, 4, 109, 64, 0};
     ray_t* table = string_table(16);
     TEST_ASSERT_EQ_I(ray_block_store_save(table, root, &options), RAY_OK); ray_release(table);
     /* Neither reading x nor materializing local/s should decode the unused t. */
@@ -860,7 +884,7 @@ static test_result_t subset_variable_width(void) {
 static test_result_t store_strings(void) {
     const char* projection[] = {"s", "local", "x", "t"};
     ray_block_store_options_t options = {64, 1, true};
-    ray_block_scan_options_t read = {0, UINT64_MAX, 4, 1024, 64};
+    ray_block_scan_options_t read = {0, UINT64_MAX, 4, 1024, 64, 0};
     ray_t* table = string_table(16);
     TEST_ASSERT_EQ_I(ray_block_store_save(table, root, &options), RAY_OK); ray_release(table);
     TEST_ASSERT_EQ_I(ray_block_scan_open(root, projection, 4, &read, &scan), RAY_OK);
@@ -918,7 +942,7 @@ static test_result_t string_limits(void) {
     TEST_ASSERT_EQ_I(access(target, F_OK), -1);
     options.block_bytes = 64;
     TEST_ASSERT_EQ_I(ray_block_store_save(table, root, &options), RAY_OK); ray_release(table);
-    ray_block_scan_options_t read = {0, 4, 4, 154, 44};
+    ray_block_scan_options_t read = {0, 4, 4, 154, 44, 0};
     int64_t baseline = mapped();
     TEST_ASSERT_EQ_I(ray_block_scan_open(root, projection, 2, &read, &scan), RAY_OK);
     ray_t* batch = ray_block_scan_next(scan);
@@ -947,7 +971,7 @@ static test_result_t string_limits(void) {
 static test_result_t query_late_materialization(void) {
     const char* output[] = {"s", "local"};
     ray_block_store_options_t write = {64, 1, false};
-    ray_block_scan_options_t read = {0, UINT64_MAX, 4, 256, 64};
+    ray_block_scan_options_t read = {0, UINT64_MAX, 4, 256, 64, 0};
     ray_t* table = string_table(16);
     TEST_ASSERT_EQ_I(ray_block_store_save(table, root, &write), RAY_OK); ray_release(table);
     damage("s", RAY_COL_BLOCK_HEADER);
@@ -999,7 +1023,7 @@ static test_result_t query_late_materialization(void) {
 static test_result_t query_conjunction(void) {
     publish(1, 16, 16, 1);
     const char* output[] = {"y"};
-    ray_block_scan_options_t read = {2, 12, 5, 60, 64};
+    ray_block_scan_options_t read = {2, 12, 5, 60, 64, 0};
     ray_t* lo = ray_i64(103); ray_t* hi = ray_i64(112); ray_t* hole = ray_i64(105);
     ray_t* y_lo = ray_i32(1002);
     ray_block_predicate_t predicates[RAY_BLOCK_QUERY_MAX_PREDICATES];
@@ -1033,7 +1057,7 @@ static test_result_t query_native_parity(void) {
     const uint16_t ops[] = {OP_EQ, OP_NE, OP_LT, OP_LE, OP_GT, OP_GE};
     const char* output[] = {"id"};
     ray_block_store_options_t write = {64, 1, false};
-    ray_block_scan_options_t read = {1, 15, 5, 80, 64};
+    ray_block_scan_options_t read = {1, 15, 5, 80, 64, 0};
     for (unsigned t = 0; t < sizeof(types); t++) {
         int8_t type = types[t];
         ray_t* col = ray_vec_new(type, 16); col->len = 16;
@@ -1095,7 +1119,7 @@ static test_result_t query_native_parity(void) {
 static test_result_t query_admission(void) {
     publish(1, 16, 16, 1);
     const char* output[] = {"y"};
-    ray_block_scan_options_t read = {0, UINT64_MAX, 5, 40, 64};
+    ray_block_scan_options_t read = {0, UINT64_MAX, 5, 40, 64, 0};
     ray_t* atom = ray_i64(101);
     ray_block_predicate_t pred = {"x", OP_EQ, atom};
     int64_t baseline = mapped();
@@ -1147,7 +1171,7 @@ static test_result_t query_budgets_and_errors(void) {
     ray_t* atom = ray_i32(999);
     ray_block_predicate_t pred = {filter_name, OP_GT, atom};
     int64_t baseline = mapped();
-    ray_block_scan_options_t read = {0, UINT64_MAX, 5, 19, 64};
+    ray_block_scan_options_t read = {0, UINT64_MAX, 5, 19, 64, 0};
     for (unsigned which = 0; which < 4; which++) {
         read.payload_limit = which == 0 ? 19 : which == 1 ? 39 : 40;
         read.scratch_limit = which == 2 ? 63 : 64;
@@ -1168,6 +1192,7 @@ static test_result_t query_budgets_and_errors(void) {
 
 const test_entry_t block_scan_entries[] = {
     {"block_scan/mixed_raw_scan", mixed_raw_scan, setup, teardown},
+    {"block_scan/shared_work_limit", shared_work_limit, setup, teardown},
     {"block_scan/query_budgets_and_errors", query_budgets_and_errors, setup, teardown},
     {"block_scan/query_late_materialization", query_late_materialization, setup, teardown},
     {"block_scan/query_conjunction", query_conjunction, setup, teardown},

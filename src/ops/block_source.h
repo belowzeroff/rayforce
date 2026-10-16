@@ -8,11 +8,14 @@
  * A leased generation may mix legacy raw and compressed block columns; scan
  * batches own copied raw ranges and remain valid after the lease is released.
  * Results grow in singly-owned column buffers; the table is built once at EOF.
- * Options: {batch-rows: I64 payload-bytes: I64 scratch-bytes: I64}.
+ * Options: {batch-rows: I64 payload-bytes: I64 scratch-bytes: I64
+ *           work-bytes: I64}.
  * Each key is optional. Defaults: 4096 rows, 8 MiB payload, 8 MiB scratch.
+ * work-bytes has no default and, when present, bounds logical result retained
+ * by select plus the current payload, scratch, predicate masks, and aggregate
+ * workspace. It must be positive.
  * batch-rows is in [1, UINT32_MAX]; byte limits are nonnegative size_t values.
- * Limits apply per read and do not include graph masks/states/metadata or
- * caller-retained results. They are independent, not a shared query RAM cap.
+ * Metadata, symbol vocabularies and allocator capacity remain outside limits.
  * Unknown/duplicate keys and invalid values fail before opening files; select
  * revalidates descriptor options. Large batches do not grow aggregate gids.
  * Select admits explicit distinct bare-column projections/aliases and typed comparisons
