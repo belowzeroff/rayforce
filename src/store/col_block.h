@@ -101,6 +101,21 @@ ray_err_t ray_col_block_payload_size(const ray_col_block_reader_t* reader,
 /* Buffers must not overlap each other or the mapping. Capacities are checked
  * before any output write. CRC/decode errors may leave partial output.
  * Fixed-width only; STR uses materialization below. */
+/* Sum of decoded sizes of the blocks covering a range, from the directory. */
+ray_err_t ray_col_block_range_decoded(const ray_col_block_reader_t* reader, uint64_t start,
+                                     uint64_t count, size_t* bytes);
+/* Decode every block covering a range, whole and in order, into one arena of
+ * at least range_decoded bytes; in parallel on the native pool when large. */
+ray_err_t ray_col_block_decode_arena(const ray_col_block_reader_t* reader, uint64_t start,
+                                    uint64_t count, uint8_t* arena, size_t capacity);
+/* STR from a decode_arena of the same range, without decoding again:
+ * payload_size_arena measures it, materialize_str_arena fills from it. */
+ray_err_t ray_col_block_payload_size_arena(const ray_col_block_reader_t* reader,
+                                          uint64_t start, uint64_t count,
+                                          const uint8_t* arena, size_t* payload_bytes);
+ray_t* ray_col_block_materialize_str_arena(const ray_col_block_reader_t* reader,
+                                          uint64_t start, uint64_t count,
+                                          size_t measured_bytes, const uint8_t* arena);
 /* Whole blocks of a large range decode in parallel on the native pool when
  * called outside a pool dispatch; partial boundary blocks decode serially. */
 ray_err_t ray_col_block_read_range(const ray_col_block_reader_t* reader,
