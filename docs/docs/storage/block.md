@@ -74,7 +74,7 @@ Block tables are read with `select` over a scan descriptor:
 |---|---|---|
 | `batch-rows` | 65536 | Rows decoded per read. |
 | `payload-bytes` | 64 MiB | Decoded bytes per read. |
-| `scratch-bytes` | 8 MiB | Decode scratch per read. |
+| `scratch-bytes` | 8 MiB | Temporary decode memory per read. String columns decode a read's blocks once into it when they fit, otherwise twice through one block; results are the same. |
 | `work-bytes` | none | Optional cap on retained result plus the current read, masks and aggregate state. |
 | `immutable` | `false` | Admit flat raw directories, as for conversion. |
 
@@ -127,7 +127,7 @@ Selective and time-range queries benefit most; full scans and wide late material
 
 | Code | Meaning |
 |---|---|
-| `nyi` | Unsupported query shape, a flat source without `immutable: true`, or a column attribute blocks cannot keep. |
+| `nyi` | Unsupported query shape, a flat source without `immutable: true`, a column attribute blocks cannot keep, or a file using a codec or format feature newer than this reader. |
 | `limit` | A read or the result exceeds its configured byte limit. |
 | `schema` | Partitions or columns disagree in names or types. |
 | `corrupt` | A checksum, structure or statistic does not match. |
