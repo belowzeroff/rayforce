@@ -36,8 +36,12 @@ Nothing changes for existing data or calls. Only `.db.block.set`,
 `.csv.block`, `.parquet.block`, `.db.block.convert` and `.db.splayed.set` *with
 an options dictionary* create block generations. `.db.splayed.set` without
 options, `.csv.splayed`, `.parquet.splayed` and every other writer stay flat
-raw, byte for byte. Raw tables are read as before; the raw publication path is
-untouched (gate 6 below).
+raw, byte for byte, and raw tables are read as before. One change touches raw
+tables: a staged (generation) publication, raw or block, now also creates
+`.publish.lock` in the table root and holds it around the `.current` rename and
+GC, so that block scans of mixed partitions can lease raw generations safely.
+Raw first writes (no generations) are unchanged. Gate 6 below covers the raw
+paths.
 
 The step is one way. A binary from before this work resolves the generation
 layout, which already existed for staged writes, but refuses each block
@@ -81,13 +85,24 @@ files, `.d`, `.sym` and `.lease`; `.current` names the published one.
 Locks are advisory OS file locks (`flock`; `LockFileEx` on Windows), released
 by the kernel when a process dies, so there are no stale leases to clean.
 
-1. A writer takes `.write.lock` exclusively, writes a new generation, fsyncs
-   files and directories, and renames `.current.tmp` over `.current`.
-2. A reader takes `.write.lock` shared, reads `.current`, takes its
-   generation's `.lease` shared, drops the root lock, and keeps the lease for
+Three lock files, always taken in this order: `.write.lock` → `.publish.lock`
+→ `.lease`.
+
+1. A writer takes `.write.lock` exclusively for the whole write (writers
+   serialize), writes a new generation and fsyncs files and directories.
+2. It then takes `.publish.lock` exclusively, renames `.current.tmp` over
+   `.current`, runs GC and releases it. GC removes a generation only if it is
+   not current and a non-blocking exclusive lock on its `.lease` succeeds; the
+   `.lease` file goes last.
+3. A reader takes `.publish.lock` shared, reads `.current`, takes its
+   generation's `.lease` shared, drops `.publish.lock`, and keeps the lease for
    the whole scan.
-3. GC, after publishing, removes a generation only if it is not current and
-   a non-blocking exclusive lock on its `.lease` succeeds.
+
+Readers never touch `.write.lock`, so a scan waits for a publication, never
+for a long import or conversion into the same table. Under the shared
+`.publish.lock` nothing is published or removed, so the resolved generation
+exists when its lease is taken; GC never waits. Either side creates
+`.publish.lock` on first use; a table without `.write.lock` is legacy (`nyi`).
 
 Windows (rename over open or mapped files, lock semantics) and NFS (`flock`
 is not reliable there) are untested and not claimed.
@@ -189,8 +204,9 @@ Each PR builds and passes the full suite on its own; later PRs only add.
    a file with a feature bit) with a test that they read back, that a raw
    major-0 fixture still loads, and that the feature-bit file is `nyi`.
 4. **Publication and leases**: `splay.c` leases and GC, `block_store.c`
-   atomic streaming writer; crash and concurrent-reader tests. The PR states
-   that raw table publication does not change.
+   atomic streaming writer, `.publish.lock`; crash, concurrent-reader and
+   scan-during-write tests. The PR states its one raw change: staged
+   publications take `.publish.lock`.
 5. **Scan and select**: `block_scan.c`, `block_query.c`, scan builtins,
    partitions, zone maps, budgets, parallel decode and aggregates.
 6. **Writers and conversion**: CSV/Parquet block sinks, convert, `.db.block.set`,

@@ -27,13 +27,16 @@ static ray_err_t sync_file(const char* path) {
 }
 
 /* mkdir_p may have created several ancestors. Persist their directory entries
- * before publishing a durable generation, from the table root outward. */
-static ray_err_t sync_parents(const char* root) {
+ * before publishing a durable generation, from the table root outward up to
+ * the shallowest directory begin created; directories that existed before are
+ * not touched, so unreadable ancestors do not fail the write. */
+static ray_err_t sync_parents(const char* root, const char* created) {
     char path[1024];
     memcpy(path, root, strlen(root) + 1); /* write.root is bounded by this size. */
     for (;;) {
-        ray_err_t err = ray_file_sync_dir(path);
+        ray_err_t err = ray_file_sync_dir(path); /* syncs path's parent */
         if (err) return err;
+        if (!*created || !strcmp(path, created)) return RAY_OK;
         char* slash = strrchr(path, '/');
         if (!slash || slash == path) return RAY_OK;
         *slash = '\0';
@@ -336,7 +339,7 @@ ray_err_t ray_block_table_finish(ray_block_table_writer_t** writer) {
         if (!err && durable) {
             snprintf(path, sizeof(path), "%s/.lease", w->write.dir);
             err = sync_file(path);
-            if (!err) err = sync_parents(w->write.root);
+            if (!err) err = sync_parents(w->write.root, w->write.created);
         }
     }
     w->staged = false;
@@ -400,24 +403,31 @@ static bool convert_resolve(const char* path, char* out, size_t size) {
 #endif
 }
 
-static bool convert_canonical(const char* path, char* out, size_t size) {
+/* Missing components are appended unresolved. mkdir_p resolves ".." in them,
+ * so a ".." there could escape the comparison: refuse it. */
+static ray_err_t convert_canonical(const char* path, char* out, size_t size) {
     char buf[PATH_MAX], tail[PATH_MAX] = "", resolved[PATH_MAX];
     size_t len = strlen(path);
-    if (!len || len >= sizeof(buf)) return false;
+    if (!len || len >= sizeof(buf)) return RAY_ERR_RANGE;
     memcpy(buf, path, len + 1);
     while (len > 1 && buf[len - 1] == '/') buf[--len] = '\0';
     while (!convert_resolve(buf, resolved, sizeof(resolved))) {
+        if (!strcmp(buf, ".") || !strcmp(buf, "/")) return RAY_ERR_IO;
         char* slash = strrchr(buf, '/');
+        const char* part = slash ? slash + 1 : buf;
+        if (!strcmp(part, "..")) return RAY_ERR_DOMAIN;
         char next[PATH_MAX];
-        int n = snprintf(next, sizeof(next), "/%s%s", slash ? slash + 1 : buf, tail);
-        if (n < 0 || (size_t)n >= sizeof(next)) return false;
+        int n = *part && strcmp(part, ".") ?
+            snprintf(next, sizeof(next), "/%s%s", part, tail) :
+            snprintf(next, sizeof(next), "%s", tail);
+        if (n < 0 || (size_t)n >= sizeof(next)) return RAY_ERR_RANGE;
         memcpy(tail, next, (size_t)n + 1);
         if (!slash) strcpy(buf, ".");
         else if (slash == buf) strcpy(buf, "/");
         else *slash = '\0';
     }
     int n = snprintf(out, size, "%s%s", strcmp(resolved, "/") ? resolved : "", tail);
-    return n > 0 && (size_t)n < size;
+    return n > 0 && (size_t)n < size ? RAY_OK : RAY_ERR_RANGE;
 }
 
 static bool convert_nested(const char* a, const char* b) {
@@ -428,7 +438,9 @@ static bool convert_nested(const char* a, const char* b) {
 ray_err_t ray_block_store_paths_overlap(const char* a, const char* b, bool* overlap) {
     if (!a || !*a || !b || !*b || !overlap) return RAY_ERR_DOMAIN;
     char x[PATH_MAX + 256], y[PATH_MAX + 256];
-    if (!convert_canonical(a, x, sizeof(x)) || !convert_canonical(b, y, sizeof(y))) return RAY_ERR_RANGE;
+    ray_err_t err = convert_canonical(a, x, sizeof(x));
+    if (!err) err = convert_canonical(b, y, sizeof(y));
+    if (err) return err;
     *overlap = convert_nested(x, y) || convert_nested(y, x);
     return RAY_OK;
 }
@@ -438,12 +450,13 @@ ray_err_t ray_block_store_convert(const char* src, const ray_block_scan_source_t
                                   uint64_t* rows_out) {
     if (!src || !*src || !dest || !*dest || !options) return RAY_ERR_DOMAIN;
     char a[PATH_MAX + 256], b[PATH_MAX + 256];
-    if (!convert_canonical(src, a, sizeof(a)) || !convert_canonical(dest, b, sizeof(b)))
-        return RAY_ERR_RANGE;
+    ray_err_t err = convert_canonical(src, a, sizeof(a));
+    if (!err) err = convert_canonical(dest, b, sizeof(b));
+    if (err) return err;
     /* Publishing over a flat table retires its schema: never write into,
      * above or below the source. */
     if (convert_nested(a, b) || convert_nested(b, a)) return RAY_ERR_DOMAIN;
-    ray_err_t err = store_schema_options(options);
+    err = store_schema_options(options);
     if (err) return err;
     ray_block_scan_options_t read = {0, UINT64_MAX, RAY_BLOCK_CONVERT_BATCH_ROWS,
                                      RAY_BLOCK_CONVERT_BATCH_BYTES, RAY_BLOCK_CONVERT_BATCH_BYTES, 0};

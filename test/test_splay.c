@@ -2751,7 +2751,7 @@ static test_result_t test_generation_first_write_removed(void) {
 
     char listing[512];
     dir_listing(dir, listing, sizeof(listing));
-    TEST_ASSERT_STR_EQ(listing, ".current .generations .sym .sym.lk .write.lock");
+    TEST_ASSERT_STR_EQ(listing, ".current .generations .publish.lock .sym .sym.lk .write.lock");
     TEST_ASSERT_EQ_I(generation_dir_count(dir), 1);
     ray_t* loaded = ray_read_splayed(dir, sym);
     TEST_ASSERT_FALSE(RAY_IS_ERR(loaded));
@@ -2785,7 +2785,7 @@ static test_result_t test_generation_first_write_keeps_others(void) {
     TEST_ASSERT_EQ_I(ray_splay_save(two, dir, NULL), RAY_OK);
     char listing[512];
     dir_listing(dir, listing, sizeof(listing));
-    TEST_ASSERT_STR_EQ(listing, ".current .generations .write.lock 2026.10.05 notes");
+    TEST_ASSERT_STR_EQ(listing, ".current .generations .publish.lock .write.lock 2026.10.05 notes");
     TEST_ASSERT_EQ_I(access(TMP_SPLAY_BASE "/generation_shared_root/2026.10.05/t/keep", F_OK), 0);
     TEST_ASSERT_TRUE(generation_matches(dir, true, 2));
     ray_release(two);

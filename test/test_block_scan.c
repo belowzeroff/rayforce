@@ -244,6 +244,40 @@ static test_result_t auto_batch_rows(void) {
     PASS();
 }
 
+/* Raw STR columns are costed by their pooled bytes, so automatic batches of
+ * long strings stay within the payload limit. */
+static test_result_t auto_batch_raw_strings(void) {
+    const int64_t rows = 4000;
+    char text[201];
+    memset(text, 'q', 200); text[200] = '\0';
+    ray_t* s = ray_vec_new(RAY_STR, rows);
+    for (int64_t i = 0; i < rows; i++) {
+        text[0] = (char)('a' + i % 26);
+        s = ray_str_vec_append(s, text, 200);
+    }
+    ray_t* t = ray_table_new(1);
+    t = ray_table_add_col(t, ray_sym_intern("s", 1), s);
+    ray_release(s);
+    char flat[128];
+    snprintf(flat, sizeof(flat), "%s/flat", root);
+    TEST_ASSERT_EQ_I(ray_splay_save(t, flat, NULL), RAY_OK);
+    ray_release(t);
+    const char* const projection[] = {"s"};
+    ray_block_scan_options_t options = {0, UINT64_MAX, RAY_BLOCK_SCAN_AUTO_ROWS, 1u << 18, 4096, 0};
+    ray_block_scan_source_t source = {NULL, true};
+    TEST_ASSERT_EQ_I(ray_block_scan_open_source(flat, &source, projection, 1, &options, &scan), RAY_OK);
+    /* Half the payload over a 16-byte descriptor plus 200 pooled bytes. */
+    uint32_t batch = ray_block_scan_batch_rows(scan);
+    TEST_ASSERT_TRUE(batch <= (1u << 17) / 216 && batch >= (1u << 17) / 232);
+    int64_t seen = 0;
+    for (ray_t* b; (b = ray_block_scan_next(scan)); ray_release(b)) {
+        TEST_ASSERT_FALSE(RAY_IS_ERR(b));
+        seen += ray_table_nrows(b);
+    }
+    TEST_ASSERT_EQ_I(seen, rows);
+    PASS();
+}
+
 static void sleep_us(long us) {
     struct timespec ts = {us / 1000000, (us % 1000000) * 1000};
     nanosleep(&ts, NULL);
@@ -304,6 +338,17 @@ static test_result_t crash_publication(void) {
     /* Kill points sweep 0..150% of the slowest save: staging, sync,
      * publication and after it. */
     long window = save_us + save_us / 2 + 1;
+    /* A reader scans throughout, through kills inside rename and GC. */
+    fflush(stdout); fflush(stderr);
+    pid_t reader = fork();
+    TEST_ASSERT_TRUE(reader >= 0);
+    if (!reader) {
+        for (;;) {
+            int64_t e;
+            if (epoch_read(rows, &e)) _exit(1);
+            sleep_us(200);
+        }
+    }
     int64_t current = 1;
     int published = 0, kept = 0;
     /* A forked writer can run slower than the timed saves: widen the sweep
@@ -329,6 +374,14 @@ static test_result_t crash_publication(void) {
             current = epoch;
         }
     }
+    int reader_status = 0;
+    pid_t reader_done = waitpid(reader, &reader_status, WNOHANG);
+    if (!reader_done) {
+        kill(reader, SIGKILL);
+        TEST_ASSERT_EQ_I(waitpid(reader, &reader_status, 0), reader);
+    }
+    /* Still scanning when stopped: no read saw a partial generation. */
+    TEST_ASSERT_TRUE(WIFSIGNALED(reader_status));
     /* Both outcomes occurred, so kills landed on both sides of publication. */
     TEST_ASSERT_TRUE(published > 0 && kept > 0);
     /* A later writer succeeds over whatever the killed ones left. */
@@ -392,6 +445,43 @@ static test_result_t concurrent_readers(void) {
     int64_t epoch = 0;
     TEST_ASSERT_EQ_I(epoch_read(rows, &epoch), 0);
     TEST_ASSERT_EQ_I(epoch, 32);
+    PASS();
+}
+
+/* A writer holds .write.lock for its whole write; scans do not wait for it,
+ * in other processes or in its own. */
+static test_result_t scan_during_write(void) {
+    const int64_t rows = 3000;
+    ray_block_store_options_t store = {4096, 1, false};
+    ray_t* t = epoch_table(1, rows);
+    TEST_ASSERT_EQ_I(ray_block_store_save(t, root, &store), RAY_OK);
+    ray_release(t);
+    ray_splay_write_t write;
+    TEST_ASSERT_EQ_I(ray_splay_write_begin_staged(root, &write), RAY_OK);
+    fflush(stdout); fflush(stderr);
+    pid_t pid = fork();
+    TEST_ASSERT_TRUE(pid >= 0);
+    if (!pid) {
+        int64_t e = 0;
+        _exit(epoch_read(rows, &e) || e != 1 ? 1 : 0);
+    }
+    int status = 0;
+    pid_t done = 0;
+    for (int i = 0; i < 1000 && !(done = waitpid(pid, &status, WNOHANG)); i++) sleep_us(10000);
+    if (!done) { kill(pid, SIGKILL); (void)waitpid(pid, &status, 0); }
+    if (done == pid && WIFEXITED(status) && !WEXITSTATUS(status)) {
+        int64_t e = 0;
+        TEST_ASSERT_EQ_I(epoch_read(rows, &e), 0);
+        TEST_ASSERT_EQ_I(e, 1);
+    }
+    /* Abandoned: nothing is published. */
+    (void)ray_splay_write_finish(&write, RAY_ERR_IO, false);
+    TEST_ASSERT_EQ_I(done, pid);
+    TEST_ASSERT_TRUE(WIFEXITED(status));
+    TEST_ASSERT_EQ_I(WEXITSTATUS(status), 0);
+    int64_t e = 0;
+    TEST_ASSERT_EQ_I(epoch_read(rows, &e), 0);
+    TEST_ASSERT_EQ_I(e, 1);
     PASS();
 }
 
@@ -1713,7 +1803,9 @@ const test_entry_t block_scan_entries[] = {
     {"block_scan/shared_work_limit", shared_work_limit, setup, teardown},
     {"block_scan/crash_publication", crash_publication, setup, teardown},
     {"block_scan/concurrent_readers", concurrent_readers, setup, teardown},
+    {"block_scan/scan_during_write", scan_during_write, setup, teardown},
     {"block_scan/auto_batch_rows", auto_batch_rows, setup, teardown},
+    {"block_scan/auto_batch_raw_strings", auto_batch_raw_strings, setup, teardown},
     {"block_scan/flat_immutable", flat_immutable, setup, teardown},
     {"block_scan/query_budgets_and_errors", query_budgets_and_errors, setup, teardown},
     {"block_scan/query_late_materialization", query_late_materialization, setup, teardown},

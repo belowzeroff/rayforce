@@ -520,8 +520,12 @@ static bool predicates(ray_t* expr, ray_block_predicate_t* out, size_t* n, unsig
         const comparison_t* c = &comparisons[i];
         if (strcmp(op, c->name) || (ray_binary_fn)(uintptr_t)fn->i64 != c->fn) continue;
         const char* col = name(ray_list_get(expr, 1));
-        if (!col) return false;
-        out[(*n)++] = (ray_block_predicate_t){col, c->opcode, ray_list_get(expr, 2)};
+        ray_t* value = ray_list_get(expr, 2);
+        /* The query is unevaluated: an unquoted name is a column or variable
+         * reference, not the symbol it spells. */
+        if (!col || (value && value->type == -RAY_SYM && !(value->attrs & ATTR_QUOTED)))
+            return false;
+        out[(*n)++] = (ray_block_predicate_t){col, c->opcode, value};
         return true;
     }
     return false;

@@ -1152,7 +1152,9 @@ static test_result_t block_convert(void) {
     ray_release(expected); ray_release(actual);
     if (tr.status != TEST_PASS) return tr;
     /* Destinations overlapping the source are refused; the source is intact. */
-    const char* overlap[] = {"%s/raw/2024.01.01/t", "%s/raw/2024.01.01/t/sub", "%s/raw", "%s/raw/2024.01.01/t/"};
+    /* ".." among missing components would be resolved only by mkdir_p. */
+    const char* overlap[] = {"%s/raw/2024.01.01/t", "%s/raw/2024.01.01/t/sub", "%s/raw", "%s/raw/2024.01.01/t/",
+                             "%s/new/../raw/2024.01.01/t", "%s/raw/2024.01.01/missing/../t"};
     for (unsigned i = 0; i < sizeof(overlap) / sizeof(*overlap); i++) {
         char dest[256];
         snprintf(dest, sizeof(dest), overlap[i], root);
@@ -1161,6 +1163,8 @@ static test_result_t block_convert(void) {
         r = ray_eval_str(command);
         TEST_ASSERT_TRUE(RAY_IS_ERR(r)); TEST_ASSERT_STR_EQ(ray_err_code(r), "domain"); ray_release(r);
     }
+    snprintf(command, sizeof(command), "%s/new", root);
+    TEST_ASSERT_EQ_I(access(command, F_OK), -1);
     snprintf(command, sizeof(command), "%s/raw/2024.01.01/t/.d", root);
     TEST_ASSERT_EQ_I(access(command, F_OK), 0);
     snprintf(command, sizeof(command), "%s/raw/2024.01.01/t/.current", root);
@@ -1621,6 +1625,10 @@ static test_result_t symbol_and_float_queries(void) {
     }
     ray_t* r = parted_select(source, "where: (< sy 'beta) i: id");
     TEST_ASSERT_TRUE(RAY_IS_ERR(r)); ray_release(r);
+    /* An unquoted name is a reference, not the symbol it spells: refused,
+     * never compared with the symbol `alpha. */
+    r = parted_select(source, "where: (== sy alpha) i: id");
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r)); TEST_ASSERT_STR_EQ(ray_err_code(r), "nyi"); ray_release(r);
     /* Each compressed partition has its own dictionary. */
     parted_fixture("db", 0xf);
     char raw[256], block[256];

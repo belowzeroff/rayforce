@@ -64,9 +64,10 @@ ray_err_t ray_splay_resolve_dir(const char* dir, char* out, size_t out_sz);
 bool ray_splay_has_schema(const char* dir);
 
 /* Pin the current immutable staged generation against cooperating writers'
- * pruning. Acquire briefly takes the root shared writer lock; a held lease
- * never blocks publication. Requires existing .write.lock and generation
- * .lease files; legacy/uninstrumented generations return NYI. Read-only opens.
+ * pruning. Acquire briefly takes .publish.lock shared (creating it if
+ * needed), so it waits for a publication but never for a write in progress;
+ * a held lease never blocks publication. Requires existing .write.lock and
+ * generation .lease files; legacy/uninstrumented generations return NYI.
  * *out must start NULL. dir() is borrowed until release, which clears *lease.
  * Not protection against old writers, external deletion or in-place edits;
  * existing eager loaders do not acquire this lease automatically. */
