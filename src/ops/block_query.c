@@ -26,6 +26,7 @@ static ray_err_t parted_source_empty(block_parted_t* p, bool* empty);
 static bool parted_has_column(const block_parted_t* p, const char* name);
 static void parted_cancel(block_parted_t* p);
 static uint64_t parted_rows(const block_parted_t* p);
+static uint32_t parted_batch_rows(const block_parted_t* p);
 static void parted_stats(const block_parted_t* p, ray_block_query_stats_t* out);
 static ray_t* parted_next(ray_block_query_t* q);
 
@@ -166,6 +167,12 @@ ray_err_t ray_block_query_open_source(const char* root, const ray_block_scan_sou
 uint64_t ray_block_query_rows(const ray_block_query_t* q) {
     if (!q) return 0;
     return q->parted ? parted_rows(q->parted) : ray_block_scan_rows(q->scan);
+}
+
+uint32_t ray_block_query_batch_rows(const ray_block_query_t* q) {
+    if (!q) return 0;
+    if (q->parted) return parted_batch_rows(q->parted);
+    return ray_block_scan_batch_rows(q->scan);
 }
 
 ray_err_t ray_block_query_source_empty(ray_block_query_t* q, bool* empty) {
@@ -680,7 +687,7 @@ ray_err_t ray_block_query_open_parted(const char* root, const char* table, bool 
 
 static ray_err_t parted_reserve(block_parted_t* p) {
     if (!p->current) return RAY_OK;
-    size_t extra = (size_t)p->options.batch_rows;
+    size_t extra = (size_t)ray_block_query_batch_rows(p->current);
     if (p->row_bytes && extra > SIZE_MAX / p->row_bytes) return RAY_ERR_LIMIT;
     extra *= p->row_bytes;
     if (extra > SIZE_MAX - p->external_reserve) return RAY_ERR_LIMIT;
@@ -835,4 +842,8 @@ static ray_err_t parted_set_reserve(block_parted_t* p, size_t bytes) {
     ray_err_t err = parted_reserve(p);
     if (err) p->external_reserve = previous;
     return err;
+}
+
+static uint32_t parted_batch_rows(const block_parted_t* p) {
+    return p->current ? ray_block_query_batch_rows(p->current) : 0;
 }

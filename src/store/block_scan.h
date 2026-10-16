@@ -8,6 +8,11 @@
 #define RAY_BLOCK_SCAN_SCHEMA_MAX_BYTES (1024u * 1024u)
 
 typedef struct ray_block_scan_s ray_block_scan_t;
+/* batch_rows value asking open to size batches itself: half the payload
+ * limit (a quarter of a work limit) over the estimated row width of the
+ * projection, at most RAY_BLOCK_SCAN_AUTO_MAX rows. */
+#define RAY_BLOCK_SCAN_AUTO_ROWS UINT32_MAX
+#define RAY_BLOCK_SCAN_AUTO_MAX (1u << 20)
 typedef struct {
     uint64_t start, count; /* count == UINT64_MAX means through EOF */
     uint32_t batch_rows;  /* nonzero; a batch that exceeds a budget fails */
@@ -78,6 +83,8 @@ ray_t* ray_block_scan_names(const ray_block_scan_t* scan);
 /* Attributes persisted with a selected raw column (SORTED, HAS_NULLS); a
  * compressed column persists none. Batches never carry SORTED. */
 uint8_t ray_block_scan_column_attrs(const ray_block_scan_t* scan, size_t column);
+/* Rows per batch in effect, after RAY_BLOCK_SCAN_AUTO_ROWS is resolved. */
+uint32_t ray_block_scan_batch_rows(const ray_block_scan_t* scan);
 /* Configured row-range cardinality, before filtering; stable across next(). */
 uint64_t ray_block_scan_rows(const ray_block_scan_t* scan);
 /* Inspect the next batch range without reading payload or moving the cursor. */

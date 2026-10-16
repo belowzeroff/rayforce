@@ -40,6 +40,8 @@ struct ray_block_scan_s {
     bool failed, cancelled;
 };
 
+static uint32_t scan_auto_rows(const ray_block_scan_t* s);
+
 void ray_block_scan_close(ray_block_scan_t** scan) {
     if (!scan || !*scan) return;
     ray_block_scan_t* s = *scan;
@@ -280,6 +282,8 @@ ray_err_t ray_block_scan_open_source(const char* root, const ray_block_scan_sour
         }
     }
     free(all_names); free(all_list);
+    if (!err && s->options.batch_rows == RAY_BLOCK_SCAN_AUTO_ROWS)
+        s->options.batch_rows = scan_auto_rows(s);
     if (err) { ray_block_scan_close(&s); return err; }
     *out = s;
     return RAY_OK;
@@ -395,6 +399,35 @@ ray_err_t ray_block_scan_verify_column(const ray_block_scan_t* s, size_t column,
     free(scratch);
     if (!err) *checked = r->blocks;
     return err;
+}
+
+uint32_t ray_block_scan_batch_rows(const ray_block_scan_t* s) {
+    return s ? s->options.batch_rows : 0;
+}
+
+/* Logical bytes per output row: fixed widths, SYM as W64, STR as its
+ * descriptor plus the average decoded string of the column. */
+static uint32_t scan_auto_rows(const ray_block_scan_t* s) {
+    double width = 0;
+    for (size_t i = 0; i < s->count; i++) {
+        const scan_column_t* c = &s->columns[i];
+        int8_t type = scan_column_type(c);
+        if (type == RAY_SYM) width += 8;
+        else if (type != RAY_STR) width += ray_elem_size(type);
+        else if (c->raw) width += 32;
+        else {
+            const ray_col_block_reader_t* r = ray_col_block_file_reader(c->file);
+            ray_col_block_summary_t sum;
+            double avg = r->rows && !ray_col_block_summary(r, &sum) ?
+                (double)sum.decoded_bytes / (double)r->rows : 0;
+            width += 12 + avg;
+        }
+    }
+    size_t budget = s->options.payload_limit / 2;
+    if (s->options.work_limit && s->options.work_limit / 4 < budget) budget = s->options.work_limit / 4;
+    double rows = (double)budget / (width > 1 ? width : 1);
+    if (rows > RAY_BLOCK_SCAN_AUTO_MAX) rows = RAY_BLOCK_SCAN_AUTO_MAX;
+    return rows < 1 ? 1 : (uint32_t)rows;
 }
 
 uint8_t ray_block_scan_column_attrs(const ray_block_scan_t* s, size_t column) {

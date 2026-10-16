@@ -218,6 +218,28 @@ static test_result_t flat_immutable(void) {
     PASS();
 }
 
+static test_result_t auto_batch_rows(void) {
+    publish(1, 16, 16, 1);   /* x I64, y I32: 12 logical bytes per row */
+    ray_block_scan_options_t options = {0, UINT64_MAX, RAY_BLOCK_SCAN_AUTO_ROWS, 1u << 20, 4096, 0};
+    TEST_ASSERT_EQ_I(ray_block_scan_open(root, names, 2, &options, &scan), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_block_scan_batch_rows(scan), (1u << 19) / 12);
+    ray_t* batch = ray_block_scan_next(scan);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(batch)); TEST_ASSERT_EQ_I(ray_table_nrows(batch), 16);
+    ray_release(batch); ray_block_scan_close(&scan);
+    options.work_limit = 1200;   /* a quarter of the work limit is smaller */
+    TEST_ASSERT_EQ_I(ray_block_scan_open(root, names, 2, &options, &scan), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_block_scan_batch_rows(scan), 300 / 12);
+    ray_block_scan_close(&scan);
+    options.work_limit = 0; options.payload_limit = (size_t)1 << 40;
+    TEST_ASSERT_EQ_I(ray_block_scan_open(root, names, 2, &options, &scan), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_block_scan_batch_rows(scan), RAY_BLOCK_SCAN_AUTO_MAX);
+    ray_block_scan_close(&scan);
+    options.batch_rows = 7;      /* explicit sizes are kept */
+    TEST_ASSERT_EQ_I(ray_block_scan_open(root, names, 2, &options, &scan), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_block_scan_batch_rows(scan), 7);
+    PASS();
+}
+
 static test_result_t shared_work_limit(void) {
     publish(1, 16, 16, 1);
     int64_t baseline = mapped();
@@ -1534,6 +1556,7 @@ static test_result_t query_budgets_and_errors(void) {
 const test_entry_t block_scan_entries[] = {
     {"block_scan/mixed_raw_scan", mixed_raw_scan, setup, teardown},
     {"block_scan/shared_work_limit", shared_work_limit, setup, teardown},
+    {"block_scan/auto_batch_rows", auto_batch_rows, setup, teardown},
     {"block_scan/flat_immutable", flat_immutable, setup, teardown},
     {"block_scan/query_budgets_and_errors", query_budgets_and_errors, setup, teardown},
     {"block_scan/query_late_materialization", query_late_materialization, setup, teardown},
