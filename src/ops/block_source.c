@@ -661,9 +661,10 @@ static const aggregate_t* aggregate_kind(ray_t* expr) {
 static bool aggregate_type(uint16_t op, int8_t type) {
     if (op == OP_COUNT) return true;
     if (op == OP_SUM || op == OP_AVG)
-        return type == RAY_I16 || type == RAY_I32 || type == RAY_I64;
+        return type == RAY_I16 || type == RAY_I32 || type == RAY_I64 || type == RAY_F64;
     return type == RAY_BOOL || type == RAY_U8 || type == RAY_I16 || type == RAY_I32 ||
-        type == RAY_I64 || type == RAY_DATE || type == RAY_TIME || type == RAY_TIMESTAMP;
+        type == RAY_I64 || type == RAY_F64 || type == RAY_DATE || type == RAY_TIME ||
+        type == RAY_TIMESTAMP;
 }
 
 typedef struct {
@@ -837,7 +838,7 @@ static ray_t* aggregate_result(ray_block_query_t* cursor, const aggregate_t* con
         bool is_null = output_rows && k->finalize_value(states[a].state, ray_data(col));
         /* Some ordinary select paths lose the null hint on a wrapped sum at
          * INT64_MIN. Fail closed until that engine-wide contract is unified. */
-        if (is_null && kinds[a]->opcode == OP_SUM) {
+        if (is_null && kinds[a]->opcode == OP_SUM && k->out_type != RAY_F64) {
             ray_release(col); ray_release(result);
             result = ray_error("range", "block select: sum reached the reserved null sentinel"); break;
         }

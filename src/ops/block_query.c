@@ -67,9 +67,14 @@ static bool query_atom_admitted(const ray_t* v) {
     if (!v || RAY_IS_NULL(v)) return false;
     switch (v->type) {
     case -RAY_BOOL: case -RAY_U8: case -RAY_I16: case -RAY_I32:
-    case -RAY_I64: case -RAY_DATE: case -RAY_TIME: case -RAY_TIMESTAMP: return true;
+    case -RAY_I64: case -RAY_DATE: case -RAY_TIME: case -RAY_TIMESTAMP: case -RAY_SYM: return true;
     default: return false;
     }
+}
+
+/* Symbols compare for equality only: their order is no data order. */
+static bool query_pair_admitted(uint16_t op, const ray_t* v) {
+    return v->type != -RAY_SYM || op == OP_EQ || op == OP_NE;
 }
 
 static bool query_opcode_admitted(uint16_t op) {
@@ -106,6 +111,7 @@ ray_err_t ray_block_query_open_source(const char* root, const ray_block_scan_sou
         if (!query_name_safe(predicates[i].column)) return RAY_ERR_DOMAIN;
         if (!query_opcode_admitted(predicates[i].opcode)) return RAY_ERR_NYI;
         if (!query_atom_admitted(predicates[i].value)) return RAY_ERR_TYPE;
+        if (!query_pair_admitted(predicates[i].opcode, predicates[i].value)) return RAY_ERR_NYI;
     }
     ray_block_query_t* q = calloc(1, sizeof(*q));
     if (!q) return RAY_ERR_OOM;
@@ -547,6 +553,7 @@ ray_err_t ray_block_query_open_parted(const char* root, const char* table, bool 
         if (!query_name_safe(predicates[i].column)) return RAY_ERR_DOMAIN;
         if (!query_opcode_admitted(predicates[i].opcode)) return RAY_ERR_NYI;
         if (!query_atom_admitted(predicates[i].value)) return RAY_ERR_TYPE;
+        if (!query_pair_admitted(predicates[i].opcode, predicates[i].value)) return RAY_ERR_NYI;
     }
     block_parted_t* p = calloc(1, sizeof(*p));
     ray_block_query_t* q = calloc(1, sizeof(*q));

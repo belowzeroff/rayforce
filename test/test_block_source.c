@@ -1581,7 +1581,67 @@ static test_result_t splayed_integration(void) {
     PASS();
 }
 
+/* Symbol equality filters and float aggregates match native select. */
+static test_result_t symbol_and_float_queries(void) {
+    const int64_t rows = 3000;
+    ray_t* id = ray_vec_new(RAY_I64, rows);
+    ray_t* f = ray_vec_new(RAY_F64, rows);
+    ray_t* sy = ray_sym_vec_new(RAY_SYM_W64, rows);
+    const char* names[] = {"alpha", "beta", "gamma"};
+    for (int64_t i = 0; i < rows; i++) {
+        ((int64_t*)ray_data(id))[i] = i;
+        ((double*)ray_data(f))[i] = (double)(i % 101) * 0.25 - 7.5;
+        ((int64_t*)ray_data(sy))[i] = ray_sym_intern(names[i % 3], strlen(names[i % 3]));
+    }
+    id->len = f->len = sy->len = rows;
+    ray_t* t = ray_table_new(3);
+    t = ray_table_add_col(t, ray_sym_intern("id", 2), id);
+    t = ray_table_add_col(t, ray_sym_intern("f", 1), f);
+    t = ray_table_add_col(t, ray_sym_intern("sy", 2), sy);
+    ray_release(id); ray_release(f); ray_release(sy);
+    ray_block_store_options_t store = {512, 1, false};
+    TEST_ASSERT_EQ_I(ray_block_store_save(t, root, &store), RAY_OK);
+    if (ray_env_set(ray_sym_intern("raw", 3), t)) ray_test_fatal("bind raw");
+    ray_release(t);
+    char source[256];
+    snprintf(source, sizeof(source), "(.db.block.scan \"%s\" 100000000 {batch-rows: 700})", root);
+    const char* clauses[] = {
+        "where: (== sy 'alpha) i: id v: f",
+        "where: (and (!= sy 'beta) (> id 100)) i: id k: sy",
+        "where: (== sy 'missing) i: id",
+        "where: (!= sy 'gamma) n: (count id) s: (sum f) a: (avg f) lo: (min f) hi: (max f)",
+        "s: (sum f) a: (avg f) lo: (min f) hi: (max f)"
+    };
+    for (unsigned c = 0; c < sizeof(clauses) / sizeof(*clauses); c++) {
+        ray_t* expected = parted_select("raw", clauses[c]);
+        ray_t* actual = parted_select(source, clauses[c]);
+        test_result_t r = tables_equal(actual, expected);
+        ray_release(expected); ray_release(actual);
+        if (r.status != TEST_PASS) return r;
+    }
+    ray_t* r = parted_select(source, "where: (< sy 'beta) i: id");
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r)); ray_release(r);
+    /* Each compressed partition has its own dictionary. */
+    parted_fixture("db", 0xf);
+    char raw[256], block[256];
+    snprintf(raw, sizeof(raw), "(.db.parted.get \"%s/db\" (quote t))", root);
+    snprintf(block, sizeof(block), "(.db.block.parted \"%s/db\" (quote t) 100000000)", root);
+    const char* parted[] = {"where: (== sy 'common) d: date i: id", "where: (== sy 'p2_3) i: id k: sy",
+                            "where: (!= sy 'common) n: (count id)"};
+    snprintf(raw, sizeof(raw), "(.db.parted.get \"%s/rawdb\" (quote t))", root);
+    parted_fixture("rawdb", 0);
+    for (unsigned c = 0; c < 3; c++) {
+        ray_t* expected = parted_select(raw, parted[c]);
+        ray_t* actual = parted_select(block, parted[c]);
+        test_result_t res = tables_equal(actual, expected);
+        ray_release(expected); ray_release(actual);
+        if (res.status != TEST_PASS) return res;
+    }
+    PASS();
+}
+
 const test_entry_t block_source_entries[] = {
+    {"block_source/symbol_and_float_queries", symbol_and_float_queries, setup, teardown},
     {"block_source/splayed_integration", splayed_integration, setup, teardown},
     {"block_source/block_defaults", block_defaults, setup, teardown},
     {"block_source/block_convert_parted", block_convert_parted, setup, teardown},
