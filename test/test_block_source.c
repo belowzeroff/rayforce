@@ -1212,7 +1212,97 @@ static test_result_t block_convert(void) {
     PASS();
 }
 
+static int64_t storage_cell(ray_t* table, const char* field, int64_t row) {
+    ray_t* col = ray_table_get_col(table, ray_sym_intern(field, strlen(field)));
+    return col ? ((int64_t*)ray_data(col))[row] : -1;
+}
+
+static bool storage_sym(ray_t* table, const char* field, int64_t row, const char* expected) {
+    ray_t* col = ray_table_get_col(table, ray_sym_intern(field, strlen(field)));
+    ray_t* s = col ? ray_sym_vec_cell(col, row) : NULL;
+    return s && ray_str_len(s) == strlen(expected) && !memcmp(ray_str_ptr(s), expected, ray_str_len(s));
+}
+
+static test_result_t storage_info_verify(void) {
+    fixture(4103, false);   /* id x s sy, 256-byte Snappy blocks */
+    make_column_raw("x");
+    char command[512];
+    snprintf(command, sizeof(command), "(.db.storage.info \"%s\")", root);
+    ray_t* info = ray_eval_str(command);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(info));
+    TEST_ASSERT_EQ_I(ray_table_nrows(info), 4); TEST_ASSERT_EQ_I(ray_table_ncols(info), 10);
+    TEST_ASSERT_TRUE(storage_sym(info, "column", 0, "id"));
+    TEST_ASSERT_TRUE(storage_sym(info, "format", 0, "block"));
+    TEST_ASSERT_TRUE(storage_sym(info, "codec", 0, "snappy"));
+    TEST_ASSERT_TRUE(storage_sym(info, "type", 0, "I64"));
+    TEST_ASSERT_EQ_I(storage_cell(info, "rows", 0), 4103);
+    TEST_ASSERT_EQ_I(storage_cell(info, "blocks", 0), (4103 + 31) / 32);
+    TEST_ASSERT_EQ_I(storage_cell(info, "block_bytes", 0), 256);
+    TEST_ASSERT_EQ_I(storage_cell(info, "logical", 0), 4103 * 8);
+    TEST_ASSERT_TRUE(storage_sym(info, "format", 1, "raw"));
+    TEST_ASSERT_TRUE(storage_sym(info, "codec", 1, "none"));
+    TEST_ASSERT_EQ_I(storage_cell(info, "blocks", 1), 0);
+    TEST_ASSERT_TRUE(storage_cell(info, "stored", 1) >= 4103 * 8);
+    double ratio = ((double*)ray_data(ray_table_get_col(info, ray_sym_intern("ratio", 5))))[0];
+    TEST_ASSERT_TRUE(ratio > 1.0); /* sequential ids compress */
+    ray_release(info);
+
+    snprintf(command, sizeof(command), "(.db.storage.verify \"%s\")", root);
+    ray_t* verify = ray_eval_str(command);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(verify));
+    TEST_ASSERT_EQ_I(storage_cell(verify, "blocks", 0), (4103 + 31) / 32);
+    TEST_ASSERT_EQ_I(storage_cell(verify, "blocks", 1), 0);
+    ray_release(verify);
+
+    /* A payload byte flip passes metadata checks; only verify reports it. */
+    char dir[1024], path[1100];
+    TEST_ASSERT_EQ_I(ray_splay_resolve_dir(root, dir, sizeof(dir)), RAY_OK);
+    snprintf(path, sizeof(path), "%s/id", dir);
+    FILE* f = fopen(path, "r+b"); TEST_ASSERT_NOT_NULL(f);
+    TEST_ASSERT_EQ_I(fseek(f, RAY_COL_BLOCK_HEADER + 3, SEEK_SET), 0);
+    int b = fgetc(f); TEST_ASSERT_TRUE(b != EOF);
+    TEST_ASSERT_EQ_I(fseek(f, RAY_COL_BLOCK_HEADER + 3, SEEK_SET), 0);
+    TEST_ASSERT_TRUE(fputc(b ^ 0x10, f) != EOF); TEST_ASSERT_EQ_I(fclose(f), 0);
+    snprintf(command, sizeof(command), "(.db.storage.info \"%s\")", root);
+    info = ray_eval_str(command);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(info)); ray_release(info);
+    snprintf(command, sizeof(command), "(.db.storage.verify \"%s\")", root);
+    verify = ray_eval_str(command);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(verify)); TEST_ASSERT_STR_EQ(ray_err_code(verify), "corrupt");
+    ray_release(verify);
+
+    /* Flat raw tables need immutable; unknown options and restricted fail. */
+    ray_t* t = parted_table(1, 20, RAY_I64);
+    char flat[256], sym[256];
+    snprintf(flat, sizeof(flat), "%s/flat", root);
+    snprintf(sym, sizeof(sym), "%s/flat/.sym", root);
+    TEST_ASSERT_EQ_I(ray_splay_save(t, flat, sym), RAY_OK); ray_release(t);
+    snprintf(command, sizeof(command), "(.db.storage.info \"%s\")", flat);
+    info = ray_eval_str(command);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(info)); TEST_ASSERT_STR_EQ(ray_err_code(info), "nyi"); ray_release(info);
+    snprintf(command, sizeof(command), "(.db.storage.info \"%s\" {immutable: true})", flat);
+    info = ray_eval_str(command);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(info)); TEST_ASSERT_EQ_I(ray_table_nrows(info), 4);
+    TEST_ASSERT_TRUE(storage_sym(info, "format", 2, "raw"));
+    TEST_ASSERT_TRUE(storage_sym(info, "type", 2, "SYM"));
+    ray_release(info);
+    const char* invalid[] = {"(.db.storage.info)", "(.db.storage.info \"\")",
+                             "(.db.storage.info \"%s\" {other: 1})", "(.db.storage.verify \"%s\" 1)"};
+    for (unsigned i = 0; i < sizeof(invalid) / sizeof(*invalid); i++) {
+        snprintf(command, sizeof(command), invalid[i], flat);
+        ray_t* r = ray_eval_str(command);
+        TEST_ASSERT_TRUE(RAY_IS_ERR(r)); ray_release(r);
+    }
+    ray_eval_set_restricted(true);
+    snprintf(command, sizeof(command), "(.db.storage.verify \"%s\" {immutable: true})", flat);
+    ray_t* r = ray_eval_str(command);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r)); TEST_ASSERT_STR_EQ(ray_err_code(r), "access"); ray_release(r);
+    ray_eval_set_restricted(false);
+    PASS();
+}
+
 const test_entry_t block_source_entries[] = {
+    {"block_source/storage_info_verify", storage_info_verify, setup, teardown},
     {"block_source/block_convert", block_convert, setup, teardown},
     {"block_source/csv_block", csv_block, setup, teardown},
     {"block_source/parquet_block", parquet_block, setup, teardown},
