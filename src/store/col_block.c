@@ -419,8 +419,11 @@ ray_err_t ray_col_block_append(ray_col_block_writer_t* w, const void* values, ui
         return w->error = RAY_ERR_RANGE;
     const uint8_t* p = values;
     if (w->type == RAY_SYM) {
-        for (uint64_t i = 0; i < rows; i++)
-            if (get_le(p + i * 8, 8) >= w->sym_count) return w->error = RAY_ERR_CORRUPT;
+        for (uint64_t i = 0; i < rows; i++) {
+            uint64_t position = get_le(p + i * 8, 8);
+            if (position >= w->sym_count) return w->error = RAY_ERR_CORRUPT;
+            if (position >= w->sym_used) w->sym_used = position + 1;
+        }
     }
     while (rows) {
         uint64_t count = rows < w->block_bytes / esz ? rows : w->block_bytes / esz;
@@ -429,6 +432,17 @@ ray_err_t ray_col_block_append(ray_col_block_writer_t* w, const void* values, ui
         if (err) return err;
         p += bytes; rows -= count;
     }
+    return RAY_OK;
+}
+
+ray_err_t ray_col_block_set_sym(ray_col_block_writer_t* w, uint64_t sym_count,
+                                uint32_t sym_crc) {
+    if (!w || !w->output) return RAY_ERR_DOMAIN;
+    if (w->error) return w->error;
+    if (w->type != RAY_SYM) return w->error = RAY_ERR_TYPE;
+    if (!sym_count || sym_count > INT64_MAX) return w->error = RAY_ERR_RANGE;
+    if (sym_count < w->sym_used) return w->error = RAY_ERR_CORRUPT;
+    w->sym_count = sym_count; w->sym_crc = sym_crc;
     return RAY_OK;
 }
 

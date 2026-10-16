@@ -130,6 +130,7 @@ typedef struct {
     ray_err_t error;
     uint64_t sym_count;
     uint32_t sym_crc;
+    uint64_t sym_used; /* one past the largest SYM position appended */
 } ray_col_block_writer_t;
 
 /* output must be a new, empty, seekable binary file. Caller owns output and
@@ -151,6 +152,11 @@ ray_err_t ray_col_block_begin_sym(ray_col_block_writer_t* writer, FILE* output,
                                   uint32_t sym_crc);
 ray_err_t ray_col_block_append(ray_col_block_writer_t* writer,
                                const void* values, uint64_t rows);
+/* SYM only, before finish: replace the dictionary identity given to begin_sym,
+ * for a writer that streams positions while its dictionary still grows (begin
+ * with the INT64_MAX bound). Every appended position must fall below count. */
+ray_err_t ray_col_block_set_sym(ray_col_block_writer_t* writer,
+                                uint64_t sym_count, uint32_t sym_crc);
 /* Append one pre-encoded STR block. Validates lengths and exact consumption;
  * encoded_size <= block_bytes. Each string stays in a single block. */
 ray_err_t ray_col_block_append_str(ray_col_block_writer_t* writer,

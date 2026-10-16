@@ -26,4 +26,22 @@ typedef struct {
  * Requires runtime heap/symbol table. Caller owns the input table. */
 ray_err_t ray_block_store_save(ray_t* table, const char* root,
                                const ray_block_store_options_t* options);
+/* Streaming variant of the same format and publication. begin stages a new
+ * generation of root for the columns, names and types of schema_table (its
+ * rows are ignored); append writes a chunk with exactly that schema, in any
+ * number of calls; finish seals the generation dictionary and publishes.
+ * Output does not depend on how rows are chunked: each column carries one
+ * partial block between appends. Memory per column is one block buffer plus
+ * the codec workspace; SYM vocabulary grows with distinct symbols, capped as
+ * for save. Validation is per chunk, after staging: a failed append makes the
+ * writer terminal, and abort (or a failed finish) discards the generation and
+ * leaves the previous one published. One thread at a time. */
+typedef struct ray_block_table_writer_s ray_block_table_writer_t;
+ray_err_t ray_block_table_begin(const char* root, ray_t* schema_table,
+                                const ray_block_store_options_t* options,
+                                ray_block_table_writer_t** out);
+ray_err_t ray_block_table_append(ray_block_table_writer_t* writer, ray_t* chunk);
+/* Always releases the writer and clears *writer. */
+ray_err_t ray_block_table_finish(ray_block_table_writer_t** writer);
+void ray_block_table_abort(ray_block_table_writer_t** writer);
 #endif

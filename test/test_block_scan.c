@@ -663,6 +663,161 @@ static test_result_t store_roundtrip(void) {
     PASS();
 }
 
+/* Rows [lo, hi) of a BOOL/I64/STR/SYM table, as fresh runtime vectors. */
+static ray_t* stream_slice(ray_t* table, int64_t lo, int64_t hi) {
+    ray_t* out = ray_table_new(ray_table_ncols(table));
+    for (int64_t c = 0; c < ray_table_ncols(table); c++) {
+        ray_t* src = ray_table_get_col_idx(table, c);
+        ray_t* col;
+        if (src->type == RAY_STR) {
+            col = ray_vec_new(RAY_STR, hi - lo);
+            for (int64_t i = lo; i < hi; i++) {
+                size_t n; const char* s = ray_str_vec_get(src, i, &n);
+                col = ray_str_vec_append(col, s, n);
+            }
+        } else {
+            size_t w = ray_type_sizes[(uint8_t)src->type];
+            col = src->type == RAY_SYM ? ray_sym_vec_new(RAY_SYM_W64, hi - lo) :
+                ray_vec_new(src->type, hi - lo);
+            memcpy(ray_data(col), (const char*)ray_data(src) + lo * w, (size_t)(hi - lo) * w);
+            col->len = hi - lo;
+        }
+        out = ray_table_add_col(out, ray_table_col_name(table, c), col);
+        ray_release(col);
+    }
+    return out;
+}
+
+static ray_t* stream_table(int64_t rows) {
+    ray_t* b = ray_vec_new(RAY_BOOL, rows);
+    ray_t* a = ray_vec_new(RAY_I64, rows);
+    ray_t* k = ray_sym_vec_new(RAY_SYM_W64, rows);
+    ray_t* s = ray_vec_new(RAY_STR, rows);
+    char text[64];
+    for (int64_t i = 0; i < rows; i++) {
+        ((uint8_t*)ray_data(b))[i] = (uint8_t)(i % 3 == 0);
+        ((int64_t*)ray_data(a))[i] = i * 7 - 50;
+        int n = snprintf(text, sizeof(text), "k%lld", (long long)(i % 13));
+        ((int64_t*)ray_data(k))[i] = i % 11 ? ray_sym_intern(text, (size_t)n) : 0;
+        n = snprintf(text, sizeof(text), "%.*s", (int)(i % 40), "a string of varying length, up to forty");
+        s = ray_str_vec_append(s, text, (size_t)n);
+    }
+    b->len = a->len = k->len = rows;
+    const char* const cols[] = {"b", "a", "k", "s"};
+    ray_t* vecs[] = {b, a, k, s};
+    ray_t* t = ray_table_new(4);
+    for (unsigned c = 0; c < 4; c++) {
+        t = ray_table_add_col(t, ray_sym_intern(cols[c], 1), vecs[c]);
+        ray_release(vecs[c]);
+    }
+    return t;
+}
+
+static uint64_t stream_blocks(const char* target, const char* column) {
+    char dir[1024], path[1100];
+    if (ray_splay_resolve_dir(target, dir, sizeof(dir))) return 0;
+    snprintf(path, sizeof(path), "%s/%s", dir, column);
+    ray_col_block_file_t* file = NULL;
+    if (ray_col_block_file_open(path, &file)) return 0;
+    uint64_t blocks = ray_col_block_file_reader(file)->blocks;
+    ray_col_block_file_close(&file);
+    return blocks;
+}
+
+static test_result_t store_stream_chunks(void) {
+    const int64_t rows = 1000;
+    ray_t* table = stream_table(rows);
+    char one[128], two[128];
+    snprintf(one, sizeof(one), "%s/one", root);
+    snprintf(two, sizeof(two), "%s/two", root);
+    ray_block_store_options_t options = {96, 1, false};
+    TEST_ASSERT_EQ_I(ray_block_store_save(table, one, &options), RAY_OK);
+    ray_block_table_writer_t* w = NULL;
+    TEST_ASSERT_EQ_I(ray_block_table_begin(two, table, &options, &w), RAY_OK);
+    const int64_t sizes[] = {1, 7, 64, 333, 0};
+    for (int64_t lo = 0, i = 0; lo < rows; i++) {
+        int64_t hi = lo + sizes[i % 5];
+        if (hi > rows) hi = rows;
+        ray_t* chunk = stream_slice(table, lo, hi);
+        TEST_ASSERT_EQ_I(ray_block_table_append(w, chunk), RAY_OK);
+        ray_release(chunk);
+        lo = hi;
+    }
+    TEST_ASSERT_EQ_I(ray_block_table_finish(&w), RAY_OK);
+    TEST_ASSERT_TRUE(w == NULL);
+    const char* const cols[] = {"b", "a", "k", "s"};
+    for (unsigned c = 0; c < 4; c++)
+        TEST_ASSERT_EQ_I(stream_blocks(two, cols[c]), stream_blocks(one, cols[c]));
+    ray_block_scan_options_t read = {0, UINT64_MAX, 4096, 1u << 20, 1u << 20, 0};
+    ray_block_scan_t* other = NULL;
+    TEST_ASSERT_EQ_I(ray_block_scan_open(one, cols, 4, &read, &scan), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_block_scan_open(two, cols, 4, &read, &other), RAY_OK);
+    ray_t* x = ray_block_scan_next(scan);
+    ray_t* y = ray_block_scan_next(other);
+    ray_block_scan_close(&scan); ray_block_scan_close(&other);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(x)); TEST_ASSERT_FALSE(RAY_IS_ERR(y));
+    TEST_ASSERT_EQ_I(ray_table_nrows(x), rows); TEST_ASSERT_EQ_I(ray_table_nrows(y), rows);
+    for (unsigned c = 0; c < 4; c++) {
+        ray_t* p = ray_table_get_col_idx(x, c); ray_t* q = ray_table_get_col_idx(y, c);
+        ray_t* e = ray_table_get_col_idx(table, c);
+        for (int64_t i = 0; i < rows; i++) {
+            if (e->type == RAY_STR) {
+                size_t n1, n2, n3;
+                const char* s1 = ray_str_vec_get(p, i, &n1);
+                const char* s2 = ray_str_vec_get(q, i, &n2);
+                const char* s3 = ray_str_vec_get(e, i, &n3);
+                TEST_ASSERT_TRUE(n1 == n3 && n2 == n3 && (!n3 || (!memcmp(s1, s3, n3) && !memcmp(s2, s3, n3))));
+            } else if (e->type == RAY_SYM) {
+                ray_t* s1 = ray_sym_vec_cell(p, i); ray_t* s2 = ray_sym_vec_cell(q, i);
+                ray_t* s3 = ray_sym_vec_cell(e, i);
+                TEST_ASSERT_EQ_I(ray_str_len(s1), ray_str_len(s3));
+                TEST_ASSERT_EQ_I(ray_str_len(s2), ray_str_len(s3));
+                TEST_ASSERT_TRUE(!memcmp(ray_str_ptr(s1), ray_str_ptr(s3), ray_str_len(s3)));
+                TEST_ASSERT_TRUE(!memcmp(ray_str_ptr(s2), ray_str_ptr(s3), ray_str_len(s3)));
+            } else {
+                size_t sz = ray_type_sizes[(uint8_t)e->type];
+                TEST_ASSERT_TRUE(!memcmp((char*)ray_data(p) + i * sz, (char*)ray_data(e) + i * sz, sz));
+                TEST_ASSERT_TRUE(!memcmp((char*)ray_data(q) + i * sz, (char*)ray_data(e) + i * sz, sz));
+            }
+        }
+    }
+    ray_release(x); ray_release(y);
+
+    /* A failed chunk is terminal and the published generation survives. */
+    char before[1024], after[1024];
+    TEST_ASSERT_EQ_I(ray_splay_resolve_dir(two, before, sizeof(before)), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_block_table_begin(two, table, &options, &w), RAY_OK);
+    ray_t* chunk = stream_slice(table, 0, 10);
+    TEST_ASSERT_EQ_I(ray_block_table_append(w, chunk), RAY_OK);
+    ray_t* wrong = ray_table_new(1);
+    wrong = ray_table_add_col(wrong, ray_sym_intern("b", 1), ray_table_get_col_idx(chunk, 0));
+    TEST_ASSERT_EQ_I(ray_block_table_append(w, wrong), RAY_ERR_SCHEMA);
+    TEST_ASSERT_EQ_I(ray_block_table_append(w, chunk), RAY_ERR_DOMAIN);
+    TEST_ASSERT_EQ_I(ray_block_table_finish(&w), RAY_ERR_DOMAIN);
+    TEST_ASSERT_TRUE(w == NULL);
+    ray_release(wrong);
+    TEST_ASSERT_EQ_I(ray_splay_resolve_dir(two, after, sizeof(after)), RAY_OK);
+    TEST_ASSERT_STR_EQ(after, before);
+    /* An oversize string fails the append, abort keeps the old generation. */
+    ray_block_store_options_t small = {16, 0, false};
+    ray_t* long_strings = stream_slice(table, 0, 20); /* lengths up to 19 > 16 - 4 */
+    TEST_ASSERT_EQ_I(ray_block_table_begin(two, table, &small, &w), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_block_table_append(w, long_strings), RAY_ERR_RANGE);
+    ray_release(long_strings);
+    ray_block_table_abort(&w);
+    TEST_ASSERT_TRUE(w == NULL);
+    TEST_ASSERT_EQ_I(ray_splay_resolve_dir(two, after, sizeof(after)), RAY_OK);
+    TEST_ASSERT_STR_EQ(after, before);
+    /* No appends: an empty table with the schema. */
+    TEST_ASSERT_EQ_I(ray_block_table_begin(two, chunk, &options, &w), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_block_table_finish(&w), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_block_scan_open(two, cols, 4, &read, &scan), RAY_OK);
+    TEST_ASSERT_TRUE(ray_block_scan_next(scan) == NULL);
+    ray_block_scan_close(&scan);
+    ray_release(chunk); ray_release(table);
+    PASS();
+}
+
 static test_result_t store_preflight(void) {
     char target[128]; snprintf(target, sizeof(target), "%s/preflight", root);
     ray_block_store_options_t options = {64, 1, false};
@@ -1364,6 +1519,7 @@ const test_entry_t block_scan_entries[] = {
     {"block_scan/schema_corruption", schema_corruption, setup, teardown},
     {"block_scan/schema_limits", schema_limits, setup, teardown},
     {"block_scan/store_roundtrip", store_roundtrip, setup, teardown},
+    {"block_scan/store_stream_chunks", store_stream_chunks, setup, teardown},
     {"block_scan/store_preflight", store_preflight, setup, teardown},
     {"block_scan/store_rollback", store_rollback, setup, teardown},
     {NULL, NULL, NULL, NULL},
