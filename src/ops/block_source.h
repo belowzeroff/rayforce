@@ -52,7 +52,9 @@ ray_t* ray_block_convert_fn(ray_t** args, int64_t n);
  * of compressed columns, checking both CRCs, string framing and symbol bounds;
  * returns blocks checked per column (0 for raw columns, which have no
  * checksums) or a corrupt error naming the column and block. Both pin one
- * generation; read options as for .db.block.convert. */
+ * generation; read options as for .db.block.convert. With root 'table they
+ * cover every partition <root>/<p>/<table> (raw SYM defaulting to <root>/.sym)
+ * and add a leading partition column; errors also name the partition. */
 ray_t* ray_storage_info_fn(ray_t** args, int64_t n);
 ray_t* ray_storage_verify_fn(ray_t** args, int64_t n);
 /* NULL means not our descriptor; otherwise owned final result/error. */

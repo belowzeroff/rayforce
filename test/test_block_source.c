@@ -1354,7 +1354,58 @@ static test_result_t parallel_decode(void) {
     PASS();
 }
 
+static test_result_t storage_parted(void) {
+    parted_fixture("mix", 0x6); /* 01 and 04 flat raw, 02 and 03 compressed */
+    char command[512];
+    snprintf(command, sizeof(command), "(.db.storage.info \"%s/mix\" (quote t) {immutable: true})", root);
+    ray_t* info = ray_eval_str(command);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(info));
+    TEST_ASSERT_EQ_I(ray_table_nrows(info), 16); TEST_ASSERT_EQ_I(ray_table_ncols(info), 11);
+    TEST_ASSERT_TRUE(storage_sym(info, "partition", 0, "2024.01.01"));
+    TEST_ASSERT_TRUE(storage_sym(info, "format", 0, "raw"));
+    TEST_ASSERT_TRUE(storage_sym(info, "partition", 4, "2024.01.02"));
+    TEST_ASSERT_TRUE(storage_sym(info, "format", 4, "block"));
+    TEST_ASSERT_TRUE(storage_sym(info, "column", 4, "id"));
+    TEST_ASSERT_EQ_I(storage_cell(info, "rows", 4), 397);
+    TEST_ASSERT_TRUE(storage_sym(info, "type", 6, "SYM"));
+    ray_release(info);
+    snprintf(command, sizeof(command), "(.db.storage.verify \"%s/mix\" (quote t) {immutable: true})", root);
+    ray_t* verify = ray_eval_str(command);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(verify)); TEST_ASSERT_EQ_I(ray_table_nrows(verify), 16);
+    TEST_ASSERT_EQ_I(storage_cell(verify, "blocks", 0), 0);
+    TEST_ASSERT_TRUE(storage_cell(verify, "blocks", 4) > 0);
+    ray_release(verify);
+    /* Flat partitions need immutable; a damaged block names its partition. */
+    snprintf(command, sizeof(command), "(.db.storage.verify \"%s/mix\" (quote t))", root);
+    verify = ray_eval_str(command);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(verify)); TEST_ASSERT_STR_EQ(ray_err_code(verify), "nyi"); ray_release(verify);
+    char table[256], dir[1024], path[1100];
+    snprintf(table, sizeof(table), "%s/mix/2024.01.03/t", root);
+    TEST_ASSERT_EQ_I(ray_splay_resolve_dir(table, dir, sizeof(dir)), RAY_OK);
+    snprintf(path, sizeof(path), "%s/x", dir);
+    FILE* f = fopen(path, "r+b"); TEST_ASSERT_NOT_NULL(f);
+    TEST_ASSERT_EQ_I(fseek(f, RAY_COL_BLOCK_HEADER + 2, SEEK_SET), 0);
+    int b = fgetc(f); TEST_ASSERT_TRUE(b != EOF);
+    TEST_ASSERT_EQ_I(fseek(f, RAY_COL_BLOCK_HEADER + 2, SEEK_SET), 0);
+    TEST_ASSERT_TRUE(fputc(b ^ 0x20, f) != EOF); TEST_ASSERT_EQ_I(fclose(f), 0);
+    snprintf(command, sizeof(command), "(.db.storage.verify \"%s/mix\" (quote t) {immutable: true})", root);
+    verify = ray_eval_str(command);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(verify)); TEST_ASSERT_STR_EQ(ray_err_code(verify), "corrupt"); ray_release(verify);
+    snprintf(command, sizeof(command), "(.db.storage.info \"%s/mix\" (quote t) {immutable: true})", root);
+    info = ray_eval_str(command);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(info)); ray_release(info);
+    const char* invalid[] = {"(.db.storage.info \"%s/mix\" (quote .t))", "(.db.storage.info \"%s/none\" (quote t))",
+                             "(.db.storage.info \"%s/mix\" (quote t) {immutable: true} 1)"};
+    for (unsigned i = 0; i < sizeof(invalid) / sizeof(*invalid); i++) {
+        snprintf(command, sizeof(command), invalid[i], root);
+        ray_t* r = ray_eval_str(command);
+        TEST_ASSERT_TRUE(RAY_IS_ERR(r)); ray_release(r);
+    }
+    PASS();
+}
+
 const test_entry_t block_source_entries[] = {
+    {"block_source/storage_parted", storage_parted, setup, teardown},
     {"block_source/parallel_decode", parallel_decode, setup, teardown},
     {"block_source/storage_info_verify", storage_info_verify, setup, teardown},
     {"block_source/block_convert", block_convert, setup, teardown},
