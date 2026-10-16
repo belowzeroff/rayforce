@@ -13,6 +13,11 @@ typedef struct {
     size_t payload_limit, scratch_limit;
     size_t work_limit; /* 0 disables the combined logical-work cap */
 } ray_block_scan_options_t;
+/* Where a root's data lives, beyond its own generation. */
+typedef struct {
+    const char* sym_path; /* symfile for raw SYM columns, e.g. a parted root's */
+    bool immutable;       /* admit a flat root without generations or a reader lease */
+} ray_block_scan_source_t;
 typedef enum {
     RAY_BLOCK_SCAN_EQ, RAY_BLOCK_SCAN_NE, RAY_BLOCK_SCAN_LT,
     RAY_BLOCK_SCAN_LE, RAY_BLOCK_SCAN_GT, RAY_BLOCK_SCAN_GE
@@ -29,6 +34,12 @@ typedef enum {
  * SYM uses the generation's .sym vocabulary, verified by count and CRC before
  * attaching its retained domain to each output vector. Selected SYM columns
  * must reference the same dictionary; numeric-only projections do not open it.
+ * open_source: a nonnull sym_path instead supplies the vocabulary of raw SYM columns, as a
+ * partition's table shares its parted root's .sym; compressed SYM columns keep
+ * their generation dictionary. A root without a published generation is
+ * nyi unless immutable is set: then the flat directory is read without a
+ * lease, and the caller vouches that no writer replaces or prunes its files
+ * while the scan is open. source and sym_path are not retained after open.
  * Requires initialized runtime heap/symbol table. *out must initially be NULL.
  * Names are interned; caller may discard options/name strings after open.
  * Limits cover logical payload of one batch and temporary decode scratch,
@@ -41,6 +52,11 @@ typedef enum {
 ray_err_t ray_block_scan_open(const char* root, const char* const* columns,
                               size_t count, const ray_block_scan_options_t* options,
                               ray_block_scan_t** out);
+/* As open, with an optional source description (NULL: generation-local). */
+ray_err_t ray_block_scan_open_source(const char* root, const ray_block_scan_source_t* source,
+                                     const char* const* columns, size_t count,
+                                     const ray_block_scan_options_t* options,
+                                     ray_block_scan_t** out);
 /* Owned zero-row table describing the projection, including for empty scans.
  * No payload reads or cursor advancement. Allocator overhead is not budgeted. */
 ray_t* ray_block_scan_schema(const ray_block_scan_t* scan);

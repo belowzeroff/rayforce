@@ -152,6 +152,72 @@ static test_result_t mixed_raw_scan(void) {
     PASS();
 }
 
+static test_result_t flat_immutable(void) {
+    static const char* const symbols[] = {"a", "bb", "a", "ccc", "bb", "a"};
+    ray_t* x = ray_vec_new(RAY_I64, 6);
+    ray_t* s = ray_sym_vec_new(RAY_SYM_W64, 6);
+    for (int64_t i = 0; i < 6; i++) {
+        ((int64_t*)ray_data(x))[i] = 10 + i;
+        ((int64_t*)ray_data(s))[i] = ray_sym_intern(symbols[i], strlen(symbols[i]));
+    }
+    x->len = s->len = 6;
+    ray_t* t = ray_table_new(2);
+    t = ray_table_add_col(t, ray_sym_intern("x", 1), x);
+    t = ray_table_add_col(t, ray_sym_intern("s", 1), s);
+    ray_release(x); ray_release(s);
+    char part[128], sym[128], missing[128];
+    snprintf(part, sizeof(part), "%s/2024.01.01/t", root);
+    snprintf(sym, sizeof(sym), "%s/.sym", root);
+    snprintf(missing, sizeof(missing), "%s/2024.01.02/t", root);
+    TEST_ASSERT_EQ_I(ray_splay_save(t, part, sym), RAY_OK);
+    ray_release(t);
+    int64_t baseline = mapped();
+    const char* const projection[] = {"x", "s"};
+    ray_block_scan_options_t options = {0, UINT64_MAX, 4, 4096, 4096, 0};
+    ray_block_scan_source_t source = {NULL, false};
+    TEST_ASSERT_EQ_I(ray_block_scan_open_source(part, &source, projection, 2, &options, &scan),
+                     RAY_ERR_NYI);
+    source.immutable = true;
+    /* The partition has no .sym of its own; numeric columns need none. */
+    TEST_ASSERT_TRUE(ray_block_scan_open_source(part, &source, projection, 2, &options, &scan) != RAY_OK);
+    TEST_ASSERT_TRUE(scan == NULL);
+    TEST_ASSERT_EQ_I(ray_block_scan_open_source(part, &source, projection, 1, &options, &scan), RAY_OK);
+    ray_block_scan_close(&scan);
+    TEST_ASSERT_EQ_I(ray_block_scan_open_source(missing, &source, projection, 1, &options, &scan), RAY_ERR_IO);
+    source.sym_path = missing;
+    TEST_ASSERT_EQ_I(ray_block_scan_open_source(part, &source, projection, 2, &options, &scan), RAY_ERR_IO);
+    char sym_copy[128];
+    snprintf(sym_copy, sizeof(sym_copy), "%s", sym);
+    source.sym_path = sym_copy;
+    TEST_ASSERT_EQ_I(ray_block_scan_open_source(part, &source, projection, 2, &options, &scan), RAY_OK);
+    memset(sym_copy, 0, sizeof(sym_copy)); /* not retained after open */
+    int64_t row = 0;
+    for (ray_t* batch; (batch = ray_block_scan_next(scan)); ray_release(batch)) {
+        TEST_ASSERT_FALSE(RAY_IS_ERR(batch));
+        ray_t* xs = ray_table_get_col_idx(batch, 0);
+        ray_t* ss = ray_table_get_col_idx(batch, 1);
+        for (int64_t i = 0; i < xs->len; i++, row++) {
+            TEST_ASSERT_EQ_I(((int64_t*)ray_data(xs))[i], 10 + row);
+            ray_t* cell = ray_sym_vec_cell(ss, i);
+            TEST_ASSERT_EQ_I(ray_str_len(cell), strlen(symbols[row]));
+            TEST_ASSERT_TRUE(!memcmp(ray_str_ptr(cell), symbols[row], ray_str_len(cell)));
+        }
+    }
+    TEST_ASSERT_EQ_I(row, 6);
+    ray_block_scan_close(&scan);
+    TEST_ASSERT_EQ_I(mapped(), baseline);
+
+    /* A root with a generation manifest is never read as a flat directory. */
+    source.sym_path = NULL;
+    char current[1100];
+    snprintf(current, sizeof(current), "%s/.current", part);
+    FILE* f = fopen(current, "wb");
+    TEST_ASSERT_NOT_NULL(f); fclose(f);
+    TEST_ASSERT_TRUE(ray_block_scan_open_source(part, &source, projection, 1, &options, &scan) != RAY_OK);
+    TEST_ASSERT_TRUE(scan == NULL); TEST_ASSERT_EQ_I(mapped(), baseline);
+    PASS();
+}
+
 static test_result_t shared_work_limit(void) {
     publish(1, 16, 16, 1);
     int64_t baseline = mapped();
@@ -1220,6 +1286,7 @@ static test_result_t query_budgets_and_errors(void) {
 const test_entry_t block_scan_entries[] = {
     {"block_scan/mixed_raw_scan", mixed_raw_scan, setup, teardown},
     {"block_scan/shared_work_limit", shared_work_limit, setup, teardown},
+    {"block_scan/flat_immutable", flat_immutable, setup, teardown},
     {"block_scan/query_budgets_and_errors", query_budgets_and_errors, setup, teardown},
     {"block_scan/query_late_materialization", query_late_materialization, setup, teardown},
     {"block_scan/query_conjunction", query_conjunction, setup, teardown},
