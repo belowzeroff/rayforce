@@ -259,7 +259,7 @@ static test_result_t descriptor_validation(void) {
         else { TEST_ASSERT_TRUE(RAY_IS_ERR(r)); TEST_ASSERT_STR_EQ(ray_err_code(r), "limit"); }
         ray_release(r);
     }
-    ray_block_scan_options_t read = {0, UINT64_MAX, 5, 40, 256};
+    ray_block_scan_options_t read = {0, UINT64_MAX, 5, 40, 256, 0};
     const char* output[] = {"id"}; ray_block_query_t* q = NULL;
     TEST_ASSERT_EQ_I(ray_block_query_open(root, output, 1, NULL, 0, &read, &q), RAY_OK);
     ray_eval_request_interrupt();
@@ -588,10 +588,58 @@ static test_result_t scan_work_limits(void) {
     PASS();
 }
 
+static test_result_t query_work_budget(void) {
+    fixture(64, false);
+    char command[512];
+    for (unsigned i = 0; i < 2; i++) {
+        snprintf(command, sizeof(command),
+            "(select {from: (.db.block.scan \"%s\" 8192 {batch-rows: 2 payload-bytes: 16 scratch-bytes: 256 work-bytes: %u}) where: (and (>= x 99) (< x 100)) id: id})",
+            root, 278 - i);
+        ray_t* r = ray_eval_str(command);
+        TEST_ASSERT_NOT_NULL(r);
+        if (!i) { TEST_ASSERT_FALSE(RAY_IS_ERR(r)); TEST_ASSERT_EQ_I(ray_table_nrows(r), 0); }
+        else { TEST_ASSERT_TRUE(RAY_IS_ERR(r)); TEST_ASSERT_STR_EQ(ray_err_code(r), "limit"); }
+        ray_release(r);
+    }
+    for (unsigned i = 0; i < 2; i++) {
+        snprintf(command, sizeof(command),
+            "(select {from: (.db.block.scan \"%s\" 8192 {batch-rows: 1 payload-bytes: 45 scratch-bytes: 256 work-bytes: %u}) where: (>= x 0) number: id text: s symbol: sy})",
+            root, 2721 - i);
+        ray_t* r = ray_eval_str(command);
+        TEST_ASSERT_NOT_NULL(r);
+        if (!i) { TEST_ASSERT_FALSE(RAY_IS_ERR(r)); TEST_ASSERT_EQ_I(ray_table_nrows(r), 64); }
+        else { TEST_ASSERT_TRUE(RAY_IS_ERR(r)); TEST_ASSERT_STR_EQ(ray_err_code(r), "limit"); }
+        ray_release(r);
+    }
+    make_column_raw("id");
+    for (unsigned i = 0; i < 2; i++) {
+        snprintf(command, sizeof(command),
+            "(select {from: (.db.block.scan \"%s\" 8192 {batch-rows: 1 payload-bytes: 8 scratch-bytes: 0 work-bytes: %u}) id: id})",
+            root, 520 - i);
+        ray_t* r = ray_eval_str(command);
+        TEST_ASSERT_NOT_NULL(r);
+        if (!i) { TEST_ASSERT_FALSE(RAY_IS_ERR(r)); TEST_ASSERT_EQ_I(ray_table_nrows(r), 64); }
+        else { TEST_ASSERT_TRUE(RAY_IS_ERR(r)); TEST_ASSERT_STR_EQ(ray_err_code(r), "limit"); }
+        ray_release(r);
+    }
+    for (unsigned i = 0; i < 2; i++) {
+        snprintf(command, sizeof(command),
+            "(select {from: (.db.block.scan \"%s\" 16 {batch-rows: 1 payload-bytes: 8 scratch-bytes: 0 work-bytes: %u}) n: (count id) m: (count id)})",
+            root, 36 - i);
+        ray_t* r = ray_eval_str(command);
+        TEST_ASSERT_NOT_NULL(r);
+        if (!i) { TEST_ASSERT_FALSE(RAY_IS_ERR(r)); TEST_ASSERT_EQ_I(ray_table_nrows(r), 1); }
+        else { TEST_ASSERT_TRUE(RAY_IS_ERR(r)); TEST_ASSERT_STR_EQ(ray_err_code(r), "limit"); }
+        ray_release(r);
+    }
+    PASS();
+}
+
 static test_result_t scan_options_admission(void) {
     const char* invalid[] = {
         "42", "{batch-rows: 0}", "{batch-rows: -1}", "{batch-rows: 4294967296}",
-        "{payload-bytes: -1}", "{scratch-bytes: 0Nl}", "{batch-rows: 2.0}",
+        "{payload-bytes: -1}", "{scratch-bytes: 0Nl}", "{work-bytes: 0}",
+        "{work-bytes: -1}", "{work-bytes: \"1\"}", "{batch-rows: 2.0}",
         "{batch-rows: true}", "{unknown: 1}", "{payload-bytes: \"1\"}"
     };
     for (unsigned i = 0; i < sizeof(invalid) / sizeof(*invalid); i++) {
@@ -663,6 +711,7 @@ const test_entry_t block_source_entries[] = {
     {"block_source/block_store_api", block_store_api, setup, teardown},
     {"block_source/mixed_format_parity", mixed_format_parity, setup, teardown},
     {"block_source/scan_work_limits", scan_work_limits, setup, teardown},
+    {"block_source/query_work_budget", query_work_budget, setup, teardown},
     {"block_source/scan_options_admission", scan_options_admission, setup, teardown},
     {"block_source/aggregate_batch_options", aggregate_batch_options, setup, teardown},
     {"block_source/aggregate_corruption", aggregate_corruption, setup, teardown},
