@@ -31,9 +31,40 @@ ray_err_t ray_block_query_open(const char* root, const char* const* columns,
                              size_t count, const ray_block_predicate_t* predicates,
                              size_t n_predicates, const ray_block_scan_options_t* options,
                              ray_block_query_t** out);
+/* As open, reading root as described by source (NULL: generation-local). */
+ray_err_t ray_block_query_open_source(const char* root, const ray_block_scan_source_t* source,
+                                      const char* const* columns, size_t count,
+                                      const ray_block_predicate_t* predicates,
+                                      size_t n_predicates,
+                                      const ray_block_scan_options_t* options,
+                                      ray_block_query_t** out);
+/* Partitioned variant over <root>/<partition>/<table>. Partitions are listed
+ * once at open, in the key order of .db.parted.get, and read one at a time:
+ * each holds its own generation lease (or, with immutable, is a flat
+ * directory) only while it is read, so there is no snapshot across
+ * partitions. The virtual key column is "date" for YYYY.MM.DD partitions,
+ * else "part" (I64 or SYM); it may be projected and compared. Predicates on
+ * the key prune whole partitions before any of their files are opened. The
+ * first partition, pruned or not, is opened at open: like .db.parted.get it
+ * defines the name schema, and later partitions must have a prefix of it with
+ * every selected column of the same type. A projection needs one stored
+ * column. SYM columns are re-interned into the runtime symbol table, since
+ * each compressed generation has its own dictionary; raw SYM columns use
+ * <root>/.sym. Limits apply per partition read as in open; the key and SYM
+ * copies are charged to work_limit per batch row. */
+ray_err_t ray_block_query_open_parted(const char* root, const char* table, bool immutable,
+                                      const char* const* columns, size_t count,
+                                      const ray_block_predicate_t* predicates,
+                                      size_t n_predicates,
+                                      const ray_block_scan_options_t* options,
+                                      ray_block_query_t** out);
+/* Whether the source holds no rows at all, before filtering. A parted query
+ * may open the metadata of partitions it has not read, one at a time. */
+ray_err_t ray_block_query_source_empty(ray_block_query_t* query, bool* empty);
 /* Owned zero-row output schema, including for an empty/no-match query. */
 ray_t* ray_block_query_schema(const ray_block_query_t* query);
 bool ray_block_query_has_column(const ray_block_query_t* query, const char* name);
+/* Rows before filtering; for a parted query, of the partitions read so far. */
 uint64_t ray_block_query_rows(const ray_block_query_t* query);
 /* Logical bytes retained by the caller while query_next produces a batch.
  * Combined with decoded payload, scratch, and predicate masks by work_limit. */

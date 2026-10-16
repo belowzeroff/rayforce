@@ -317,6 +317,10 @@ bool ray_block_scan_has_column(const ray_block_scan_t* s, const char* name) {
     return false;
 }
 
+ray_t* ray_block_scan_names(const ray_block_scan_t* s) {
+    return s ? s->names : NULL;
+}
+
 ray_t* ray_block_scan_schema(const ray_block_scan_t* s) {
     if (!s) return ray_error("domain", "null block scan");
     ray_t* schema = ray_table_new((int64_t)s->count);

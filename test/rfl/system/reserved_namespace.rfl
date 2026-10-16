@@ -40,7 +40,7 @@
 (type .db.parted) -- 'DICT
 (type .db.block) -- 'DICT
 (count .db) -- 3          ;; block, splayed, parted
-(count .db.block) -- 2    ;; set, scan
+(count .db.block) -- 3    ;; set, scan, parted
 (count .db.splayed) -- 2  ;; set, get
 (count .db.parted) -- 3   ;; get, tables, fill
 (nil? (resolve '.db.splayed.set))    -- false
@@ -50,6 +50,7 @@
 (nil? (resolve '.db.parted.fill))    -- false
 (nil? (resolve '.db.block.set))       -- false
 (nil? (resolve '.db.block.scan))      -- false
+(nil? (resolve '.db.block.parted))    -- false
 ;; REPL completion + syntax highlighting go through
 ;; ray_env_lookup_prefix scanning flat g_env keys.  The namespace
 ;; dicts alone don't satisfy that path, so every reserved builtin
