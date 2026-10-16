@@ -343,6 +343,11 @@ bool ray_block_scan_has_column(const ray_block_scan_t* s, const char* name) {
     return false;
 }
 
+uint8_t ray_block_scan_column_attrs(const ray_block_scan_t* s, size_t column) {
+    if (!s || column >= s->count || !s->columns[column].raw) return 0;
+    return s->columns[column].raw->attrs & (RAY_ATTR_SORTED | RAY_ATTR_HAS_NULLS);
+}
+
 ray_t* ray_block_scan_names(const ray_block_scan_t* s) {
     return s ? s->names : NULL;
 }
