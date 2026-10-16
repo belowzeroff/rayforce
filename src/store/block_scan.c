@@ -32,6 +32,7 @@ struct ray_block_scan_s {
     uint64_t domain_count;
     uint32_t domain_crc;
     size_t reserved_bytes;
+    ray_block_scan_stats_t stats;
     ray_block_scan_options_t options;
     uint64_t cursor, end;
     bool failed, cancelled;
@@ -399,6 +400,19 @@ static ray_t* scan_raw_materialize(ray_t* raw, uint64_t start, uint64_t rows) {
     return out;
 }
 
+void ray_block_scan_stats(const ray_block_scan_t* s, ray_block_scan_stats_t* out) {
+    if (!out) return;
+    if (s) *out = s->stats;
+    else *out = (ray_block_scan_stats_t){0, 0};
+}
+
+static void scan_count_blocks(ray_block_scan_t* s, const ray_col_block_reader_t* r,
+                              uint64_t start, uint64_t rows) {
+    uint64_t first, end;
+    if (!ray_col_block_range_blocks(r, start, rows, &first, &end))
+        s->stats.blocks_decoded += end - first;
+}
+
 void ray_block_scan_cancel(ray_block_scan_t* s) {
     if (s) s->cancelled = true;
 }
@@ -469,8 +483,10 @@ static ray_t* scan_materialize(ray_block_scan_t* s, const size_t* indices,
         ray_err_t err = RAY_OK;
         const ray_col_block_reader_t* r = column->raw ? NULL :
             ray_col_block_file_reader(column->file);
-        if (r && r->type == RAY_STR)
+        if (r && r->type == RAY_STR) {
+            scan_count_blocks(s, r, start, rows);
             err = ray_col_block_payload_size(r, start, rows, scratch, scratch_bytes, &bytes);
+        }
         if (!err && bytes > s->options.payload_limit - total) err = RAY_ERR_LIMIT;
         if (err) { free(scratch); return scan_error(s, err); }
         column->payload_bytes = bytes;
@@ -486,6 +502,8 @@ static ray_t* scan_materialize(ray_block_scan_t* s, const size_t* indices,
         scan_column_t* column = &s->columns[indices ? indices[i] : i];
         const ray_col_block_reader_t* r = column->raw ? NULL :
             ray_col_block_file_reader(column->file);
+        if (r) scan_count_blocks(s, r, start, rows);
+        else s->stats.raw_rows += rows;
         ray_t* col = column->raw ? scan_raw_materialize(column->raw, start, rows) :
             r->type == RAY_STR ?
             ray_col_block_materialize_str(r, start, rows,

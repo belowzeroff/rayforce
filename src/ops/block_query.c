@@ -25,6 +25,7 @@ static ray_err_t parted_source_empty(block_parted_t* p, bool* empty);
 static bool parted_has_column(const block_parted_t* p, const char* name);
 static void parted_cancel(block_parted_t* p);
 static uint64_t parted_rows(const block_parted_t* p);
+static void parted_stats(const block_parted_t* p, ray_block_query_stats_t* out);
 static ray_t* parted_next(ray_block_query_t* q);
 
 struct ray_block_query_s {
@@ -37,6 +38,7 @@ struct ray_block_query_s {
     ray_t* mask;
     uint64_t start, position, remaining;
     size_t external_reserve;
+    uint64_t batches_skipped;
     bool failed, cancelled;
 };
 
@@ -188,6 +190,15 @@ ray_t* ray_block_query_schema(const ray_block_query_t* q) {
     return q->schema;
 }
 
+void ray_block_query_stats(const ray_block_query_t* q, ray_block_query_stats_t* out) {
+    if (!out) return;
+    *out = (ray_block_query_stats_t){{0, 0}, 0, 0, 0};
+    if (!q) return;
+    if (q->parted) { parted_stats(q->parted, out); return; }
+    ray_block_scan_stats(q->scan, &out->scan);
+    out->batches_skipped = q->batches_skipped;
+}
+
 void ray_block_query_cancel(ray_block_query_t* q) {
     if (!q) return;
     q->cancelled = true;
@@ -308,6 +319,7 @@ ray_t* ray_block_query_next(ray_block_query_t* q) {
         if (!may_match) {
             range_err = ray_block_scan_skip_next(q->scan, &q->start);
             if (range_err) { result = ray_error(ray_err_code_str(range_err), "block query skip failed"); break; }
+            q->batches_skipped++;
             q->remaining -= scan_rows;
             continue;
         }
@@ -371,9 +383,21 @@ struct block_parted_s {
     ray_t* names;        /* first partition's full name schema */
     ray_block_query_t* current;
     uint64_t first_rows, rows_read;
+    ray_block_query_stats_t done; /* closed partitions */
     size_t row_bytes;    /* key and SYM copies per output row */
     size_t external_reserve;
 };
+
+/* Fold the current partition's work into the totals before closing it. */
+static void parted_close_current(block_parted_t* p) {
+    if (!p->current) return;
+    ray_block_query_stats_t s;
+    ray_block_query_stats(p->current, &s);
+    p->done.scan.blocks_decoded += s.scan.blocks_decoded;
+    p->done.scan.raw_rows += s.scan.raw_rows;
+    p->done.batches_skipped += s.batches_skipped;
+    ray_block_query_close(&p->current);
+}
 
 static void parted_free(block_parted_t* p) {
     if (!p) return;
@@ -555,7 +579,8 @@ ray_err_t ray_block_query_open_parted(const char* root, const char* table, bool 
         p->current = first; first = NULL;
         p->reading = 0;
         p->rows_read = p->first_rows;
-    }
+        p->done.partitions_read = 1;
+    } else if (!err) p->done.partitions_pruned = 1;
     p->next = 1;
     ray_block_query_close(&first);
     if (err) { ray_block_query_close(&q); return err; }
@@ -639,7 +664,10 @@ static ray_t* parted_next(ray_block_query_t* q) {
         if (p->cancelled || ray_eval_is_interrupted())
             return ray_error("cancel", "block query cancelled");
         if (!p->current) {
-            while (p->next < p->n_dirs && parted_pruned(p, p->next)) p->next++;
+            while (p->next < p->n_dirs && parted_pruned(p, p->next)) {
+                p->next++;
+                p->done.partitions_pruned++;
+            }
             if (p->next == p->n_dirs) return NULL;
             int64_t partition = p->next++;
             ray_err_t err = parted_open_partition(p, partition, p->data_names, p->n_data,
@@ -651,11 +679,12 @@ static ray_t* parted_next(ray_block_query_t* q) {
             }
             p->reading = partition;
             p->rows_read += ray_block_query_rows(p->current);
+            p->done.partitions_read++;
         }
         ray_err_t err = parted_reserve(p);
         if (err) return ray_error(ray_err_code_str(err), "block query working set exceeds limit");
         ray_t* batch = ray_block_query_next(p->current);
-        if (!batch) { ray_block_query_close(&p->current); continue; }
+        if (!batch) { parted_close_current(p); continue; }
         if (RAY_IS_ERR(batch)) return batch;
         ray_t* out = parted_batch(p, batch);
         ray_release(batch);
@@ -697,6 +726,16 @@ static void parted_cancel(block_parted_t* p) {
 
 static uint64_t parted_rows(const block_parted_t* p) {
     return p->rows_read;
+}
+
+static void parted_stats(const block_parted_t* p, ray_block_query_stats_t* out) {
+    *out = p->done;
+    if (!p->current) return;
+    ray_block_query_stats_t s;
+    ray_block_query_stats(p->current, &s);
+    out->scan.blocks_decoded += s.scan.blocks_decoded;
+    out->scan.raw_rows += s.scan.raw_rows;
+    out->batches_skipped += s.batches_skipped;
 }
 
 static ray_err_t parted_set_reserve(block_parted_t* p, size_t bytes) {

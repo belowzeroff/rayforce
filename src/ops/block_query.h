@@ -74,6 +74,15 @@ ray_err_t ray_block_query_reserve(ray_block_query_t* query, size_t bytes);
  * during synchronous decode.
  * Repeated small matching ranges may re-decode boundary blocks. */
 ray_t* ray_block_query_next(ray_block_query_t* query);
+/* Scan work so far, plus filter batches skipped by zone maps and, for a
+ * parted query, partitions opened for reading and pruned by key predicates.
+ * The first partition's schema open is not a read unless it is read. */
+typedef struct {
+    ray_block_scan_stats_t scan;
+    uint64_t batches_skipped;
+    uint64_t partitions_read, partitions_pruned;
+} ray_block_query_stats_t;
+void ray_block_query_stats(const ray_block_query_t* query, ray_block_query_stats_t* out);
 void ray_block_query_cancel(ray_block_query_t* query);
 void ray_block_query_close(ray_block_query_t** query);
 #endif

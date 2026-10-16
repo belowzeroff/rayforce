@@ -13,6 +13,12 @@ typedef struct {
     size_t payload_limit, scratch_limit;
     size_t work_limit; /* 0 disables the combined logical-work cap */
 } ray_block_scan_options_t;
+/* Work done so far. A decode pass counts every block it touches, so STR
+ * batches, which are sized by one pass and filled by another, count twice. */
+typedef struct {
+    uint64_t blocks_decoded; /* compressed blocks, summed over columns and passes */
+    uint64_t raw_rows;       /* rows copied from raw columns, summed over columns */
+} ray_block_scan_stats_t;
 /* Where a root's data lives, beyond its own generation. */
 typedef struct {
     const char* sym_path; /* symfile for raw SYM columns, e.g. a parted root's */
@@ -104,6 +110,7 @@ ray_t* ray_block_scan_read_columns(ray_block_scan_t* scan, const size_t* indices
 /* Set logical bytes retained by the caller while the next batch is produced.
  * The reservation persists until replaced and is only charged by work_limit. */
 ray_err_t ray_block_scan_reserve(ray_block_scan_t* scan, size_t bytes);
+void ray_block_scan_stats(const ray_block_scan_t* scan, ray_block_scan_stats_t* out);
 void ray_block_scan_cancel(ray_block_scan_t* scan);
 void ray_block_scan_close(ray_block_scan_t** scan);
 #endif

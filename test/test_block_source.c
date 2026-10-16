@@ -861,6 +861,29 @@ static test_result_t parted_pruning(void) {
     TEST_ASSERT_FALSE(RAY_IS_ERR(r)); TEST_ASSERT_EQ_I(ray_table_nrows(r), 300 + 397); ray_release(r);
     r = parted_select(flat, "i: id");
     TEST_ASSERT_TRUE(RAY_IS_ERR(r)); TEST_ASSERT_STR_EQ(ray_err_code(r), "corrupt"); ray_release(r);
+
+    /* Stats: two partitions read, two pruned without opening. */
+    const char* output[] = {"id"};
+    ray_t* day = ray_date(ray_parted_dir_key("2024.01.03", RAY_MC_DATE));
+    ray_t* other = ray_date(ray_parted_dir_key("2024.01.02", RAY_MC_DATE));
+    ray_block_predicate_t pred[] = {{"date", OP_NE, day}, {"date", OP_NE, other}};
+    ray_block_scan_options_t read = {0, UINT64_MAX, 64, 1u << 20, 1u << 20, 0};
+    ray_block_query_t* q = NULL;
+    TEST_ASSERT_EQ_I(ray_block_query_open_parted(db, "t", false, output, 1, pred, 2, &read, &q), RAY_OK);
+    ray_release(day); ray_release(other);
+    uint64_t rows = 0;
+    for (ray_t* b; (b = ray_block_query_next(q)); ray_release(b)) {
+        TEST_ASSERT_FALSE(RAY_IS_ERR(b));
+        rows += (uint64_t)ray_table_nrows(b);
+    }
+    ray_block_query_stats_t stats;
+    ray_block_query_stats(q, &stats);
+    ray_block_query_close(&q);
+    TEST_ASSERT_EQ_I(rows, 300 + 591);
+    TEST_ASSERT_EQ_I(stats.partitions_read, 2);
+    TEST_ASSERT_EQ_I(stats.partitions_pruned, 2);
+    TEST_ASSERT_EQ_I(stats.scan.raw_rows, 0);
+    TEST_ASSERT_TRUE(stats.scan.blocks_decoded > 0);
     PASS();
 }
 
