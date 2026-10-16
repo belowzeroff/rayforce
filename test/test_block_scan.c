@@ -1209,6 +1209,60 @@ static test_result_t query_zone_pruning(void) {
     PASS();
 }
 
+/* Release gate 2: on a sorted column, a narrow range decodes only the blocks
+ * it overlaps; every excluded block stays undecoded, in the filter column and
+ * in the late-materialized output column. */
+static test_result_t gate_range_pruning(void) {
+    struct { uint32_t rows, block_bytes, batch_rows, lo, hi; uint64_t blocks; } cases[] = {
+        {4096, 512, 64, 1000, 1064, 4},               /* batch == I64 block */
+        /* Default batch, 64 KiB blocks: batches are finer than blocks, so the
+         * next batch inside the matching t block decodes that block again. */
+        {524288, 65536, 4096, 100000, 100100, 3}
+    };
+    for (unsigned c = 0; c < 2; c++) {
+        uint32_t rows = cases[c].rows;
+        ray_t* t = ray_vec_new(RAY_I64, rows);
+        ray_t* v = ray_vec_new(RAY_I32, rows);
+        for (uint32_t i = 0; i < rows; i++) {
+            ((int64_t*)ray_data(t))[i] = i;
+            ((int32_t*)ray_data(v))[i] = (int32_t)(i * 3);
+        }
+        t->len = v->len = rows;
+        ray_t* table = ray_table_new(2);
+        table = ray_table_add_col(table, ray_sym_intern("t", 1), t);
+        table = ray_table_add_col(table, ray_sym_intern("v", 1), v);
+        ray_release(t); ray_release(v);
+        ray_block_store_options_t store = {cases[c].block_bytes, 1, false};
+        TEST_ASSERT_EQ_I(ray_block_store_save(table, root, &store), RAY_OK);
+        ray_release(table);
+        uint64_t total_blocks = (rows * 8ull + cases[c].block_bytes - 1) / cases[c].block_bytes +
+                                (rows * 4ull + cases[c].block_bytes - 1) / cases[c].block_bytes;
+        const char* output[] = {"v"};
+        ray_t* lo = ray_i64(cases[c].lo); ray_t* hi = ray_i64(cases[c].hi);
+        ray_block_predicate_t pred[] = {{"t", OP_GE, lo}, {"t", OP_LT, hi}};
+        ray_block_scan_options_t read = {0, UINT64_MAX, cases[c].batch_rows, 1u << 20, 1u << 20, 0};
+        TEST_ASSERT_EQ_I(ray_block_query_open(root, output, 1, pred, 2, &read, &query), RAY_OK);
+        ray_release(lo); ray_release(hi);
+        uint64_t matched = 0;
+        for (ray_t* b; (b = ray_block_query_next(query)); ray_release(b)) {
+            TEST_ASSERT_FALSE(RAY_IS_ERR(b));
+            ray_t* col = ray_table_get_col_idx(b, 0);
+            for (int64_t i = 0; i < col->len; i++, matched++)
+                TEST_ASSERT_EQ_I(((int32_t*)ray_data(col))[i], (int32_t)((cases[c].lo + matched) * 3));
+        }
+        TEST_ASSERT_EQ_I(matched, cases[c].hi - cases[c].lo);
+        ray_block_query_stats_t stats;
+        ray_block_query_stats(query, &stats);
+        TEST_ASSERT_EQ_I(stats.scan.blocks_decoded, cases[c].blocks);
+        TEST_ASSERT_EQ_I(stats.scan.raw_rows, 0);
+        uint64_t batches = (rows + cases[c].batch_rows - 1) / cases[c].batch_rows;
+        TEST_ASSERT_TRUE(stats.batches_skipped >= batches - 2);
+        TEST_ASSERT_TRUE(stats.scan.blocks_decoded * 10 <= total_blocks);
+        ray_block_query_close(&query);
+    }
+    PASS();
+}
+
 static test_result_t query_admission(void) {
     publish(1, 16, 16, 1);
     const char* output[] = {"y"};
@@ -1292,6 +1346,7 @@ const test_entry_t block_scan_entries[] = {
     {"block_scan/query_conjunction", query_conjunction, setup, teardown},
     {"block_scan/query_native_parity", query_native_parity, setup, teardown},
     {"block_scan/query_zone_pruning", query_zone_pruning, setup, teardown},
+    {"block_scan/gate_range_pruning", gate_range_pruning, setup, teardown},
     {"block_scan/query_admission", query_admission, setup, teardown},
     {"block_scan/subset_variable_width", subset_variable_width, setup, teardown},
     {"block_scan/subset_ranges", subset_ranges, setup, teardown},
