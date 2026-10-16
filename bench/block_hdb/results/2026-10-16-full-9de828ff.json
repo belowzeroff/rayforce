@@ -1,0 +1,386 @@
+{
+  "commit": "2a360398",
+  "binary": "/home/athuser/rayforce-build/bench-data/rayforce-9de828ff-rel",
+  "cpu": "x86_64",
+  "logical_cpus": 32,
+  "days": 20,
+  "rows_per_day": 5000000,
+  "block_bytes": 65536,
+  "repeat": 3,
+  "page_cache": "warm: after one untimed run; cold: posix_fadvise(DONTNEED) on the variant's files",
+  "timing": "in-process timeit of the select, fresh process per run",
+  "disk_bytes": {
+    "raw": 7903958832,
+    "none": 6357100420,
+    "snappy": 2744530969
+  },
+  "build": {
+    "generate_seconds": 66.96434760093689,
+    "convert_seconds": {
+      "none": 58.48596167564392,
+      "snappy": 60.69282865524292
+    }
+  },
+  "results": [
+    {
+      "query": "full_aggregate",
+      "variant": "raw",
+      "warm_ms": [
+        327.407,
+        332.667,
+        594.247
+      ],
+      "cold_ms": [
+        1527.25,
+        1533.37,
+        1529.7
+      ],
+      "cold_read_bytes": [
+        5466304512,
+        5465296896,
+        5465800704
+      ],
+      "max_rss_kib": 4816616
+    },
+    {
+      "query": "full_aggregate",
+      "variant": "none",
+      "warm_ms": [
+        4772.16,
+        5980.84,
+        5357.75
+      ],
+      "cold_ms": [
+        6837.6,
+        10288.9,
+        7188.34
+      ],
+      "cold_read_bytes": [
+        1601863680,
+        1601863680,
+        1601863680
+      ],
+      "max_rss_kib": 4816616
+    },
+    {
+      "query": "full_aggregate",
+      "variant": "snappy",
+      "warm_ms": [
+        8551.45,
+        9109.55,
+        7818.9
+      ],
+      "cold_ms": [
+        11141.0,
+        9194.85,
+        9257.89
+      ],
+      "cold_read_bytes": [
+        737689600,
+        737689600,
+        737689600
+      ],
+      "max_rss_kib": 4816616
+    },
+    {
+      "query": "day_time_range",
+      "variant": "raw",
+      "warm_ms": [
+        316.846,
+        621.152,
+        258.596
+      ],
+      "cold_ms": [
+        559.897,
+        798.151,
+        800.737
+      ],
+      "cold_read_bytes": [
+        4155097088,
+        4154957824,
+        4155547648
+      ],
+      "max_rss_kib": 4816616
+    },
+    {
+      "query": "day_time_range",
+      "variant": "none",
+      "warm_ms": [
+        15.2383,
+        15.5566,
+        15.1889
+      ],
+      "cold_ms": [
+        59.8279,
+        59.7619,
+        69.8305
+      ],
+      "cold_read_bytes": [
+        33587200,
+        33587200,
+        33587200
+      ],
+      "max_rss_kib": 4816616
+    },
+    {
+      "query": "day_time_range",
+      "variant": "snappy",
+      "warm_ms": [
+        18.3664,
+        18.445,
+        17.2816
+      ],
+      "cold_ms": [
+        61.9963,
+        62.8432,
+        63.6048
+      ],
+      "cold_read_bytes": [
+        33587200,
+        33587200,
+        33587200
+      ],
+      "max_rss_kib": 4816616
+    },
+    {
+      "query": "time_range_all_days",
+      "variant": "raw",
+      "warm_ms": [
+        133.676,
+        148.958,
+        109.027
+      ],
+      "cold_ms": [
+        766.05,
+        756.574,
+        760.914
+      ],
+      "cold_read_bytes": [
+        4795441152,
+        4795371520,
+        4795441152
+      ],
+      "max_rss_kib": 4816616
+    },
+    {
+      "query": "time_range_all_days",
+      "variant": "none",
+      "warm_ms": [
+        37.0868,
+        37.4295,
+        37.943
+      ],
+      "cold_ms": [
+        388.086,
+        383.596,
+        387.851
+      ],
+      "cold_read_bytes": [
+        260374528,
+        260374528,
+        260374528
+      ],
+      "max_rss_kib": 4816616
+    },
+    {
+      "query": "time_range_all_days",
+      "variant": "snappy",
+      "warm_ms": [
+        40.8867,
+        40.1793,
+        40.98
+      ],
+      "cold_ms": [
+        344.991,
+        335.737,
+        330.633
+      ],
+      "cold_read_bytes": [
+        260374528,
+        260374528,
+        260374528
+      ],
+      "max_rss_kib": 4816616
+    },
+    {
+      "query": "one_day_one_column",
+      "variant": "raw",
+      "warm_ms": [
+        204.22,
+        385.782,
+        202.778
+      ],
+      "cold_ms": [
+        442.781,
+        440.481,
+        447.603
+      ],
+      "cold_read_bytes": [
+        4154806272,
+        4154806272,
+        4154806272
+      ],
+      "max_rss_kib": 4816616
+    },
+    {
+      "query": "one_day_one_column",
+      "variant": "none",
+      "warm_ms": [
+        258.104,
+        379.392,
+        378.846
+      ],
+      "cold_ms": [
+        397.886,
+        398.187,
+        396.085
+      ],
+      "cold_read_bytes": [
+        46354432,
+        46354432,
+        46354432
+      ],
+      "max_rss_kib": 4816616
+    },
+    {
+      "query": "one_day_one_column",
+      "variant": "snappy",
+      "warm_ms": [
+        229.163,
+        241.175,
+        646.676
+      ],
+      "cold_ms": [
+        656.476,
+        689.695,
+        694.731
+      ],
+      "cold_read_bytes": [
+        26685440,
+        26685440,
+        26685440
+      ],
+      "max_rss_kib": 4816616
+    },
+    {
+      "query": "one_day_selective_wide",
+      "variant": "raw",
+      "warm_ms": [
+        380.414,
+        226.545,
+        229.205
+      ],
+      "cold_ms": [
+        592.796,
+        621.094,
+        592.451
+      ],
+      "cold_read_bytes": [
+        4265775104,
+        4265775104,
+        4265775104
+      ],
+      "max_rss_kib": 4816616
+    },
+    {
+      "query": "one_day_selective_wide",
+      "variant": "none",
+      "warm_ms": [
+        2047.79,
+        1626.65,
+        1238.05
+      ],
+      "cold_ms": [
+        1675.98,
+        1872.6,
+        1668.89
+      ],
+      "cold_read_bytes": [
+        355667968,
+        355667968,
+        355667968
+      ],
+      "max_rss_kib": 4816616
+    },
+    {
+      "query": "one_day_selective_wide",
+      "variant": "snappy",
+      "warm_ms": [
+        2698.16,
+        1817.46,
+        1751.08
+      ],
+      "cold_ms": [
+        2113.7,
+        3432.35,
+        2481.5
+      ],
+      "cold_read_bytes": [
+        175034368,
+        175034368,
+        175034368
+      ],
+      "max_rss_kib": 4816616
+    },
+    {
+      "query": "avg_all_days",
+      "variant": "raw",
+      "warm_ms": [
+        416.25,
+        231.726,
+        257.598
+      ],
+      "cold_ms": [
+        894.851,
+        885.729,
+        888.02
+      ],
+      "cold_read_bytes": [
+        4791681024,
+        4791177216,
+        4791177216
+      ],
+      "max_rss_kib": 4816616
+    },
+    {
+      "query": "avg_all_days",
+      "variant": "none",
+      "warm_ms": [
+        2999.59,
+        2653.87,
+        2321.91
+      ],
+      "cold_ms": [
+        3753.65,
+        4056.04,
+        5531.56
+      ],
+      "cold_read_bytes": [
+        801013760,
+        801013760,
+        801013760
+      ],
+      "max_rss_kib": 4816616
+    },
+    {
+      "query": "avg_all_days",
+      "variant": "snappy",
+      "warm_ms": [
+        3888.29,
+        3843.35,
+        4270.52
+      ],
+      "cold_ms": [
+        5078.14,
+        5715.41,
+        5825.92
+      ],
+      "cold_read_bytes": [
+        330219520,
+        330219520,
+        330219520
+      ],
+      "max_rss_kib": 4816616
+    }
+  ]
+}
