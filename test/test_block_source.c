@@ -953,7 +953,90 @@ static test_result_t parted_rejections(void) {
     PASS();
 }
 
+/* Every column of a Parquet import read back through a block scan. */
+static ray_t* parquet_block_readback(const char* target, ray_t* like) {
+    char command[2048];
+    int n = snprintf(command, sizeof(command), "(select {from: (.db.block.scan \"%s\" 100000000)", target);
+    for (int64_t c = 0; c < ray_table_ncols(like); c++) {
+        ray_t* name = ray_sym_str(ray_table_col_name(like, c));
+        n += snprintf(command + n, sizeof(command) - (size_t)n, " %.*s: %.*s",
+                      (int)ray_str_len(name), ray_str_ptr(name), (int)ray_str_len(name), ray_str_ptr(name));
+    }
+    snprintf(command + n, sizeof(command) - (size_t)n, "})");
+    return ray_eval_str(command);
+}
+
+static test_result_t parquet_block(void) {
+    const char* files[] = {"flat-1-v2", "flat-0-v1", "all-null", "unix", "bool"};
+    for (unsigned f = 0; f < sizeof(files) / sizeof(*files); f++) {
+        char command[512], target[128];
+        snprintf(target, sizeof(target), "%s/pq%u", root, f);
+        snprintf(command, sizeof(command), "(.parquet.read \"test/data/parquet/%s.parquet\")", files[f]);
+        ray_t* expected = ray_eval_str(command);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(expected));
+        snprintf(command, sizeof(command),
+            "(.parquet.block \"test/data/parquet/%s.parquet\" \"%s\" {block-bytes: 64 codec: snappy durable: false})",
+            files[f], target);
+        ray_t* rows = ray_eval_str(command);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(rows));
+        TEST_ASSERT_EQ_I(rows->i64, ray_table_nrows(expected)); ray_release(rows);
+        ray_t* actual = parquet_block_readback(target, expected);
+        test_result_t r = tables_equal(actual, expected);
+        ray_release(actual); ray_release(expected);
+        if (r.status != TEST_PASS) return r;
+    }
+    /* Several 64Ki-row batches stream into one generation. */
+    char command[512];
+    snprintf(command, sizeof(command),
+        "(.parquet.block \"test/data/parquet/parallel.parquet\" \"%s/big\" {block-bytes: 65536 codec: snappy durable: false})", root);
+    ray_t* r = ray_eval_str(command);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r)); TEST_ASSERT_EQ_I(r->i64, 70003); ray_release(r);
+    snprintf(command, sizeof(command),
+        "(select {from: (.db.block.scan \"%s/big\" 1000) n: (count x) s: (sum x) lo: (min y)})", root);
+    r = ray_eval_str(command);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(ray_table_get_col_idx(r, 0)))[0], 70003);
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(ray_table_get_col_idx(r, 1)))[0], 2450175003);
+    ray_release(r);
+    /* Read options select columns; the published schema follows them. */
+    snprintf(command, sizeof(command),
+        "(.parquet.block [x] \"test/data/parquet/parallel.parquet\" \"%s/narrow\" {block-bytes: 4096 codec: none durable: false})", root);
+    r = ray_eval_str(command);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r)); ray_release(r);
+    snprintf(command, sizeof(command), "(select {from: (.db.block.scan \"%s/narrow\" 1000) y: y})", root);
+    r = ray_eval_str(command);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r)); ray_release(r);
+    /* An empty file publishes its schema with no rows. */
+    snprintf(command, sizeof(command),
+        "(.parquet.block \"test/data/parquet/empty.parquet\" \"%s/empty\" {block-bytes: 64 codec: snappy})", root);
+    r = ray_eval_str(command);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r)); TEST_ASSERT_EQ_I(r->i64, 0); ray_release(r);
+    snprintf(command, sizeof(command), "(select {from: (.db.block.scan \"%s/empty\" 1000) n: (count x)})", root);
+    r = ray_eval_str(command);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r)); ray_release(r);
+    /* Invalid block options and missing inputs publish nothing. */
+    const char* invalid[] = {
+        "(.parquet.block \"test/data/parquet/bool.parquet\" \"%s/bad\" {codec: snappy})",
+        "(.parquet.block \"test/data/parquet/bool.parquet\" \"%s/bad\" {block-bytes: 0 codec: snappy})",
+        "(.parquet.block \"test/data/parquet/missing.parquet\" \"%s/bad\" {block-bytes: 64 codec: snappy})",
+        "(.parquet.block \"test/data/parquet/bool.parquet\" \"%s/bad\")"
+    };
+    for (unsigned i = 0; i < sizeof(invalid) / sizeof(*invalid); i++) {
+        snprintf(command, sizeof(command), invalid[i], root);
+        r = ray_eval_str(command);
+        TEST_ASSERT_TRUE(RAY_IS_ERR(r)); ray_release(r);
+    }
+    snprintf(command, sizeof(command), "%s/bad/.current", root);
+    TEST_ASSERT_EQ_I(access(command, F_OK), -1);
+    ray_eval_set_restricted(true);
+    r = ray_eval_str("(.parquet.block \"test/data/parquet/bool.parquet\" \"/tmp/never\" {block-bytes: 64 codec: snappy})");
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r)); ray_release(r);
+    ray_eval_set_restricted(false);
+    PASS();
+}
+
 const test_entry_t block_source_entries[] = {
+    {"block_source/parquet_block", parquet_block, setup, teardown},
     {"block_source/parted_parity", parted_parity, setup, teardown},
     {"block_source/parted_pruning", parted_pruning, setup, teardown},
     {"block_source/parted_rejections", parted_rejections, setup, teardown},

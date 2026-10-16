@@ -185,7 +185,7 @@ static const char* block_codec_name(ray_t* value, size_t* len) {
     return ray_str_ptr(text);
 }
 
-static ray_err_t block_store_options(ray_t* value, ray_block_store_options_t* out) {
+ray_err_t ray_block_store_parse_options(ray_t* value, ray_block_store_options_t* out) {
     if (!value || value->type != RAY_DICT) return RAY_ERR_TYPE;
     ray_t* keys = ray_dict_keys(value);
     ray_t* vals = ray_dict_vals(value);
@@ -233,7 +233,7 @@ ray_t* ray_block_store_fn(ray_t** args, int64_t n) {
     if (!args[1] || args[1]->type != RAY_TABLE)
         return ray_error("type", ".db.block.set: value must be a table");
     ray_block_store_options_t options;
-    ray_err_t err = block_store_options(args[2], &options);
+    ray_err_t err = ray_block_store_parse_options(args[2], &options);
     if (err) return ray_error(ray_err_code_str(err), ".db.block.set: invalid options");
     err = ray_block_store_save(args[1], path, &options);
     if (err) return ray_error(ray_err_code_str(err), ".db.block.set: save failed");

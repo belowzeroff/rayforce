@@ -26,6 +26,7 @@
 #include "ops/glob.h"
 #include "ops/agg_registry.h"
 #include "store/splay.h"
+#include "store/block_store.h"
 #include "store/stream.h"
 #include "store/col.h"
 #include "store/fileio.h"
@@ -3355,6 +3356,51 @@ ray_t* ray_parquet_parted_fn(ray_t** args, int64_t n) {
     ray_t* name = args[n-1]->type == -RAY_SYM ? ray_sym_str(args[n-1]->i64) : args[n-1];
     const char* table = pq_path_arg(name);
     return p && root && table ? ray_parquet_parted_typed(p,root,table,n == 4 ? args[0] : NULL) : ray_error("type","parquet.parted: expected paths and table name");
+}
+static ray_t* pq_block_error(ray_err_t err, const char* what) {
+    return ray_error(ray_err_code_str(err), "parquet.block: %s", what);
+}
+ray_t* ray_parquet_block_fn(ray_t** args, int64_t n) {
+#ifdef RAY_FUZZING
+    return ray_error("restricted","Parquet imports disabled under fuzzing");
+#endif
+    if (n != 3 && n != 4) return ray_error("arity","parquet.block: [read-options] path root block-options");
+    const char* path = pq_path_arg(args[n-3]); const char* root = pq_path_arg(args[n-2]);
+    if (!path || !root) return ray_error("type","parquet.block: expected two paths");
+    ray_block_store_options_t options;
+    ray_err_t e = ray_block_store_parse_options(args[n-1],&options);
+    if (e) return pq_block_error(e,"invalid block options");
+    ray_t* read_options = n == 4 ? args[0] : NULL;
+    ray_parquet_t* r = NULL;
+    ray_t* err = pq_open_options(path,read_options,&r);
+    if (err) return err;
+    ray_block_table_writer_t* w = NULL;
+    int64_t rows = 0;
+    for (;;) {
+        if (ray_interrupted()) { err = ray_error("cancel","parquet.block: interrupted"); break; }
+        ray_t* batch = ray_parquet_next(r);
+        if (!batch) break;
+        if (RAY_IS_ERR(batch)) { err = batch; break; }
+        e = w ? RAY_OK : ray_block_table_begin(root,batch,&options,&w);
+        if (!e) e = ray_block_table_append(w,batch);
+        rows += ray_table_nrows(batch);
+        ray_release(batch);
+        if (e) { err = pq_block_error(e,"block write failed"); break; }
+    }
+    ray_parquet_close(r);
+    if (!err && !w) {
+        /* No batches: publish the file's empty schema. */
+        ray_t* empty = ray_parquet_read(path,read_options);
+        if (!empty || RAY_IS_ERR(empty)) err = empty ? empty : ray_error("oom",NULL);
+        else {
+            e = ray_block_table_begin(root,empty,&options,&w);
+            ray_release(empty);
+            if (e) err = pq_block_error(e,"block write failed");
+        }
+    }
+    if (err) { ray_block_table_abort(&w); return err; }
+    e = ray_block_table_finish(&w);
+    return e ? pq_block_error(e,"publication failed") : ray_i64(rows);
 }
 ray_t* ray_parquet_each_fn(ray_t** args, int64_t n) {
     if (n != 2 && n != 3) return ray_error("arity","parquet.each: [columns] path callback");
