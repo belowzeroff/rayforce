@@ -55,6 +55,8 @@ void ray_block_table_abort(ray_block_table_writer_t** writer);
  * not equal, contain or lie inside src: the source is never modified. A raw
  * column persisted as SORTED is nyi: block files cannot keep the attribute. On
  * failure nothing is published. *rows (optional) receives the row count. */
+/* Whether two paths, existing or not, are equal or one lies inside the other. */
+ray_err_t ray_block_store_paths_overlap(const char* a, const char* b, bool* overlap);
 #define RAY_BLOCK_CONVERT_BATCH_ROWS 65536u
 #define RAY_BLOCK_CONVERT_BATCH_BYTES ((size_t)1 << 30)
 ray_err_t ray_block_store_convert(const char* src, const ray_block_scan_source_t* source,

@@ -45,7 +45,9 @@ Writes stream: CSV and Parquet imports and conversions hold one input batch plus
 
 ### Converting existing data
 
-`.db.block.convert` reads its source through a block scan of every column and writes a new generation of `dest`. `dest` may not be the source, inside it, or contain it: the source is never modified. Convert a partitioned database one partition at a time into a new root.
+`.db.block.convert` reads its source through a block scan of every column and writes a new generation of `dest`. `dest` may not be the source, inside it, or contain it: the source is never modified.
+
+A whole partitioned database converts with `(.db.block.convert "src-root" 'table "dest-root" options [read-options])`: every partition `src-root/<p>/table` becomes `dest-root/<p>/table`, in partition order, and the result lists each partition's row count. Raw `SYM` columns default to `src-root/.sym`. A failure names its partition; partitions converted before it stay published, and running the command again republishes every partition.
 
 `read-options` describe the source:
 
