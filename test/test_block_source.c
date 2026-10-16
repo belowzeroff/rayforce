@@ -1107,7 +1107,98 @@ static test_result_t csv_block(void) {
     PASS();
 }
 
+static test_result_t block_convert(void) {
+    parted_fixture("raw", 0);
+    char command[1024];
+    for (unsigned p = 0; p < 4; p++) {
+        snprintf(command, sizeof(command),
+            "(.db.block.convert \"%s/raw/%s/t\" \"%s/conv/%s/t\" {block-bytes: 256 codec: snappy durable: false} {immutable: true})",
+            root, parted_days[p], root, parted_days[p]);
+        ray_t* r = ray_eval_str(command);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(r)); TEST_ASSERT_EQ_I(r->i64, 300 + 97 * p); ray_release(r);
+    }
+    char raw[256], conv[256];
+    snprintf(raw, sizeof(raw), "(.db.parted.get \"%s/raw\" (quote t))", root);
+    snprintf(conv, sizeof(conv), "(.db.block.parted \"%s/conv\" (quote t) 100000000)", root);
+    const char* clauses[] = {
+        "d: date i: id v: x k: sy t: s",
+        "where: (and (>= date 2024.01.02) (> x 3)) i: id k: sy",
+        "where: (< x 2) n: (count sy) total: (sum id) hi: (max date)"
+    };
+    for (unsigned c = 0; c < sizeof(clauses) / sizeof(*clauses); c++) {
+        ray_t* expected = parted_select(raw, clauses[c]);
+        ray_t* actual = parted_select(conv, clauses[c]);
+        test_result_t r = tables_equal(actual, expected);
+        ray_release(expected); ray_release(actual);
+        if (r.status != TEST_PASS) return r;
+    }
+    /* A flat source is read only when declared immutable. */
+    snprintf(command, sizeof(command),
+        "(.db.block.convert \"%s/raw/2024.01.01/t\" \"%s/other\" {block-bytes: 256 codec: snappy})", root, root);
+    ray_t* r = ray_eval_str(command);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r)); TEST_ASSERT_STR_EQ(ray_err_code(r), "nyi"); ray_release(r);
+    /* Compressed to compressed: a repack with another block size. */
+    snprintf(command, sizeof(command),
+        "(.db.block.convert \"%s/conv/2024.01.02/t\" \"%s/repack\" {block-bytes: 4096 codec: none durable: false})", root, root);
+    r = ray_eval_str(command);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r)); TEST_ASSERT_EQ_I(r->i64, 397); ray_release(r);
+    char repack[256];
+    snprintf(repack, sizeof(repack), "(.db.block.scan \"%s/repack\" 100000000)", root);
+    ray_t* expected = parted_select(conv, "where: (== date 2024.01.02) i: id v: x k: sy t: s");
+    ray_t* actual = parted_select(repack, "i: id v: x k: sy t: s");
+    test_result_t tr = tables_equal(actual, expected);
+    ray_release(expected); ray_release(actual);
+    if (tr.status != TEST_PASS) return tr;
+    /* Destinations overlapping the source are refused; the source is intact. */
+    const char* overlap[] = {"%s/raw/2024.01.01/t", "%s/raw/2024.01.01/t/sub", "%s/raw", "%s/raw/2024.01.01/t/"};
+    for (unsigned i = 0; i < sizeof(overlap) / sizeof(*overlap); i++) {
+        char dest[256];
+        snprintf(dest, sizeof(dest), overlap[i], root);
+        snprintf(command, sizeof(command),
+            "(.db.block.convert \"%s/raw/2024.01.01/t\" \"%s\" {block-bytes: 256 codec: snappy} {immutable: true})", root, dest);
+        r = ray_eval_str(command);
+        TEST_ASSERT_TRUE(RAY_IS_ERR(r)); TEST_ASSERT_STR_EQ(ray_err_code(r), "domain"); ray_release(r);
+    }
+    snprintf(command, sizeof(command), "%s/raw/2024.01.01/t/.d", root);
+    TEST_ASSERT_EQ_I(access(command, F_OK), 0);
+    snprintf(command, sizeof(command), "%s/raw/2024.01.01/t/.current", root);
+    TEST_ASSERT_EQ_I(access(command, F_OK), -1);
+    /* A standalone flat table with its own .sym. */
+    ray_t* t = parted_table(9, 50, RAY_I64);
+    char flat[256];
+    snprintf(flat, sizeof(flat), "%s/flat", root);
+    snprintf(command, sizeof(command), "%s/flat/.sym", root);
+    TEST_ASSERT_EQ_I(ray_splay_save(t, flat, command), RAY_OK);
+    if (ray_env_set(ray_sym_intern("flat-src", 8), t)) ray_test_fatal("convert bind");
+    ray_release(t);
+    snprintf(command, sizeof(command),
+        "(.db.block.convert \"%s\" \"%s/flat-block\" {block-bytes: 128 codec: snappy} {immutable: true})", flat, root);
+    r = ray_eval_str(command);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r)); TEST_ASSERT_EQ_I(r->i64, 50); ray_release(r);
+    snprintf(repack, sizeof(repack), "(.db.block.scan \"%s/flat-block\" 100000000)", root);
+    expected = parted_select("flat-src", "i: id v: x k: sy t: s");
+    actual = parted_select(repack, "i: id v: x k: sy t: s");
+    tr = tables_equal(actual, expected);
+    ray_release(expected); ray_release(actual);
+    if (tr.status != TEST_PASS) return tr;
+    const char* invalid[] = {
+        "(.db.block.convert \"%s/flat\" \"%s/x\" {block-bytes: 128 codec: snappy} {immutable: 1})",
+        "(.db.block.convert \"%s/flat\" \"%s/x\" {block-bytes: 128 codec: snappy} {other: true})",
+        "(.db.block.convert \"%s/flat\" \"%s/x\" {codec: snappy})",
+        "(.db.block.convert \"%s/missing\" \"%s/x\" {block-bytes: 128 codec: snappy} {immutable: true})"
+    };
+    for (unsigned i = 0; i < sizeof(invalid) / sizeof(*invalid); i++) {
+        snprintf(command, sizeof(command), invalid[i], root, root);
+        r = ray_eval_str(command);
+        TEST_ASSERT_TRUE(RAY_IS_ERR(r)); ray_release(r);
+    }
+    snprintf(command, sizeof(command), "%s/x/.current", root);
+    TEST_ASSERT_EQ_I(access(command, F_OK), -1);
+    PASS();
+}
+
 const test_entry_t block_source_entries[] = {
+    {"block_source/block_convert", block_convert, setup, teardown},
     {"block_source/csv_block", csv_block, setup, teardown},
     {"block_source/parquet_block", parquet_block, setup, teardown},
     {"block_source/parted_parity", parted_parity, setup, teardown},

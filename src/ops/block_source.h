@@ -38,6 +38,12 @@ ray_t* ray_block_source_fn(ray_t** args, int64_t n);
  * same options and select subset as .db.block.scan, plus the virtual partition
  * key column ("date" or "part") in projections, aggregates and comparisons. */
 ray_t* ray_block_parted_fn(ray_t** args, int64_t n);
+/* (.db.block.convert src dest block-options [read-options]): rewrite a raw or
+ * compressed table as a new block generation of dest; returns the row count.
+ * read-options {immutable: BOOL sym: STR} describe the source as for scans;
+ * a partition path <root>/<partition>/<table> defaults sym to <root>/.sym.
+ * See ray_block_store_convert: dest never overlaps src. */
+ray_t* ray_block_convert_fn(ray_t** args, int64_t n);
 /* NULL means not our descriptor; otherwise owned final result/error. */
 ray_t* ray_block_select_source(ray_t* source, ray_t* query);
 #endif

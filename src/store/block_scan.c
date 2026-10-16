@@ -170,7 +170,8 @@ ray_err_t ray_block_scan_open_source(const char* root, const ray_block_scan_sour
                                      const ray_block_scan_options_t* options,
                                      ray_block_scan_t** out) {
     const char* sym_path = source ? source->sym_path : NULL;
-    if (!out || *out || !options || !options->batch_rows || !columns || !count)
+    bool all = !columns && !count;
+    if (!out || *out || !options || !options->batch_rows || (!all && (!columns || !count)))
         return RAY_ERR_DOMAIN;
     if (count > RAY_BLOCK_SCAN_MAX_COLUMNS) return RAY_ERR_LIMIT;
     for (size_t i = 0; i < count; i++) {
@@ -183,9 +184,11 @@ ray_err_t ray_block_scan_open_source(const char* root, const ray_block_scan_sour
     ray_block_scan_t* s = calloc(1, sizeof(*s));
     if (!s) return RAY_ERR_OOM;
     s->options = *options;
-    s->columns = calloc(count, sizeof(*s->columns));
-    if (!s->columns) { free(s); return RAY_ERR_OOM; }
-    s->count = count;
+    if (!all) {
+        s->columns = calloc(count, sizeof(*s->columns));
+        if (!s->columns) { free(s); return RAY_ERR_OOM; }
+        s->count = count;
+    }
     ray_err_t err = ray_splay_lease_acquire(root, &s->lease);
     if (err == RAY_ERR_NYI && source && source->immutable)
         err = scan_flat_dir(root, s->dir, sizeof(s->dir));
@@ -195,6 +198,27 @@ ray_err_t ray_block_scan_open_source(const char* root, const ray_block_scan_sour
         else memcpy(s->dir, dir, strlen(dir) + 1);
     }
     if (!err) err = scan_check_schema(s->dir, columns, count, &s->names);
+    /* Every column of the schema read under this lease, in its order. */
+    char (*all_names)[256] = NULL;
+    const char** all_list = NULL;
+    if (!err && all) {
+        count = (size_t)s->names->len;
+        if (!count) err = RAY_ERR_CORRUPT;
+        else {
+            all_names = malloc(count * sizeof(*all_names));
+            all_list = malloc(count * sizeof(*all_list));
+            s->columns = calloc(count, sizeof(*s->columns));
+            if (!all_names || !all_list || !s->columns) err = RAY_ERR_OOM;
+        }
+        for (size_t i = 0; !err && i < count; i++) {
+            size_t len;
+            const char* name = ray_str_vec_get(s->names, (int64_t)i, &len);
+            memcpy(all_names[i], name, len);
+            all_names[i][len] = '\0';
+            all_list[i] = all_names[i];
+        }
+        if (!err) { s->count = count; columns = all_list; }
+    }
     uint64_t rows = 0, generation = 0, sym_count = 0;
     uint64_t actual_sym_count = 0;
     uint32_t sym_crc = 0, actual_sym_crc = 0;
@@ -253,6 +277,7 @@ ray_err_t ray_block_scan_open_source(const char* root, const ray_block_scan_sour
             s->end = options->count == UINT64_MAX ? rows : s->cursor + options->count;
         }
     }
+    free(all_names); free(all_list);
     if (err) { ray_block_scan_close(&s); return err; }
     *out = s;
     return RAY_OK;
