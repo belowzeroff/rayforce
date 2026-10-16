@@ -52,6 +52,19 @@ ray_err_t ray_col_block_read(const ray_col_block_reader_t* reader, uint64_t bloc
 ray_err_t ray_col_block_range_size(const ray_col_block_reader_t* reader,
                                   uint64_t start, uint64_t count,
                                   size_t* output_bytes, size_t* scratch_bytes);
+/* Directory totals, from metadata only. */
+typedef struct {
+    uint64_t blocks, snappy_blocks, zoned_blocks;
+    uint64_t stored_bytes, decoded_bytes; /* block payloads, before/after codec */
+} ray_col_block_summary_t;
+ray_err_t ray_col_block_summary(const ray_col_block_reader_t* reader,
+                                ray_col_block_summary_t* out);
+/* Full check of every block in order: payload CRC, codec, decoded CRC, STR
+ * framing and SYM positions below sym_count. scratch must hold block_bytes.
+ * On corrupt, *bad_block (optional) is the first failing block. */
+ray_err_t ray_col_block_verify(const ray_col_block_reader_t* reader,
+                               void* scratch, size_t scratch_capacity,
+                               uint64_t* bad_block);
 /* Half-open block interval covering a row range; empty ranges return [0,0). */
 ray_err_t ray_col_block_range_blocks(const ray_col_block_reader_t* reader,
                                     uint64_t start, uint64_t count,

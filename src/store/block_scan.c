@@ -343,6 +343,47 @@ bool ray_block_scan_has_column(const ray_block_scan_t* s, const char* name) {
     return false;
 }
 
+ray_err_t ray_block_scan_column_info(const ray_block_scan_t* s, size_t column,
+                                     ray_block_scan_column_info_t* out) {
+    if (!s || !out || column >= s->count) return RAY_ERR_DOMAIN;
+    memset(out, 0, sizeof(*out));
+    const scan_column_t* c = &s->columns[column];
+    out->type = scan_column_type(c);
+    if (!c->raw) {
+        const ray_col_block_reader_t* r = ray_col_block_file_reader(c->file);
+        out->compressed = true;
+        out->rows = r->rows;
+        out->file_bytes = r->size;
+        out->block_bytes = r->block_bytes;
+        return ray_col_block_summary(r, &out->blocks);
+    }
+    out->rows = (uint64_t)c->raw->len;
+    ray_t* name = ray_sym_str(c->name);
+    if (!name || RAY_IS_ERR(name)) return RAY_ERR_CORRUPT;
+    char path[1300];
+    int n = snprintf(path, sizeof(path), "%s/%.*s", s->dir, (int)ray_str_len(name), ray_str_ptr(name));
+    if (n < 0 || (size_t)n >= sizeof(path)) return RAY_ERR_RANGE;
+    struct stat st;
+    if (stat(path, &st) != 0) return RAY_ERR_IO;
+    out->file_bytes = (uint64_t)st.st_size;
+    return RAY_OK;
+}
+
+ray_err_t ray_block_scan_verify_column(const ray_block_scan_t* s, size_t column,
+                                       uint64_t* checked, uint64_t* bad_block) {
+    if (!s || !checked || column >= s->count) return RAY_ERR_DOMAIN;
+    *checked = 0;
+    const scan_column_t* c = &s->columns[column];
+    if (c->raw) return RAY_OK;
+    const ray_col_block_reader_t* r = ray_col_block_file_reader(c->file);
+    void* scratch = malloc(r->block_bytes ? r->block_bytes : 1);
+    if (!scratch) return RAY_ERR_OOM;
+    ray_err_t err = ray_col_block_verify(r, scratch, r->block_bytes, bad_block);
+    free(scratch);
+    if (!err) *checked = r->blocks;
+    return err;
+}
+
 uint8_t ray_block_scan_column_attrs(const ray_block_scan_t* s, size_t column) {
     if (!s || column >= s->count || !s->columns[column].raw) return 0;
     return s->columns[column].raw->attrs & (RAY_ATTR_SORTED | RAY_ATTR_HAS_NULLS);
