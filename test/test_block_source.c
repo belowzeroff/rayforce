@@ -12,6 +12,7 @@
 #include "table/sym.h"
 #include "table/domain.h"
 #include "store/part.h"
+#include "io/csv.h"
 #include "ops/ops.h"
 #include <stdlib.h>
 #include <unistd.h>
@@ -1035,7 +1036,79 @@ static test_result_t parquet_block(void) {
     PASS();
 }
 
+static void csv_fixture(const char* path, unsigned rows) {
+    FILE* f = fopen(path, "w");
+    if (!f) ray_test_fatal("csv fixture");
+    fprintf(f, "id,px,venue,day,note\n");
+    for (unsigned i = 0; i < rows; i++)
+        fprintf(f, "%u,%u.25,%s,2024.01.%02u,\"%s, %u\"\n", i, i * 3, i % 3 ? "XNAS" : "ARCX",
+                1 + i % 28, i % 4 ? "plain" : "with \"\"quotes\"\" and a longer tail", i);
+    if (fclose(f)) ray_test_fatal("csv fixture close");
+}
+
+static test_result_t csv_block(void) {
+    char csv[128], command[1024], target[128];
+    snprintf(csv, sizeof(csv), "%s/trades.csv", root);
+    csv_fixture(csv, 500);
+    snprintf(command, sizeof(command), "(.csv.read \"%s\")", csv);
+    ray_t* expected = ray_eval_str(command);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(expected));
+    snprintf(target, sizeof(target), "%s/csv1", root);
+    snprintf(command, sizeof(command), "(.csv.block \"%s\" \"%s\" {block-bytes: 256 codec: snappy durable: false})", csv, target);
+    ray_t* rows = ray_eval_str(command);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(rows)); TEST_ASSERT_EQ_I(rows->i64, 500); ray_release(rows);
+    ray_t* actual = parquet_block_readback(target, expected);
+    test_result_t r = tables_equal(actual, expected);
+    ray_release(actual);
+    if (r.status != TEST_PASS) { ray_release(expected); return r; }
+
+    /* Seven-row chunks give the same table as one chunk. */
+    ray_block_store_options_t options = {256, 1, false};
+    int64_t n = 0;
+    snprintf(target, sizeof(target), "%s/csv7", root);
+    TEST_ASSERT_EQ_I(ray_csv_save_block(csv, ',', true, NULL, 0, NULL, 0, target, 7, &options, &n), RAY_OK);
+    TEST_ASSERT_EQ_I(n, 500);
+    actual = parquet_block_readback(target, expected);
+    r = tables_equal(actual, expected);
+    ray_release(actual); ray_release(expected);
+    if (r.status != TEST_PASS) return r;
+
+    /* Explicit names and types, with SYM for the venue. */
+    snprintf(target, sizeof(target), "%s/typed", root);
+    snprintf(command, sizeof(command),
+        "(.csv.block [id px venue day note] [I64 F64 SYM DATE STR] \"%s\" \"%s\" {block-bytes: 512 codec: none})", csv, target);
+    rows = ray_eval_str(command);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(rows)); TEST_ASSERT_EQ_I(rows->i64, 500); ray_release(rows);
+    snprintf(command, sizeof(command),
+        "(select {from: (.db.block.scan \"%s\" 1000000) where: (== day 2024.01.05) v: venue i: id})", target);
+    ray_t* t = ray_eval_str(command);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(t));
+    TEST_ASSERT_EQ_I(ray_table_nrows(t), 18);
+    ray_t* venue = ray_table_get_col_idx(t, 0);
+    TEST_ASSERT_EQ_I(venue->type, RAY_SYM);
+    ray_t* first = ray_sym_vec_cell(venue, 0);
+    TEST_ASSERT_TRUE(ray_str_len(first) == 4 && !memcmp(ray_str_ptr(first), "XNAS", 4));
+    ray_release(t);
+
+    /* Failures publish nothing. */
+    const char* invalid[] = {
+        "(.csv.block \"%s\" \"%s/bad\" {codec: snappy})",
+        "(.csv.block \"%s/missing.csv\" \"%s/bad\" {block-bytes: 64 codec: snappy})",
+        "(.csv.block \"%s\" \"%s/bad\" {block-bytes: 16 codec: snappy})"   /* note > 12 bytes */
+    };
+    for (unsigned i = 0; i < sizeof(invalid) / sizeof(*invalid); i++) {
+        if (i == 1) snprintf(command, sizeof(command), invalid[i], root, root);
+        else snprintf(command, sizeof(command), invalid[i], csv, root);
+        ray_t* e = ray_eval_str(command);
+        TEST_ASSERT_TRUE(RAY_IS_ERR(e)); ray_release(e);
+    }
+    snprintf(command, sizeof(command), "%s/bad/.current", root);
+    TEST_ASSERT_EQ_I(access(command, F_OK), -1);
+    PASS();
+}
+
 const test_entry_t block_source_entries[] = {
+    {"block_source/csv_block", csv_block, setup, teardown},
     {"block_source/parquet_block", parquet_block, setup, teardown},
     {"block_source/parted_parity", parted_parity, setup, teardown},
     {"block_source/parted_pruning", parted_pruning, setup, teardown},

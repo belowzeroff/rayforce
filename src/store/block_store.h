@@ -3,7 +3,7 @@
 #define RAY_BLOCK_STORE_H
 #include <rayforce.h>
 
-typedef struct {
+typedef struct ray_block_store_options_s {
     uint32_t block_bytes;
     uint8_t codec; /* 0 raw blocks, 1 Snappy with raw fallback */
     bool durable;

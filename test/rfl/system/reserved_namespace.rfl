@@ -29,8 +29,8 @@
 ;; size, list
 (count .ipc) -- 6
 ;; open, close, send, post, handle, txlimit
-(count .csv) -- 4
-;; read, splayed, parted, write
+(count .csv) -- 5
+;; read, splayed, parted, write, block
 ;; .db.* — three-level reserved namespace for storage I/O.  The
 ;; root resolves to a dict whose values are themselves dicts
 ;; ({block: …, splayed: …, parted: …}); each format dict carries
@@ -66,6 +66,7 @@
 (nil? (resolve '.csv.read)) -- false
 (nil? (resolve '.csv.splayed)) -- false
 (nil? (resolve '.csv.parted)) -- false
+(nil? (resolve '.csv.block)) -- false
 ;; OS env round-trip: set a key, read it back.
 (.os.setenv "RAYF_NS_TEST" "hello")
 (.os.getenv "RAYF_NS_TEST") -- "hello"
