@@ -12,7 +12,8 @@
  *           work-bytes: I64 immutable: BOOL}.
  * immutable: true admits a flat directory without generations or a reader
  * lease; the caller vouches that nothing rewrites it during the select.
- * Each key is optional. Defaults: 65536 rows, 64 MiB payload, 8 MiB scratch;
+ * Each key is optional. Defaults: rows sized to half the payload limit (at
+ * most 1Mi), 64 MiB payload, 8 MiB scratch;
  * whole blocks of a read decode in parallel on the native pool.
  * work-bytes has no default and, when present, bounds logical result retained
  * by select plus the current payload, scratch, predicate masks, and aggregate

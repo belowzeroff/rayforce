@@ -68,6 +68,9 @@ ray_err_t ray_block_query_source_empty(ray_block_query_t* query, bool* empty);
 /* Owned zero-row output schema, including for an empty/no-match query. */
 ray_t* ray_block_query_schema(const ray_block_query_t* query);
 bool ray_block_query_has_column(const ray_block_query_t* query, const char* name);
+/* Rows per scan batch in effect (resolved RAY_BLOCK_SCAN_AUTO_ROWS); for a
+ * parted query, of the partition being read, 0 between partitions. */
+uint32_t ray_block_query_batch_rows(const ray_block_query_t* query);
 /* Rows before filtering; for a parted query, of the partitions read so far. */
 uint64_t ray_block_query_rows(const ray_block_query_t* query);
 /* Logical bytes retained by the caller while query_next produces a batch.
