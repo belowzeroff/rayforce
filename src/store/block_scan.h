@@ -125,6 +125,11 @@ ray_t* ray_block_scan_next_columns(ray_block_scan_t* scan, const size_t* indices
  * repeated small ranges may decode the same boundary block again. */
 ray_t* ray_block_scan_read_columns(ray_block_scan_t* scan, const size_t* indices,
                                    size_t count, uint64_t start, uint64_t rows);
+/* As read_columns, keeping only rows whose mask byte (one per range row) is
+ * set. Budgets are checked for the whole range; string columns decoded into
+ * an arena build only the kept rows. */
+ray_t* ray_block_scan_read_masked(ray_block_scan_t* scan, const size_t* indices, size_t count,
+                                  uint64_t start, uint64_t rows, const uint8_t* mask);
 /* Set logical bytes retained by the caller while the next batch is produced.
  * The reservation persists until replaced and is only charged by work_limit. */
 ray_err_t ray_block_scan_reserve(ray_block_scan_t* scan, size_t bytes);

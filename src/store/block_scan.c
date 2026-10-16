@@ -427,9 +427,10 @@ static uint32_t scan_auto_rows(const ray_block_scan_t* s) {
     size_t budget = s->options.payload_limit / 2;
     if (s->options.work_limit && s->options.work_limit / 4 < budget) budget = s->options.work_limit / 4;
     double rows = (double)budget / (width > 1 ? width : 1);
-    /* Keep string arenas within scratch, so strings decode once per read. */
-    if (decoded > 0 && (double)s->options.scratch_limit / decoded < rows)
-        rows = (double)s->options.scratch_limit / decoded;
+    /* Keep string arenas within scratch, so strings decode once per read;
+     * a quarter is left for the whole boundary blocks a range also covers. */
+    if (decoded > 0 && 0.75 * (double)s->options.scratch_limit / decoded < rows)
+        rows = 0.75 * (double)s->options.scratch_limit / decoded;
     if (rows > RAY_BLOCK_SCAN_AUTO_MAX) rows = RAY_BLOCK_SCAN_AUTO_MAX;
     return rows < 1 ? 1 : (uint32_t)rows;
 }
@@ -585,8 +586,44 @@ static void scan_free_arenas(ray_block_scan_t* s, const size_t* indices, size_t 
  * otherwise each STR block is decoded twice through one block of scratch:
  * once to measure, once to fill. Either way the exact batch size is known
  * before any output column is allocated. */
+/* Rows of col whose mask byte is set, as a fresh owned vector. SYM keeps its
+ * dictionary domain and width, STR copies its strings into a new pool. */
+static ray_t* scan_compact(ray_t* src, const uint8_t* mask, int64_t kept) {
+    int64_t rows = src->len;
+    ray_t* v;
+    if (src->type == RAY_STR) {
+        v = ray_vec_new(RAY_STR, kept);
+        for (int64_t i = 0; v && !RAY_IS_ERR(v) && i < rows; i++) {
+            if (!mask[i]) continue;
+            size_t len;
+            const char* str = ray_str_vec_get(src, i, &len);
+            v = ray_str_vec_append(v, str, len);
+        }
+    } else {
+        size_t width = ray_sym_elem_size(src->type, src->attrs);
+        v = src->type == RAY_SYM ? ray_sym_vec_new(src->attrs & RAY_SYM_W_MASK, kept) :
+            ray_vec_new(src->type, kept);
+        if (v && !RAY_IS_ERR(v)) {
+            const uint8_t* from = ray_data(src);
+            uint8_t* to = ray_data(v);
+            for (int64_t i = 0; i < rows; i++)
+                if (mask[i]) { memcpy(to, from + (size_t)i * width, width); to += width; }
+            v->len = kept;
+            if (src->type == RAY_SYM) ray_sym_vec_adopt_domain(v, src);
+        }
+    }
+    if (!v) return ray_error("oom", NULL);
+    if (!RAY_IS_ERR(v)) v->attrs |= src->attrs & RAY_ATTR_HAS_NULLS;
+    return v;
+}
+
+/* mask (optional, one byte per row) keeps only marked rows. String columns
+ * decoded into an arena materialize just those; others are compacted. */
 static ray_t* scan_materialize(ray_block_scan_t* s, const size_t* indices,
-                              size_t count, uint64_t start, uint64_t rows) {
+                              size_t count, uint64_t start, uint64_t rows,
+                              const uint8_t* mask) {
+    int64_t kept = (int64_t)rows;
+    if (mask) { kept = 0; for (uint64_t i = 0; i < rows; i++) kept += mask[i] != 0; }
     size_t total = 0, scratch_bytes = 0, scratch_fixed = 0, arena_total = 0;
     bool strings = false, arenas = false;
     void* scratch = NULL;
@@ -647,7 +684,7 @@ static ray_t* scan_materialize(ray_block_scan_t* s, const size_t* indices,
             scan_count_blocks(s, r, start, rows);
             if (column->arena) {
                 err = ray_col_block_decode_arena(r, start, rows, column->arena, column->arena_bytes);
-                if (!err) err = ray_col_block_payload_size_arena(r, start, rows, column->arena, &bytes);
+                if (!err) err = ray_col_block_payload_size_arena(r, start, rows, column->arena, mask, &bytes);
             } else err = ray_col_block_payload_size(r, start, rows, scratch, scratch_bytes, &bytes);
         }
         if (!err && bytes > s->options.payload_limit - total) err = RAY_ERR_LIMIT;
@@ -673,10 +710,15 @@ static ray_t* scan_materialize(ray_block_scan_t* s, const size_t* indices,
         ray_t* col = column->raw ? scan_raw_materialize(column->raw, start, rows) :
             r->type == RAY_STR ?
             (column->arena ?
-                ray_col_block_materialize_str_arena(r, start, rows, column->payload_bytes, column->arena) :
+                ray_col_block_materialize_str_arena(r, start, rows, mask, column->payload_bytes, column->arena) :
                 ray_col_block_materialize_str(r, start, rows, column->payload_bytes, scratch, scratch_bytes)) :
             ray_col_block_materialize_dom(r, start, rows,
                 s->options.payload_limit, scratch, scratch_bytes, s->domain);
+        if (!RAY_IS_ERR(col) && mask && col->len != kept) {
+            ray_t* compact = scan_compact(col, mask, kept);
+            ray_release(col);
+            col = compact;
+        }
         if (RAY_IS_ERR(col)) { ray_release(batch); batch = col; break; }
         batch = ray_table_add_col(batch, column->name, col);
         ray_release(col);
@@ -688,6 +730,19 @@ static ray_t* scan_materialize(ray_block_scan_t* s, const size_t* indices,
     return batch;
 }
 
+ray_t* ray_block_scan_read_masked(ray_block_scan_t* s, const size_t* indices, size_t count,
+                                  uint64_t start, uint64_t rows, const uint8_t* mask) {
+    if (!s) return ray_error("domain", "null block scan");
+    if (s->failed) return ray_error("domain", "block scan is terminal; close it");
+    if (s->cancelled) return scan_error(s, RAY_ERR_CANCEL);
+    if (!mask) return scan_error(s, RAY_ERR_DOMAIN);
+    ray_err_t err = scan_validate_columns(s, indices, count);
+    if (err) return scan_error(s, err);
+    if (start < s->options.start || start > s->end || rows > s->end - start ||
+        rows > s->options.batch_rows) return scan_error(s, RAY_ERR_RANGE);
+    return scan_materialize(s, indices, count, start, rows, mask);
+}
+
 ray_t* ray_block_scan_read_columns(ray_block_scan_t* s, const size_t* indices,
                                    size_t count, uint64_t start, uint64_t rows) {
     if (!s) return ray_error("domain", "null block scan");
@@ -697,7 +752,7 @@ ray_t* ray_block_scan_read_columns(ray_block_scan_t* s, const size_t* indices,
     if (err) return scan_error(s, err);
     if (start < s->options.start || start > s->end || rows > s->end - start ||
         rows > s->options.batch_rows) return scan_error(s, RAY_ERR_RANGE);
-    return scan_materialize(s, indices, count, start, rows);
+    return scan_materialize(s, indices, count, start, rows, NULL);
 }
 
 ray_t* ray_block_scan_next_columns(ray_block_scan_t* s, const size_t* indices,
@@ -710,7 +765,7 @@ ray_t* ray_block_scan_next_columns(ray_block_scan_t* s, const size_t* indices,
     if (s->cursor == s->end) return NULL;
     uint64_t rows = s->end - s->cursor;
     if (rows > s->options.batch_rows) rows = s->options.batch_rows;
-    ray_t* batch = scan_materialize(s, indices, count, s->cursor, rows);
+    ray_t* batch = scan_materialize(s, indices, count, s->cursor, rows, NULL);
     if (!RAY_IS_ERR(batch)) {
         if (row_start) *row_start = s->cursor;
         s->cursor += rows;
