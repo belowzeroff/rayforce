@@ -681,6 +681,21 @@ static test_result_t summary_and_verify(void) {
     put(entry + 44, get(entry + 44, 4) ^ 1, 4);
     rechecksum(bytes);
     TEST_ASSERT_EQ_I(ray_col_block_open(&r, bytes, file_size), RAY_ERR_CORRUPT);
+    put(entry + 44, get(entry + 44, 4) ^ 1, 4);
+    rechecksum(bytes);
+
+    /* Re-signed statistics that lie: reads accept them, verify does not. */
+    TEST_ASSERT_EQ_I(ray_col_block_open(&r, bytes, file_size), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_block_verify(&r, scratch, sizeof(scratch), &bad), RAY_OK);
+    uint8_t* second = bytes + r.directory + RAY_COL_BLOCK_ENTRY;
+    TEST_ASSERT_EQ_I(get(second + 48, 8), 0);
+    put(second + 48, 1, 8); /* min 0 -> 1, still <= max 9 */
+    rechecksum(bytes);
+    TEST_ASSERT_EQ_I(ray_col_block_open(&r, bytes, file_size), RAY_OK);
+    int64_t out[300];
+    TEST_ASSERT_EQ_I(ray_col_block_read_range(&r, 0, 300, out, sizeof(out), scratch, sizeof(scratch)), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_block_verify(&r, scratch, sizeof(scratch), &bad), RAY_ERR_CORRUPT);
+    TEST_ASSERT_EQ_I(bad, 1);
     PASS();
 }
 

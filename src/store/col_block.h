@@ -74,7 +74,8 @@ typedef struct {
 ray_err_t ray_col_block_summary(const ray_col_block_reader_t* reader,
                                 ray_col_block_summary_t* out);
 /* Full check of every block in order, ignoring reader->verified: payload CRC, codec, decoded CRC, STR
- * framing and SYM positions below sym_count. scratch must hold block_bytes.
+ * framing, SYM positions below sym_count, and zone statistics recomputed from
+ * the decoded rows (directory CRCs guard against accidents, not rewrites). scratch must hold block_bytes.
  * On corrupt, *bad_block (optional) is the first failing block. */
 ray_err_t ray_col_block_verify(const ray_col_block_reader_t* reader,
                                void* scratch, size_t scratch_capacity,

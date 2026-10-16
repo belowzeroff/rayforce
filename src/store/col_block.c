@@ -200,6 +200,22 @@ ray_err_t ray_col_block_verify(const ray_col_block_reader_t* reader, void* scrat
                     err = RAY_ERR_CORRUPT; break;
                 }
         }
+        /* Statistics drive pruning: they must describe the decoded rows. */
+        const uint8_t* e = r->data + r->directory + b * RAY_COL_BLOCK_ENTRY;
+        if (!err && (e[34] & 1)) {
+            bool has_null = false, has_value = false;
+            int64_t min = 0, max = 0;
+            for (uint64_t i = 0; i < rows; i++) {
+                int64_t value = zone_value(scratch, i, r->type);
+                if (zone_null(value, r->type)) { has_null = true; continue; }
+                if (!has_value) min = max = value;
+                else { if (value < min) min = value; if (value > max) max = value; }
+                has_value = true;
+            }
+            if (has_null != !!(e[34] & 2) || has_value != !!(e[34] & 4) ||
+                (has_value && (get_i64_le(e + 48) != min || get_i64_le(e + 56) != max)))
+                err = RAY_ERR_CORRUPT;
+        }
         if (err) {
             if (bad_block) *bad_block = b;
             return err;
