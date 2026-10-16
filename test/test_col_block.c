@@ -643,7 +643,36 @@ static test_result_t strings(void) {
     PASS();
 }
 
+static test_result_t summary_and_verify(void) {
+    int64_t values[300];
+    for (int i = 0; i < 300; i++) values[i] = i % 10;
+    TEST_ASSERT_EQ_I(ray_col_block_begin(&writer, file, RAY_I64, 800, 1, 0), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_block_append(&writer, values, 300), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_block_finish(&writer), RAY_OK);
+    snapshot();
+    ray_col_block_reader_t r;
+    TEST_ASSERT_EQ_I(ray_col_block_open(&r, bytes, file_size), RAY_OK);
+    ray_col_block_summary_t s;
+    TEST_ASSERT_EQ_I(ray_col_block_summary(&r, &s), RAY_OK);
+    TEST_ASSERT_EQ_I(s.blocks, 3); TEST_ASSERT_EQ_I(s.decoded_bytes, 2400);
+    TEST_ASSERT_EQ_I(s.snappy_blocks, 3); TEST_ASSERT_EQ_I(s.zoned_blocks, 3);
+    TEST_ASSERT_TRUE(s.stored_bytes < s.decoded_bytes);
+    uint8_t scratch[800];
+    uint64_t bad = 99;
+    TEST_ASSERT_EQ_I(ray_col_block_verify(&r, scratch, 799, &bad), RAY_ERR_LIMIT);
+    TEST_ASSERT_EQ_I(ray_col_block_verify(&r, scratch, sizeof(scratch), &bad), RAY_OK);
+    TEST_ASSERT_EQ_I(bad, 99);
+    /* A payload bit flip in the second block: open passes, verify names it. */
+    const uint8_t* e = bytes + r.directory + RAY_COL_BLOCK_ENTRY;
+    bytes[get(e + 16, 8) + 1] ^= 4;
+    TEST_ASSERT_EQ_I(ray_col_block_open(&r, bytes, file_size), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_block_verify(&r, scratch, sizeof(scratch), &bad), RAY_ERR_CORRUPT);
+    TEST_ASSERT_EQ_I(bad, 1);
+    PASS();
+}
+
 const test_entry_t col_block_entries[] = {
+    {"col_block/summary_and_verify", summary_and_verify, setup, teardown},
     {"col_block/strings", strings, setup, teardown},
     {"col_block/symbols", symbols, setup, teardown},
     {"col_block/roundtrip", roundtrip, setup, teardown},

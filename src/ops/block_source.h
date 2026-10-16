@@ -44,6 +44,16 @@ ray_t* ray_block_parted_fn(ray_t** args, int64_t n);
  * a partition path <root>/<partition>/<table> defaults sym to <root>/.sym.
  * See ray_block_store_convert: dest never overlaps src. */
 ray_t* ray_block_convert_fn(ray_t** args, int64_t n);
+/* (.db.storage.info path [read-options]): column, type, format (raw|block),
+ * codec (none|snappy|mixed), rows, blocks, block_bytes, stored (file bytes),
+ * logical (decoded block bytes; file bytes for raw) and ratio, without
+ * decoding data. (.db.storage.verify path [read-options]): decodes every block
+ * of compressed columns, checking both CRCs, string framing and symbol bounds;
+ * returns blocks checked per column (0 for raw columns, which have no
+ * checksums) or a corrupt error naming the column and block. Both pin one
+ * generation; read options as for .db.block.convert. */
+ray_t* ray_storage_info_fn(ray_t** args, int64_t n);
+ray_t* ray_storage_verify_fn(ray_t** args, int64_t n);
 /* NULL means not our descriptor; otherwise owned final result/error. */
 ray_t* ray_block_select_source(ray_t* source, ray_t* query);
 #endif

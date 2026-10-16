@@ -2,6 +2,7 @@
 #ifndef RAY_BLOCK_SCAN_H
 #define RAY_BLOCK_SCAN_H
 #include <rayforce.h>
+#include "col_block.h"
 
 #define RAY_BLOCK_SCAN_MAX_COLUMNS 1024u
 #define RAY_BLOCK_SCAN_SCHEMA_MAX_BYTES (1024u * 1024u)
@@ -116,6 +117,21 @@ ray_t* ray_block_scan_read_columns(ray_block_scan_t* scan, const size_t* indices
  * The reservation persists until replaced and is only charged by work_limit. */
 ray_err_t ray_block_scan_reserve(ray_block_scan_t* scan, size_t bytes);
 void ray_block_scan_stats(const ray_block_scan_t* scan, ray_block_scan_stats_t* out);
+/* Storage of one selected column of the pinned generation, from metadata. */
+typedef struct {
+    bool compressed;
+    int8_t type;
+    uint64_t rows;
+    uint64_t file_bytes;           /* the column file on disk */
+    uint32_t block_bytes;          /* compressed only */
+    ray_col_block_summary_t blocks; /* compressed only, else zero */
+} ray_block_scan_column_info_t;
+ray_err_t ray_block_scan_column_info(const ray_block_scan_t* scan, size_t column,
+                                     ray_block_scan_column_info_t* out);
+/* Decode and check every block of a compressed column (ray_col_block_verify).
+ * Raw columns carry no checksums: RAY_OK with *checked = 0. */
+ray_err_t ray_block_scan_verify_column(const ray_block_scan_t* scan, size_t column,
+                                       uint64_t* checked, uint64_t* bad_block);
 void ray_block_scan_cancel(ray_block_scan_t* scan);
 void ray_block_scan_close(ray_block_scan_t** scan);
 #endif

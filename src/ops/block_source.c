@@ -6,6 +6,7 @@
 #include "lang/eval.h"
 #include "lang/env.h"
 #include "lang/internal.h"
+#include "lang/format.h"
 #include "table/sym.h"
 #include "vec/vec.h"
 #include "store/block_store.h"
@@ -154,6 +155,133 @@ static const char* convert_default_sym(const char* src, char* buf, size_t size) 
     return n > 0 && (size_t)n < size && stat(buf, &st) == 0 ? buf : NULL;
 }
 
+/* Read options {immutable: BOOL sym: STR} of a stored table; sym defaults to
+ * the parted root's .sym for a partition path. NULL or an owned error. */
+static ray_t* read_source(const char* who, const char* path, ray_t* opts,
+                          ray_block_scan_source_t* source, char* sym, size_t size) {
+    *source = (ray_block_scan_source_t){NULL, false};
+    if (opts) {
+        ray_t* keys = ray_dict_keys(opts); ray_t* vals = ray_dict_vals(opts);
+        bool empty = keys && vals && keys->type == RAY_LIST && vals->type == RAY_LIST && !keys->len;
+        if (!empty && !dictionary(opts)) return ray_error("type", "%s: read options must be a dictionary", who);
+        for (int64_t i = 0; !empty && i < keys->len; i++) {
+            const char* key = string(ray_sym_vec_cell(keys, i));
+            ray_t* value = ray_list_get(vals, i);
+            if (key && !strcmp(key, "immutable") && value && value->type == -RAY_BOOL)
+                source->immutable = value->b8;
+            else if (key && !strcmp(key, "sym") && string(value)) source->sym_path = string(value);
+            else return ray_error("domain", "%s: read options are immutable: BOOL and sym: STR", who);
+        }
+    }
+    if (!source->sym_path) source->sym_path = convert_default_sym(path, sym, size);
+    return NULL;
+}
+
+/* Every column of a stored table, pinned for metadata and verification. */
+static ray_t* storage_open(const char* who, ray_t** args, int64_t n, ray_block_scan_t** scan) {
+    if (ray_eval_get_restricted()) return ray_error("access", "restricted");
+    if (n != 1 && n != 2) return ray_error("arity", "%s: path [read-options]", who);
+    const char* path = string(args[0]);
+    if (!path) return ray_error("domain", "%s: nonempty path required", who);
+    ray_block_scan_source_t source;
+    char sym[1100];
+    ray_t* bad = read_source(who, path, n == 2 ? args[1] : NULL, &source, sym, sizeof(sym));
+    if (bad) return bad;
+    ray_block_scan_options_t read = {0, UINT64_MAX, 1, 0, 0, 0};
+    ray_err_t err = ray_block_scan_open_source(path, &source, NULL, 0, &read, scan);
+    return err ? ray_error(ray_err_code_str(err), "%s: cannot open %s", who, path) : NULL;
+}
+
+static ray_t* storage_table(const char* const* names, ray_t** cols, size_t count) {
+    ray_t* t = ray_table_new((int64_t)count);
+    for (size_t i = 0; t && !RAY_IS_ERR(t) && i < count; i++)
+        t = ray_table_add_col(t, ray_sym_intern(names[i], strlen(names[i])), cols[i]);
+    for (size_t i = 0; i < count; i++) ray_release(cols[i]);
+    return t ? t : ray_error("oom", NULL);
+}
+
+static int64_t storage_symbol(const char* s) { return ray_sym_intern(s, strlen(s)); }
+
+/* (.db.storage.info path [read-options]): one row per column, metadata only. */
+ray_t* ray_storage_info_fn(ray_t** args, int64_t n) {
+    ray_block_scan_t* scan = NULL;
+    ray_t* bad = storage_open(".db.storage.info", args, n, &scan);
+    if (bad) return bad;
+    ray_t* names = ray_block_scan_names(scan);
+    int64_t count = names->len;
+    static const char* const fields[] = {"column", "type", "format", "codec", "rows", "blocks",
+                                         "block_bytes", "stored", "logical", "ratio"};
+    ray_t* cols[10];
+    for (int i = 0; i < 10; i++)
+        cols[i] = i < 4 ? ray_sym_vec_new(RAY_SYM_W64, count) : ray_vec_new(i == 9 ? RAY_F64 : RAY_I64, count);
+    ray_err_t err = RAY_OK;
+    for (int i = 0; i < 10; i++) if (!cols[i] || RAY_IS_ERR(cols[i])) err = RAY_ERR_OOM;
+    for (int64_t c = 0; !err && c < count; c++) {
+        ray_block_scan_column_info_t info;
+        err = ray_block_scan_column_info(scan, (size_t)c, &info);
+        if (err) break;
+        size_t len;
+        const char* name = ray_str_vec_get(names, c, &len);
+        uint64_t logical = info.compressed ? info.blocks.decoded_bytes : info.file_bytes;
+        const char* codec = !info.compressed || !info.blocks.snappy_blocks ? "none" :
+            info.blocks.snappy_blocks == info.blocks.blocks ? "snappy" : "mixed";
+        int64_t syms[] = {ray_sym_intern(name, len), storage_symbol(ray_type_name(info.type)),
+                          storage_symbol(info.compressed ? "block" : "raw"), storage_symbol(codec)};
+        for (int i = 0; i < 4; i++) ((int64_t*)ray_data(cols[i]))[c] = syms[i];
+        int64_t nums[] = {(int64_t)info.rows, (int64_t)info.blocks.blocks, info.block_bytes,
+                          (int64_t)info.file_bytes, (int64_t)logical};
+        for (int i = 0; i < 5; i++) ((int64_t*)ray_data(cols[4 + i]))[c] = nums[i];
+        ((double*)ray_data(cols[9]))[c] = info.file_bytes ? (double)logical / (double)info.file_bytes : 0.0;
+    }
+    ray_block_scan_close(&scan);
+    if (err) {
+        for (int i = 0; i < 10; i++) if (cols[i] && !RAY_IS_ERR(cols[i])) ray_release(cols[i]);
+        return ray_error(ray_err_code_str(err), ".db.storage.info: metadata unavailable");
+    }
+    for (int i = 0; i < 10; i++) cols[i]->len = count;
+    return storage_table(fields, cols, 10);
+}
+
+/* (.db.storage.verify path [read-options]): decode and check every block of
+ * every compressed column; a corrupt block is an error naming its column. */
+ray_t* ray_storage_verify_fn(ray_t** args, int64_t n) {
+    ray_block_scan_t* scan = NULL;
+    ray_t* bad = storage_open(".db.storage.verify", args, n, &scan);
+    if (bad) return bad;
+    ray_t* names = ray_block_scan_names(scan);
+    int64_t count = names->len;
+    static const char* const fields[] = {"column", "format", "blocks"};
+    ray_t* cols[3] = {ray_sym_vec_new(RAY_SYM_W64, count), ray_sym_vec_new(RAY_SYM_W64, count),
+                      ray_vec_new(RAY_I64, count)};
+    ray_t* result = NULL;
+    for (int i = 0; i < 3; i++)
+        if (!cols[i] || RAY_IS_ERR(cols[i])) result = ray_error("oom", NULL);
+    for (int64_t c = 0; !result && c < count; c++) {
+        if (ray_eval_is_interrupted()) { result = ray_error("cancel", ".db.storage.verify: interrupted"); break; }
+        size_t len;
+        const char* name = ray_str_vec_get(names, c, &len);
+        ray_block_scan_column_info_t info;
+        uint64_t checked = 0, block = 0;
+        ray_err_t err = ray_block_scan_column_info(scan, (size_t)c, &info);
+        if (!err) err = ray_block_scan_verify_column(scan, (size_t)c, &checked, &block);
+        if (err) {
+            result = ray_error(ray_err_code_str(err), ".db.storage.verify: %s column %.*s block %llu",
+                               string(args[0]), (int)len, name, (unsigned long long)block);
+            break;
+        }
+        ((int64_t*)ray_data(cols[0]))[c] = ray_sym_intern(name, len);
+        ((int64_t*)ray_data(cols[1]))[c] = storage_symbol(info.compressed ? "block" : "raw");
+        ((int64_t*)ray_data(cols[2]))[c] = (int64_t)checked;
+    }
+    ray_block_scan_close(&scan);
+    if (result) {
+        for (int i = 0; i < 3; i++) if (cols[i] && !RAY_IS_ERR(cols[i])) ray_release(cols[i]);
+        return result;
+    }
+    for (int i = 0; i < 3; i++) cols[i]->len = count;
+    return storage_table(fields, cols, 3);
+}
+
 /* (.db.block.convert src dest block-options [{immutable: BOOL sym: STR}]) */
 ray_t* ray_block_convert_fn(ray_t** args, int64_t n) {
     if (ray_eval_get_restricted()) return ray_error("access", "restricted");
@@ -164,23 +292,10 @@ ray_t* ray_block_convert_fn(ray_t** args, int64_t n) {
     ray_block_store_options_t options;
     ray_err_t err = ray_block_store_parse_options(args[2], &options);
     if (err) return ray_error(ray_err_code_str(err), ".db.block.convert: invalid block options");
-    ray_block_scan_source_t source = {NULL, false};
-    if (n == 4) {
-        ray_t* opts = args[3];
-        ray_t* keys = ray_dict_keys(opts); ray_t* vals = ray_dict_vals(opts);
-        bool empty = keys && vals && keys->type == RAY_LIST && vals->type == RAY_LIST && !keys->len;
-        if (!empty && !dictionary(opts)) return ray_error("type", ".db.block.convert: read options must be a dictionary");
-        for (int64_t i = 0; !empty && i < keys->len; i++) {
-            const char* key = string(ray_sym_vec_cell(keys, i));
-            ray_t* value = ray_list_get(vals, i);
-            if (key && !strcmp(key, "immutable") && value && value->type == -RAY_BOOL)
-                source.immutable = value->b8;
-            else if (key && !strcmp(key, "sym") && string(value)) source.sym_path = string(value);
-            else return ray_error("domain", ".db.block.convert: read options are immutable: BOOL and sym: STR");
-        }
-    }
+    ray_block_scan_source_t source;
     char sym[1100];
-    if (!source.sym_path) source.sym_path = convert_default_sym(src, sym, sizeof(sym));
+    ray_t* bad = read_source(".db.block.convert", src, n == 4 ? args[3] : NULL, &source, sym, sizeof(sym));
+    if (bad) return bad;
     uint64_t rows = 0;
     err = ray_block_store_convert(src, &source, dest, &options, &rows);
     if (err) return ray_error(ray_err_code_str(err), ".db.block.convert: %s -> %s failed", src, dest);

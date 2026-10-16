@@ -165,6 +165,42 @@ ray_err_t ray_col_block_read(const ray_col_block_reader_t* r, uint64_t block,
     return RAY_OK;
 }
 
+ray_err_t ray_col_block_summary(const ray_col_block_reader_t* r,
+                                ray_col_block_summary_t* out) {
+    if (!r || !r->data || !out) return RAY_ERR_DOMAIN;
+    memset(out, 0, sizeof(*out));
+    out->blocks = r->blocks;
+    for (uint64_t b = 0; b < r->blocks; b++) {
+        const uint8_t* e = r->data + r->directory + b * RAY_COL_BLOCK_ENTRY;
+        out->stored_bytes += get_le(e + 24, 4);
+        out->decoded_bytes += get_le(e + 28, 4);
+        out->snappy_blocks += e[32];
+        out->zoned_blocks += e[34] & 1;
+    }
+    return RAY_OK;
+}
+
+ray_err_t ray_col_block_verify(const ray_col_block_reader_t* r, void* scratch,
+                               size_t capacity, uint64_t* bad_block) {
+    if (!r || !r->data || !scratch) return RAY_ERR_DOMAIN;
+    if (capacity < r->block_bytes) return RAY_ERR_LIMIT;
+    for (uint64_t b = 0; b < r->blocks; b++) {
+        uint64_t row, rows;
+        ray_err_t err = ray_col_block_read(r, b, scratch, capacity, &row, &rows);
+        if (!err && r->type == RAY_SYM) {
+            for (uint64_t i = 0; i < rows; i++)
+                if (get_le((const uint8_t*)scratch + i * 8, 8) >= r->sym_count) {
+                    err = RAY_ERR_CORRUPT; break;
+                }
+        }
+        if (err) {
+            if (bad_block) *bad_block = b;
+            return err;
+        }
+    }
+    return RAY_OK;
+}
+
 /* Find the block containing an existing row (row < reader->rows). */
 static uint64_t block_for_row(const ray_col_block_reader_t* r, uint64_t row) {
     uint64_t lo = 0, hi = r->blocks;

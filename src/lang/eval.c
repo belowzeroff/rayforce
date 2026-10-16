@@ -4455,6 +4455,8 @@ static void ray_register_builtins(void) {
     register_vary(".db.block.scan",    RAY_FN_RESTRICTED, ray_block_source_fn);
     register_vary(".db.block.parted",  RAY_FN_RESTRICTED, ray_block_parted_fn);
     register_vary(".db.block.convert", RAY_FN_RESTRICTED, ray_block_convert_fn);
+    register_vary(".db.storage.info",  RAY_FN_RESTRICTED, ray_storage_info_fn);
+    register_vary(".db.storage.verify", RAY_FN_RESTRICTED, ray_storage_verify_fn);
     register_vary(".db.splayed.set",   RAY_FN_RESTRICTED, ray_set_splayed_fn);
     register_vary(".db.splayed.get",   RAY_FN_NONE,       ray_get_splayed_fn);
     register_vary(".db.parted.get",    RAY_FN_NONE,       ray_get_parted_fn);
