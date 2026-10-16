@@ -37,7 +37,12 @@ ray_err_t ray_block_store_save(ray_t* table, const char* root,
  * for save. Validation is per chunk, after staging: a failed append makes the
  * writer terminal, and abort (or a failed finish) discards the generation and
  * leaves the previous one published. One thread at a time. */
-/* {block-bytes: I64 codec: none|snappy [durable: BOOL]}, durable by default. */
+/* Defaults of the block builtins, chosen on the 100M-row benchmark: 64 KiB
+ * Snappy blocks beat 256 KiB on full, narrow and selective scans. */
+#define RAY_BLOCK_STORE_DEFAULT_BYTES 65536u
+#define RAY_BLOCK_STORE_DEFAULT_CODEC 1u
+/* [{block-bytes: I64 codec: none|snappy durable: BOOL}]: every key optional,
+ * NULL or {} gives the defaults, durable included. */
 ray_err_t ray_block_store_parse_options(ray_t* value, ray_block_store_options_t* out);
 typedef struct ray_block_table_writer_s ray_block_table_writer_t;
 ray_err_t ray_block_table_begin(const char* root, ray_t* schema_table,

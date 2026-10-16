@@ -16,17 +16,17 @@ Compared with raw splayed and partitioned tables:
 
 | Function | Description |
 |---|---|
-| `(.db.block.set "dir" table options)` | Save an in-memory table as a new generation of `dir`. Returns the table. |
-| `(.csv.block [names types] "file.csv" "dir" options)` | Stream a CSV file into a block table; the same parse and schema arguments as `.csv.splayed`. Returns the row count. |
-| `(.parquet.block [read-options] "file.parquet" "dir" options)` | Stream a Parquet file into a block table; `read-options` are those of `.parquet.read`. Returns the row count. |
-| `(.db.block.convert "src" "dest" options [read-options])` | Rewrite an existing raw or block table as a block table at `dest`. Returns the row count. |
+| `(.db.block.set "dir" table [options])` | Save an in-memory table as a new generation of `dir`. Returns the table. |
+| `(.csv.block [names types] "file.csv" "dir" [options])` | Stream a CSV file into a block table; the same parse and schema arguments as `.csv.splayed`. Returns the row count. |
+| `(.parquet.block [read-options] "file.parquet" "dir" [options])` | Stream a Parquet file into a block table; `read-options` are those of `.parquet.read`. Returns the row count. |
+| `(.db.block.convert "src" "dest" [options [read-options]])` | Rewrite an existing raw or block table as a block table at `dest`. Returns a table of `rows` with the effective `codec` and `block_bytes`. |
 
-`options` is a dictionary:
+`options` is a dictionary whose keys are all optional; without it, or with `{}`, blocks are 64 KiB Snappy and durable. These defaults won on the benchmark below against 256 KiB blocks on full, narrow and selective scans. The existing `.db.splayed.set` and CSV/Parquet splayed writers stay raw.
 
 | Key | Type | Meaning |
 |---|---|---|
-| `block-bytes` | `I64` | Uncompressed bytes per block, at most 64 MiB. Fixed-width columns hold `block-bytes / width` rows per block; a string must fit in one block. 64 KiB is a good start. |
-| `codec` | `SYM` | `none` or `snappy`. Snappy stores a block raw when compression does not shrink it. |
+| `block-bytes` | `I64` | Default 65536. Uncompressed bytes per block, at most 64 MiB. Fixed-width columns hold `block-bytes / width` rows per block; a string must fit in one block. |
+| `codec` | `SYM` | Default `snappy`; or `none`. Snappy stores a block raw when compression does not shrink it. |
 | `durable` | `BOOL` | Optional, default `true`: fsync files and directories before publishing. |
 
 Supported column types are `B8`, `U8`, `I16`, `I32`, `I64`, `F32`, `F64`, `DATE`, `TIME`, `TIMESTAMP`, `GUID`, `SYM` and `STR`. Symbols are stored in a dictionary private to the generation. Column attributes are not stored: a column carrying `sorted` (or link and index attributes) is rejected with `nyi` rather than silently losing them.
@@ -47,7 +47,7 @@ Writes stream: CSV and Parquet imports and conversions hold one input batch plus
 
 `.db.block.convert` reads its source through a block scan of every column and writes a new generation of `dest`. `dest` may not be the source, inside it, or contain it: the source is never modified.
 
-A whole partitioned database converts with `(.db.block.convert "src-root" 'table "dest-root" options [read-options])`: every partition `src-root/<p>/table` becomes `dest-root/<p>/table`, in partition order, and the result lists each partition's row count. Raw `SYM` columns default to `src-root/.sym`. A failure names its partition; partitions converted before it stay published, and running the command again republishes every partition.
+A whole partitioned database converts with `(.db.block.convert "src-root" 'table "dest-root" options [read-options])`: every partition `src-root/<p>/table` becomes `dest-root/<p>/table`, in partition order, and the result lists each partition's row count with the effective codec and block size. Raw `SYM` columns default to `src-root/.sym`. A failure names its partition; partitions converted before it stay published, and running the command again republishes every partition.
 
 `read-options` describe the source:
 

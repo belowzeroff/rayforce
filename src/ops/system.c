@@ -186,12 +186,16 @@ static const char* block_codec_name(ray_t* value, size_t* len) {
 }
 
 ray_err_t ray_block_store_parse_options(ray_t* value, ray_block_store_options_t* out) {
-    if (!value || value->type != RAY_DICT) return RAY_ERR_TYPE;
+    *out = (ray_block_store_options_t){RAY_BLOCK_STORE_DEFAULT_BYTES, RAY_BLOCK_STORE_DEFAULT_CODEC, true};
+    if (!value) return RAY_OK;
+    if (value->type != RAY_DICT) return RAY_ERR_TYPE;
     ray_t* keys = ray_dict_keys(value);
     ray_t* vals = ray_dict_vals(value);
+    /* The parser represents {} with empty LIST keys and values. */
+    if (keys && vals && keys->type == RAY_LIST && vals->type == RAY_LIST && !keys->len && !vals->len)
+        return RAY_OK;
     if (!keys || !vals || keys->type != RAY_SYM || vals->type != RAY_LIST ||
-        keys->len != vals->len || keys->len < 2 || keys->len > 3) return RAY_ERR_DOMAIN;
-    *out = (ray_block_store_options_t){0, 0, true};
+        keys->len != vals->len || keys->len > 3) return RAY_ERR_DOMAIN;
     unsigned seen = 0;
     for (int64_t i = 0; i < keys->len; i++) {
         ray_t* key = ray_sym_vec_cell(keys, i);
@@ -219,13 +223,13 @@ ray_err_t ray_block_store_parse_options(ray_t* value, ray_block_store_options_t*
             out->durable = option->i64 != 0;
         }
     }
-    return (seen & 3) == 3 ? RAY_OK : RAY_ERR_DOMAIN;
+    return RAY_OK;
 }
 
 /* (.db.block.set path table {block-bytes: I64 codec: SYM durable: BOOL})
  * block-bytes and codec are required; durable defaults to true. */
 ray_t* ray_block_store_fn(ray_t** args, int64_t n) {
-    if (n != 3) return ray_error("arity", ".db.block.set: path table options");
+    if (n != 2 && n != 3) return ray_error("arity", ".db.block.set: path table [options]");
     char path[1024];
     if (!str_to_cpath(args[0], path, sizeof(path)))
         return ray_error(args[0] && args[0]->type == -RAY_STR ? "domain" : "type",
@@ -233,7 +237,7 @@ ray_t* ray_block_store_fn(ray_t** args, int64_t n) {
     if (!args[1] || args[1]->type != RAY_TABLE)
         return ray_error("type", ".db.block.set: value must be a table");
     ray_block_store_options_t options;
-    ray_err_t err = ray_block_store_parse_options(args[2], &options);
+    ray_err_t err = ray_block_store_parse_options(n == 3 ? args[2] : NULL, &options);
     if (err) return ray_error(ray_err_code_str(err), ".db.block.set: invalid options");
     err = ray_block_store_save(args[1], path, &options);
     if (err) return ray_error(ray_err_code_str(err), ".db.block.set: save failed");

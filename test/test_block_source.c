@@ -309,10 +309,8 @@ static test_result_t block_store_api(void) {
     ray_release(r);
 
     const char* invalid[] = {
-        "(.db.block.set \"%s/bad\" raw)",
         "(.db.block.set 1 raw {block-bytes: 256 codec: 'snappy})",
         "(.db.block.set \"%s/bad\" 1 {block-bytes: 256 codec: 'snappy})",
-        "(.db.block.set \"%s/bad\" raw {})",
         "(.db.block.set \"%s/bad\" raw {block-bytes: 0 codec: 'snappy})",
         "(.db.block.set \"%s/bad\" raw {block-bytes: 256 codec: 'other})",
         "(.db.block.set \"%s/bad\" raw {block-bytes: 256 codec: \"snappy\"})",
@@ -711,6 +709,9 @@ static test_result_t aggregate_batch_options(void) {
     PASS();
 }
 
+static int64_t storage_cell(ray_t* table, const char* field, int64_t row);
+static bool storage_sym(ray_t* table, const char* field, int64_t row, const char* expected);
+
 /* ---- Partitioned block sources ---- */
 
 /* Partition p of a small HDB: its own vocabulary plus one shared symbol, so
@@ -1018,10 +1019,9 @@ static test_result_t parquet_block(void) {
     TEST_ASSERT_FALSE(RAY_IS_ERR(r)); ray_release(r);
     /* Invalid block options and missing inputs publish nothing. */
     const char* invalid[] = {
-        "(.parquet.block \"test/data/parquet/bool.parquet\" \"%s/bad\" {codec: snappy})",
+        "(.parquet.block \"test/data/parquet/bool.parquet\" \"%s/bad\" {codec: zstd})",
         "(.parquet.block \"test/data/parquet/bool.parquet\" \"%s/bad\" {block-bytes: 0 codec: snappy})",
-        "(.parquet.block \"test/data/parquet/missing.parquet\" \"%s/bad\" {block-bytes: 64 codec: snappy})",
-        "(.parquet.block \"test/data/parquet/bool.parquet\" \"%s/bad\")"
+        "(.parquet.block \"test/data/parquet/missing.parquet\" \"%s/bad\" {block-bytes: 64 codec: snappy})"
     };
     for (unsigned i = 0; i < sizeof(invalid) / sizeof(*invalid); i++) {
         snprintf(command, sizeof(command), invalid[i], root);
@@ -1093,7 +1093,7 @@ static test_result_t csv_block(void) {
 
     /* Failures publish nothing. */
     const char* invalid[] = {
-        "(.csv.block \"%s\" \"%s/bad\" {codec: snappy})",
+        "(.csv.block \"%s\" \"%s/bad\" {codec: zstd})",
         "(.csv.block \"%s/missing.csv\" \"%s/bad\" {block-bytes: 64 codec: snappy})",
         "(.csv.block \"%s\" \"%s/bad\" {block-bytes: 16 codec: snappy})"   /* note > 12 bytes */
     };
@@ -1116,7 +1116,7 @@ static test_result_t block_convert(void) {
             "(.db.block.convert \"%s/raw/%s/t\" \"%s/conv/%s/t\" {block-bytes: 256 codec: snappy durable: false} {immutable: true})",
             root, parted_days[p], root, parted_days[p]);
         ray_t* r = ray_eval_str(command);
-        TEST_ASSERT_FALSE(RAY_IS_ERR(r)); TEST_ASSERT_EQ_I(r->i64, 300 + 97 * p); ray_release(r);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(r)); TEST_ASSERT_EQ_I(storage_cell(r, "rows", 0), 300 + 97 * p); ray_release(r);
     }
     char raw[256], conv[256];
     snprintf(raw, sizeof(raw), "(.db.parted.get \"%s/raw\" (quote t))", root);
@@ -1142,7 +1142,7 @@ static test_result_t block_convert(void) {
     snprintf(command, sizeof(command),
         "(.db.block.convert \"%s/conv/2024.01.02/t\" \"%s/repack\" {block-bytes: 4096 codec: none durable: false})", root, root);
     r = ray_eval_str(command);
-    TEST_ASSERT_FALSE(RAY_IS_ERR(r)); TEST_ASSERT_EQ_I(r->i64, 397); ray_release(r);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r)); TEST_ASSERT_EQ_I(storage_cell(r, "rows", 0), 397); ray_release(r);
     char repack[256];
     snprintf(repack, sizeof(repack), "(.db.block.scan \"%s/repack\" 100000000)", root);
     ray_t* expected = parted_select(conv, "where: (== date 2024.01.02) i: id v: x k: sy t: s");
@@ -1175,7 +1175,7 @@ static test_result_t block_convert(void) {
     snprintf(command, sizeof(command),
         "(.db.block.convert \"%s\" \"%s/flat-block\" {block-bytes: 128 codec: snappy} {immutable: true})", flat, root);
     r = ray_eval_str(command);
-    TEST_ASSERT_FALSE(RAY_IS_ERR(r)); TEST_ASSERT_EQ_I(r->i64, 50); ray_release(r);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r)); TEST_ASSERT_EQ_I(storage_cell(r, "rows", 0), 50); ray_release(r);
     snprintf(repack, sizeof(repack), "(.db.block.scan \"%s/flat-block\" 100000000)", root);
     expected = parted_select("flat-src", "i: id v: x k: sy t: s");
     actual = parted_select(repack, "i: id v: x k: sy t: s");
@@ -1185,7 +1185,7 @@ static test_result_t block_convert(void) {
     const char* invalid[] = {
         "(.db.block.convert \"%s/flat\" \"%s/x\" {block-bytes: 128 codec: snappy} {immutable: 1})",
         "(.db.block.convert \"%s/flat\" \"%s/x\" {block-bytes: 128 codec: snappy} {other: true})",
-        "(.db.block.convert \"%s/flat\" \"%s/x\" {codec: snappy})",
+        "(.db.block.convert \"%s/flat\" \"%s/x\" {codec: zstd})",
         "(.db.block.convert \"%s/missing\" \"%s/x\" {block-bytes: 128 codec: snappy} {immutable: true})"
     };
     for (unsigned i = 0; i < sizeof(invalid) / sizeof(*invalid); i++) {
@@ -1479,7 +1479,53 @@ static test_result_t block_convert_parted(void) {
     PASS();
 }
 
+/* Without options the block builtins write 64 KiB Snappy blocks and say so. */
+static test_result_t block_defaults(void) {
+    fixture(500, false);
+    char command[512];
+    snprintf(command, sizeof(command), "(.db.block.set \"%s/set\" raw)", root);
+    ray_t* r = ray_eval_str(command);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r)); ray_release(r);
+    snprintf(command, sizeof(command), "(.db.storage.info \"%s/set\")", root);
+    r = ray_eval_str(command);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(storage_cell(r, "block_bytes", 0), RAY_BLOCK_STORE_DEFAULT_BYTES);
+    ray_release(r);
+    snprintf(command, sizeof(command), "(.db.block.convert \"%s/set\" \"%s/conv\")", root, root);
+    r = ray_eval_str(command);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(storage_cell(r, "rows", 0), 500);
+    TEST_ASSERT_TRUE(storage_sym(r, "codec", 0, "snappy"));
+    TEST_ASSERT_EQ_I(storage_cell(r, "block_bytes", 0), RAY_BLOCK_STORE_DEFAULT_BYTES);
+    ray_release(r);
+    snprintf(command, sizeof(command), "(.db.block.convert \"%s/set\" \"%s/none\" {codec: none} {})", root, root);
+    r = ray_eval_str(command);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r)); TEST_ASSERT_TRUE(storage_sym(r, "codec", 0, "none")); ray_release(r);
+    snprintf(command, sizeof(command), "(.db.block.convert \"%s/set\" \"%s/empty\" {})", root, root);
+    r = ray_eval_str(command);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r)); TEST_ASSERT_TRUE(storage_sym(r, "codec", 0, "snappy")); ray_release(r);
+    snprintf(command, sizeof(command), "(.parquet.block \"test/data/parquet/bool.parquet\" \"%s/pq\")", root);
+    r = ray_eval_str(command);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r)); ray_release(r);
+    snprintf(command, sizeof(command), "(.parquet.block [b] \"test/data/parquet/bool.parquet\" \"%s/pq2\")", root);
+    r = ray_eval_str(command);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r) || r->i64 >= 0); ray_release(r);
+    char csv[128];
+    snprintf(csv, sizeof(csv), "%s/d.csv", root);
+    csv_fixture(csv, 20);
+    snprintf(command, sizeof(command), "(.csv.block \"%s\" \"%s/csv\")", csv, root);
+    r = ray_eval_str(command);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r)); TEST_ASSERT_EQ_I(r->i64, 20); ray_release(r);
+    snprintf(command, sizeof(command), "(.db.storage.info \"%s/csv\")", root);
+    r = ray_eval_str(command);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(storage_cell(r, "block_bytes", 0), RAY_BLOCK_STORE_DEFAULT_BYTES);
+    ray_release(r);
+    PASS();
+}
+
 const test_entry_t block_source_entries[] = {
+    {"block_source/block_defaults", block_defaults, setup, teardown},
     {"block_source/block_convert_parted", block_convert_parted, setup, teardown},
     {"block_source/string_arena_fallback", string_arena_fallback, setup, teardown},
     {"block_source/storage_parted", storage_parted, setup, teardown},
