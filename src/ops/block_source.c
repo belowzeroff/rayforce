@@ -383,6 +383,28 @@ ray_t* ray_storage_verify_fn(ray_t** args, int64_t n) {
 /* (.db.block.convert src dest block-options [{immutable: BOOL sym: STR}]) */
 /* (.db.block.convert src-root 'table dest-root block-options [read-options]):
  * every partition src-root/<p>/table into dest-root/<p>/table, in key order. */
+/* Append the effective codec and block size, so defaults are visible. */
+static ray_t* convert_settings(ray_t* t, const ray_block_store_options_t* o, int64_t rows) {
+    ray_t* codec = ray_sym_vec_new(RAY_SYM_W64, rows);
+    ray_t* bytes = ray_vec_new(RAY_I64, rows);
+    if (!t || RAY_IS_ERR(t) || !codec || RAY_IS_ERR(codec) || !bytes || RAY_IS_ERR(bytes)) {
+        if (t && !RAY_IS_ERR(t)) ray_release(t);
+        if (codec && !RAY_IS_ERR(codec)) ray_release(codec);
+        if (bytes && !RAY_IS_ERR(bytes)) ray_release(bytes);
+        return ray_error("oom", NULL);
+    }
+    int64_t name = o->codec ? ray_sym_intern("snappy", 6) : ray_sym_intern("none", 4);
+    for (int64_t i = 0; i < rows; i++) {
+        ((int64_t*)ray_data(codec))[i] = name;
+        ((int64_t*)ray_data(bytes))[i] = o->block_bytes;
+    }
+    codec->len = bytes->len = rows;
+    t = ray_table_add_col(t, ray_sym_intern("codec", 5), codec);
+    t = ray_table_add_col(t, ray_sym_intern("block_bytes", 11), bytes);
+    ray_release(codec); ray_release(bytes);
+    return t ? t : ray_error("oom", NULL);
+}
+
 static ray_t* convert_parted(ray_t** args, int64_t n) {
     const char* src = string(args[0]);
     const char* table = table_name(args[1]);
@@ -390,7 +412,7 @@ static ray_t* convert_parted(ray_t** args, int64_t n) {
     if (!src || !table || !dest)
         return ray_error("domain", ".db.block.convert: nonempty roots and a table symbol required");
     ray_block_store_options_t options;
-    ray_err_t err = ray_block_store_parse_options(args[3], &options);
+    ray_err_t err = ray_block_store_parse_options(n > 3 ? args[3] : NULL, &options);
     if (err) return ray_error(ray_err_code_str(err), ".db.block.convert: invalid block options");
     bool overlap;
     err = ray_block_store_paths_overlap(src, dest, &overlap);
@@ -437,22 +459,22 @@ static ray_t* convert_parted(ray_t** args, int64_t n) {
     }
     ray_parted_dirs_free(dirs, count);
     if (result) { ray_release(parts); ray_release(rows); return result; }
-    ray_t* t = ray_table_new(2);
+    ray_t* t = ray_table_new(4);
     t = ray_table_add_col(t, ray_sym_intern("partition", 9), parts);
     t = ray_table_add_col(t, ray_sym_intern("rows", 4), rows);
     ray_release(parts); ray_release(rows);
-    return t ? t : ray_error("oom", NULL);
+    return convert_settings(t, &options, count);
 }
 
 ray_t* ray_block_convert_fn(ray_t** args, int64_t n) {
     if (ray_eval_get_restricted()) return ray_error("access", "restricted");
-    if ((n == 4 || n == 5) && args[1] && args[1]->type == -RAY_SYM) return convert_parted(args, n);
-    if (n != 3 && n != 4) return ray_error("arity", ".db.block.convert: src dest block-options [read-options]");
+    if (n >= 3 && n <= 5 && args[1] && args[1]->type == -RAY_SYM) return convert_parted(args, n);
+    if (n < 2 || n > 4) return ray_error("arity", ".db.block.convert: src dest [block-options [read-options]]");
     const char* src = string(args[0]);
     const char* dest = string(args[1]);
     if (!src || !dest) return ray_error("domain", ".db.block.convert: nonempty source and destination paths required");
     ray_block_store_options_t options;
-    ray_err_t err = ray_block_store_parse_options(args[2], &options);
+    ray_err_t err = ray_block_store_parse_options(n > 2 ? args[2] : NULL, &options);
     if (err) return ray_error(ray_err_code_str(err), ".db.block.convert: invalid block options");
     ray_block_scan_source_t source;
     char sym[1100];
@@ -461,7 +483,14 @@ ray_t* ray_block_convert_fn(ray_t** args, int64_t n) {
     uint64_t rows = 0;
     err = ray_block_store_convert(src, &source, dest, &options, &rows);
     if (err) return ray_error(ray_err_code_str(err), ".db.block.convert: %s -> %s failed", src, dest);
-    return ray_i64((int64_t)rows);
+    ray_t* count = ray_vec_new(RAY_I64, 1);
+    if (!count || RAY_IS_ERR(count)) return ray_error("oom", NULL);
+    ((int64_t*)ray_data(count))[0] = (int64_t)rows;
+    count->len = 1;
+    ray_t* t = ray_table_new(3);
+    t = ray_table_add_col(t, ray_sym_intern("rows", 4), count);
+    ray_release(count);
+    return convert_settings(t, &options, 1);
 }
 
 typedef struct {

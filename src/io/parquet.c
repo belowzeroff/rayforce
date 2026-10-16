@@ -3364,13 +3364,16 @@ ray_t* ray_parquet_block_fn(ray_t** args, int64_t n) {
 #ifdef RAY_FUZZING
     return ray_error("restricted","Parquet imports disabled under fuzzing");
 #endif
-    if (n != 3 && n != 4) return ray_error("arity","parquet.block: [read-options] path root block-options");
-    const char* path = pq_path_arg(args[n-3]); const char* root = pq_path_arg(args[n-2]);
+    if (n < 2 || n > 4) return ray_error("arity","parquet.block: [read-options] path root [block-options]");
+    /* A leading string is the path: read options, when given, come first. */
+    int64_t at = args[0]->type == -RAY_STR ? 0 : 1;
+    if (n < at + 2 || n > at + 3) return ray_error("arity","parquet.block: [read-options] path root [block-options]");
+    const char* path = pq_path_arg(args[at]); const char* root = pq_path_arg(args[at+1]);
     if (!path || !root) return ray_error("type","parquet.block: expected two paths");
     ray_block_store_options_t options;
-    ray_err_t e = ray_block_store_parse_options(args[n-1],&options);
+    ray_err_t e = ray_block_store_parse_options(n == at + 3 ? args[at+2] : NULL,&options);
     if (e) return pq_block_error(e,"invalid block options");
-    ray_t* read_options = n == 4 ? args[0] : NULL;
+    ray_t* read_options = at ? args[0] : NULL;
     ray_parquet_t* r = NULL;
     ray_t* err = pq_open_options(path,read_options,&r);
     if (err) return err;

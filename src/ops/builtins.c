@@ -712,12 +712,14 @@ ray_t* ray_read_csv_splayed_fn(ray_t** args, int64_t n) {
 
 /* (.csv.block [names types] path root block-options): row count. */
 ray_t* ray_read_csv_block_fn(ray_t** args, int64_t n) {
-    if (n < 3 || n > 5) return ray_error("arity", "csv.block: expects 3 to 5 arguments, got %lld", (long long)n);
+    if (n < 2 || n > 5) return ray_error("arity", "csv.block: expects 2 to 5 arguments, got %lld", (long long)n);
+    /* Block options, when given, are the trailing dictionary. */
+    bool has_options = args[n - 1] && args[n - 1]->type == RAY_DICT;
     ray_block_store_options_t options;
-    ray_err_t err = ray_block_store_parse_options(args[n - 1], &options);
+    ray_err_t err = ray_block_store_parse_options(has_options ? args[n - 1] : NULL, &options);
     if (err) return ray_error(ray_err_code_str(err), "csv.block: invalid block options");
     csv_target_t t;
-    ray_t* bad = csv_target_args("csv.block", args, n - 1, &t);
+    ray_t* bad = csv_target_args("csv.block", args, has_options ? n - 1 : n, &t);
     if (bad) return bad;
     int64_t rows = 0;
     err = ray_csv_save_block(t.path, 0, t.header, t.types, t.ncols, t.names, t.ncols,
