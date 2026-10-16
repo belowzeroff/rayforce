@@ -10,7 +10,8 @@
 #define RAY_COL_BLOCK_ENTRY 64u
 #define RAY_COL_BLOCK_FOOTER 32u
 
-/* Experimental major-2 block container. No semantic attrs or indexes.
+/* Experimental major-2 block container. No semantic attrs or external indexes.
+ * Integer and temporal blocks may carry CRC-protected min/max zone metadata.
  * STR blocks contain repeated [u32 byte length, bytes], with zero length
  * representing the canonical empty/null string. No runtime descriptors persist.
  * SYM payloads are uint64 positions in a generation-local dictionary, bound
@@ -27,6 +28,11 @@ typedef struct {
     uint64_t sym_count;
     uint32_t sym_crc;
 } ray_col_block_reader_t;
+
+typedef enum {
+    RAY_COL_BLOCK_EQ, RAY_COL_BLOCK_NE, RAY_COL_BLOCK_LT,
+    RAY_COL_BLOCK_LE, RAY_COL_BLOCK_GT, RAY_COL_BLOCK_GE
+} ray_col_block_cmp_t;
 
 ray_err_t ray_col_block_open(ray_col_block_reader_t* reader,
                              const void* data, size_t size);
@@ -50,6 +56,13 @@ ray_err_t ray_col_block_range_size(const ray_col_block_reader_t* reader,
 ray_err_t ray_col_block_range_blocks(const ray_col_block_reader_t* reader,
                                     uint64_t start, uint64_t count,
                                     uint64_t* first, uint64_t* end);
+/* Conservative integer/temporal zone-map probe. true means decode may be
+ * needed; false proves that no row in the range can satisfy the comparison.
+ * Legacy entries and unsupported types always return true. */
+ray_err_t ray_col_block_range_may_match(const ray_col_block_reader_t* reader,
+                                       uint64_t start, uint64_t count,
+                                       ray_col_block_cmp_t op, int64_t value,
+                                       bool value_is_null, bool* may_match);
 /* Exact native payload (STR descriptors + pooled bytes, fixed width otherwise).
  * STR validates/decodes selected blocks with caller scratch, without allocation.
  * Pool > UINT32_MAX returns range, matching the native STR representation. */

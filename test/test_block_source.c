@@ -593,7 +593,7 @@ static test_result_t query_work_budget(void) {
     char command[512];
     for (unsigned i = 0; i < 2; i++) {
         snprintf(command, sizeof(command),
-            "(select {from: (.db.block.scan \"%s\" 8192 {batch-rows: 2 payload-bytes: 16 scratch-bytes: 256 work-bytes: %u}) where: (and (>= x 99) (< x 100)) id: id})",
+            "(select {from: (.db.block.scan \"%s\" 8192 {batch-rows: 2 payload-bytes: 16 scratch-bytes: 256 work-bytes: %u}) where: (and (>= x 4) (< x 1)) id: id})",
             root, 278 - i);
         ray_t* r = ray_eval_str(command);
         TEST_ASSERT_NOT_NULL(r);

@@ -1116,6 +1116,33 @@ static test_result_t query_native_parity(void) {
     PASS();
 }
 
+static test_result_t query_zone_pruning(void) {
+    publish(1, 16, 16, 1);
+    damage("x", RAY_COL_BLOCK_HEADER);
+    const char* output[] = {"y"};
+    ray_block_scan_options_t read = {0, 16, 8, 64, 64, 0};
+    ray_t* atom = ray_i64(108);
+    ray_block_predicate_t pred = {"x", OP_GE, atom};
+    TEST_ASSERT_EQ_I(ray_block_query_open(root, output, 1, &pred, 1, &read, &query), RAY_OK);
+    ray_t* batch = ray_block_query_next(query);
+    TEST_ASSERT_NOT_NULL(batch); TEST_ASSERT_FALSE(RAY_IS_ERR(batch));
+    TEST_ASSERT_EQ_I(ray_table_nrows(batch), 8);
+    ray_t* y = ray_table_get_col_idx(batch, 0);
+    for (int64_t i = 0; i < 8; i++)
+        TEST_ASSERT_EQ_I(((int32_t*)ray_data(y))[i], 1008 + i);
+    ray_release(batch);
+    TEST_ASSERT_TRUE(ray_block_query_next(query) == NULL);
+    ray_block_query_close(&query);
+
+    pred.opcode = OP_LT;
+    TEST_ASSERT_EQ_I(ray_block_query_open(root, output, 1, &pred, 1, &read, &query), RAY_OK);
+    ray_release(atom);
+    batch = ray_block_query_next(query);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(batch)); TEST_ASSERT_STR_EQ(ray_err_code(batch), "corrupt");
+    ray_release(batch);
+    PASS();
+}
+
 static test_result_t query_admission(void) {
     publish(1, 16, 16, 1);
     const char* output[] = {"y"};
@@ -1197,6 +1224,7 @@ const test_entry_t block_scan_entries[] = {
     {"block_scan/query_late_materialization", query_late_materialization, setup, teardown},
     {"block_scan/query_conjunction", query_conjunction, setup, teardown},
     {"block_scan/query_native_parity", query_native_parity, setup, teardown},
+    {"block_scan/query_zone_pruning", query_zone_pruning, setup, teardown},
     {"block_scan/query_admission", query_admission, setup, teardown},
     {"block_scan/subset_variable_width", subset_variable_width, setup, teardown},
     {"block_scan/subset_ranges", subset_ranges, setup, teardown},

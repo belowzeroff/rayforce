@@ -13,6 +13,10 @@ typedef struct {
     size_t payload_limit, scratch_limit;
     size_t work_limit; /* 0 disables the combined logical-work cap */
 } ray_block_scan_options_t;
+typedef enum {
+    RAY_BLOCK_SCAN_EQ, RAY_BLOCK_SCAN_NE, RAY_BLOCK_SCAN_LT,
+    RAY_BLOCK_SCAN_LE, RAY_BLOCK_SCAN_GT, RAY_BLOCK_SCAN_GE
+} ray_block_scan_cmp_t;
 
 /* Internal named-column scan over mixed major-0 raw and major-2 block files.
  * Explicit projection: 1..1024 unique, safe column filenames declared by .d.
@@ -45,6 +49,17 @@ ray_t* ray_block_scan_schema(const ray_block_scan_t* scan);
 bool ray_block_scan_has_column(const ray_block_scan_t* scan, const char* name);
 /* Configured row-range cardinality, before filtering; stable across next(). */
 uint64_t ray_block_scan_rows(const ray_block_scan_t* scan);
+/* Inspect the next batch range without reading payload or moving the cursor. */
+ray_err_t ray_block_scan_next_range(const ray_block_scan_t* scan,
+                                    uint64_t* start, uint64_t* rows);
+/* Conservative metadata probe for one projected column and row range. Raw,
+ * legacy, and unsupported columns report true. No payload bytes are read. */
+ray_err_t ray_block_scan_range_may_match(const ray_block_scan_t* scan,
+                                        size_t column, uint64_t start, uint64_t rows,
+                                        ray_block_scan_cmp_t op, int64_t value,
+                                        bool value_is_null, bool* may_match);
+/* Advance over exactly the next batch without reading payload. */
+ray_err_t ray_block_scan_skip_next(ray_block_scan_t* scan, uint64_t* row_start);
 /* Owned table, NULL at EOF, or owned runtime error. Batches outlive scan.
  * On any error scan is terminal; close it rather than retrying. No row cursor
  * advancement until a complete batch succeeds. Cancel is checked at next(),
