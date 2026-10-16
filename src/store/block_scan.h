@@ -89,6 +89,10 @@ ray_err_t ray_block_scan_range_may_match(const ray_block_scan_t* scan,
                                         size_t column, uint64_t start, uint64_t rows,
                                         ray_block_scan_cmp_t op, int64_t value,
                                         bool value_is_null, bool* may_match);
+/* Rows per block of a compressed zone-mapped column (BOOL..TIMESTAMP, not
+ * STR/SYM/float), the granularity at which its statistics prune; 0 for raw
+ * and other columns. Every block but the last holds exactly this many rows. */
+uint64_t ray_block_scan_zone_rows(const ray_block_scan_t* scan, size_t column);
 /* Advance over exactly the next batch without reading payload. */
 ray_err_t ray_block_scan_skip_next(ray_block_scan_t* scan, uint64_t* row_start);
 /* Owned table, NULL at EOF, or owned runtime error. Batches outlive scan.
