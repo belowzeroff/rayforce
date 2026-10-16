@@ -9,7 +9,9 @@
  * batches own copied raw ranges and remain valid after the lease is released.
  * Results grow in singly-owned column buffers; the table is built once at EOF.
  * Options: {batch-rows: I64 payload-bytes: I64 scratch-bytes: I64
- *           work-bytes: I64}.
+ *           work-bytes: I64 immutable: BOOL}.
+ * immutable: true admits a flat directory without generations or a reader
+ * lease; the caller vouches that nothing rewrites it during the select.
  * Each key is optional. Defaults: 4096 rows, 8 MiB payload, 8 MiB scratch.
  * work-bytes has no default and, when present, bounds logical result retained
  * by select plus the current payload, scratch, predicate masks, and aggregate
@@ -31,6 +33,11 @@
  * select and registry kernels disagree on its null hint in this engine version.
  * Ordinary .db.splayed.get/set are unchanged. */
 ray_t* ray_block_source_fn(ray_t** args, int64_t n);
+/* Experimental (.db.block.parted root table result-bytes [options]) descriptor
+ * over <root>/<partition>/<table>; see ray_block_query_open_parted. Accepts the
+ * same options and select subset as .db.block.scan, plus the virtual partition
+ * key column ("date" or "part") in projections, aggregates and comparisons. */
+ray_t* ray_block_parted_fn(ray_t** args, int64_t n);
 /* NULL means not our descriptor; otherwise owned final result/error. */
 ray_t* ray_block_select_source(ray_t* source, ray_t* query);
 #endif

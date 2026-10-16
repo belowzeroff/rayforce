@@ -2,8 +2,13 @@
 #include "block_query.h"
 #include "ops.h"
 #include "lang/eval.h"
+#include "store/part.h"
+#include "mem/heap.h"
+#include "table/sym.h"
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 
 typedef struct {
     char column[256];
@@ -12,7 +17,18 @@ typedef struct {
     ray_t* value;
 } predicate_t;
 
+typedef struct block_parted_s block_parted_t;
+static void parted_free(block_parted_t* p);
+static ray_err_t parted_reserve(block_parted_t* p);
+static ray_err_t parted_set_reserve(block_parted_t* p, size_t bytes);
+static ray_err_t parted_source_empty(block_parted_t* p, bool* empty);
+static bool parted_has_column(const block_parted_t* p, const char* name);
+static void parted_cancel(block_parted_t* p);
+static uint64_t parted_rows(const block_parted_t* p);
+static ray_t* parted_next(ray_block_query_t* q);
+
 struct ray_block_query_s {
+    block_parted_t* parted; /* set for a partitioned query, which has no scan */
     ray_block_scan_t* scan;
     predicate_t predicates[RAY_BLOCK_QUERY_MAX_PREDICATES];
     size_t filter_indices[RAY_BLOCK_QUERY_MAX_PREDICATES];
@@ -31,6 +47,7 @@ void ray_block_query_close(ray_block_query_t** query) {
     for (size_t i = 0; i < q->n_predicates; i++) ray_release(q->predicates[i].value);
     ray_release(q->schema);
     ray_release(q->mask);
+    parted_free(q->parted);
     free(q);
     *query = NULL;
 }
@@ -57,6 +74,16 @@ ray_err_t ray_block_query_open(const char* root, const char* const* columns,
                              size_t count, const ray_block_predicate_t* predicates,
                              size_t n_predicates, const ray_block_scan_options_t* options,
                              ray_block_query_t** out) {
+    return ray_block_query_open_source(root, NULL, columns, count, predicates, n_predicates,
+                                       options, out);
+}
+
+ray_err_t ray_block_query_open_source(const char* root, const ray_block_scan_source_t* source,
+                                      const char* const* columns, size_t count,
+                                      const ray_block_predicate_t* predicates,
+                                      size_t n_predicates,
+                                      const ray_block_scan_options_t* options,
+                                      ray_block_query_t** out) {
     if (!out || *out || !columns || !count || !options || (n_predicates && !predicates))
         return RAY_ERR_DOMAIN;
     if (count > RAY_BLOCK_SCAN_MAX_COLUMNS || n_predicates > RAY_BLOCK_QUERY_MAX_PREDICATES)
@@ -100,7 +127,7 @@ ray_err_t ray_block_query_open(const char* root, const char* const* columns,
         while (j < q->n_filters && q->filter_indices[j] != index) j++;
         if (j == q->n_filters) q->filter_indices[q->n_filters++] = index;
     }
-    if (!err) err = ray_block_scan_open(root, names, n, options, &q->scan);
+    if (!err) err = ray_block_scan_open_source(root, source, names, n, options, &q->scan);
     ray_t* schema = NULL;
     if (!err) {
         schema = ray_block_scan_schema(q->scan);
@@ -128,11 +155,20 @@ ray_err_t ray_block_query_open(const char* root, const char* const* columns,
 }
 
 uint64_t ray_block_query_rows(const ray_block_query_t* q) {
-    return q ? ray_block_scan_rows(q->scan) : 0;
+    if (!q) return 0;
+    return q->parted ? parted_rows(q->parted) : ray_block_scan_rows(q->scan);
+}
+
+ray_err_t ray_block_query_source_empty(ray_block_query_t* q, bool* empty) {
+    if (!q || !empty || q->failed) return RAY_ERR_DOMAIN;
+    if (q->parted) return parted_source_empty(q->parted, empty);
+    *empty = !ray_block_scan_rows(q->scan);
+    return RAY_OK;
 }
 
 ray_err_t ray_block_query_reserve(ray_block_query_t* q, size_t bytes) {
     if (!q || q->failed) return RAY_ERR_DOMAIN;
+    if (q->parted) return parted_set_reserve(q->parted, bytes);
     size_t mask_bytes = q->mask ? (size_t)q->mask->len : 0;
     if (bytes > SIZE_MAX - mask_bytes) return RAY_ERR_LIMIT;
     ray_err_t err = ray_block_scan_reserve(q->scan, bytes + mask_bytes);
@@ -142,7 +178,8 @@ ray_err_t ray_block_query_reserve(ray_block_query_t* q, size_t bytes) {
 }
 
 bool ray_block_query_has_column(const ray_block_query_t* q, const char* name) {
-    return q && ray_block_scan_has_column(q->scan, name);
+    if (!q) return false;
+    return q->parted ? parted_has_column(q->parted, name) : ray_block_scan_has_column(q->scan, name);
 }
 
 ray_t* ray_block_query_schema(const ray_block_query_t* q) {
@@ -152,7 +189,10 @@ ray_t* ray_block_query_schema(const ray_block_query_t* q) {
 }
 
 void ray_block_query_cancel(ray_block_query_t* q) {
-    if (q) { q->cancelled = true; ray_block_scan_cancel(q->scan); }
+    if (!q) return;
+    q->cancelled = true;
+    if (q->parted) parted_cancel(q->parted);
+    else ray_block_scan_cancel(q->scan);
 }
 
 static ray_t* query_mask(ray_block_query_t* q, ray_t* batch) {
@@ -230,6 +270,11 @@ ray_t* ray_block_query_next(ray_block_query_t* q) {
     if (!q) return ray_error("domain", "null block query");
     if (q->failed) return ray_error("domain", "block query is terminal; close it");
     ray_t* result;
+    if (q->parted) {
+        result = parted_next(q);
+        if (RAY_IS_ERR(result)) q->failed = true;
+        return result;
+    }
     for (;;) {
         if (q->cancelled || ray_eval_is_interrupted()) {
             result = ray_error("cancel", "block query cancelled"); break;
@@ -289,4 +334,376 @@ ray_t* ray_block_query_next(ray_block_query_t* q) {
     }
     if (RAY_IS_ERR(result)) q->failed = true;
     return result;
+}
+
+/* ---- Partitioned queries ------------------------------------------------ */
+
+typedef struct {
+    int64_t name;  /* output column name */
+    bool key;
+    size_t data;   /* index into the partition projection */
+} parted_output_t;
+
+typedef struct {
+    uint16_t opcode;
+    int64_t value;
+} key_predicate_t;
+
+struct block_parted_s {
+    char root[1024], table[256], sym_path[1100];
+    bool has_sym, immutable, cancelled;
+    char** dirs;
+    int64_t n_dirs, next, reading;
+    uint8_t mc_type;
+    int8_t key_type;
+    int64_t key_name;
+    parted_output_t* outputs;
+    size_t n_outputs;
+    char (*data)[256];
+    const char* data_names[RAY_BLOCK_SCAN_MAX_COLUMNS];
+    int8_t* data_types;
+    size_t n_data;
+    predicate_t predicates[RAY_BLOCK_QUERY_MAX_PREDICATES];
+    size_t n_predicates;
+    key_predicate_t keys[RAY_BLOCK_QUERY_MAX_PREDICATES];
+    size_t n_keys;
+    ray_block_scan_options_t options;
+    ray_t* names;        /* first partition's full name schema */
+    ray_block_query_t* current;
+    uint64_t first_rows, rows_read;
+    size_t row_bytes;    /* key and SYM copies per output row */
+    size_t external_reserve;
+};
+
+static void parted_free(block_parted_t* p) {
+    if (!p) return;
+    ray_block_query_close(&p->current);
+    for (size_t i = 0; i < p->n_predicates; i++) ray_release(p->predicates[i].value);
+    ray_release(p->names);
+    ray_parted_dirs_free(p->dirs, p->n_dirs);
+    free(p->outputs); free(p->data); free(p->data_types);
+    free(p);
+}
+
+static bool key_match(const key_predicate_t* k, int64_t key) {
+    switch (k->opcode) {
+    case OP_EQ: return key == k->value;
+    case OP_NE: return key != k->value;
+    case OP_LT: return key < k->value;
+    case OP_LE: return key <= k->value;
+    case OP_GT: return key > k->value;
+    default: return key >= k->value;
+    }
+}
+
+static bool parted_pruned(const block_parted_t* p, int64_t partition) {
+    if (!p->n_keys) return false;
+    int64_t key = ray_parted_dir_key(p->dirs[partition], p->mc_type);
+    for (size_t i = 0; i < p->n_keys; i++)
+        if (!key_match(&p->keys[i], key)) return true;
+    return false;
+}
+
+static ray_err_t parted_path(const block_parted_t* p, int64_t partition, char* path, size_t size) {
+    int n = snprintf(path, size, "%s/%s/%s", p->root, p->dirs[partition], p->table);
+    return n < 0 || (size_t)n >= size ? RAY_ERR_RANGE : RAY_OK;
+}
+
+static ray_err_t parted_open_partition(block_parted_t* p, int64_t partition,
+                                       const char* const* columns, size_t count,
+                                       bool predicates, ray_block_query_t** out) {
+    char path[1300];
+    ray_err_t err = parted_path(p, partition, path, sizeof(path));
+    if (err) return err;
+    ray_block_predicate_t pred[RAY_BLOCK_QUERY_MAX_PREDICATES];
+    size_t n = predicates ? p->n_predicates : 0;
+    for (size_t i = 0; i < n; i++)
+        pred[i] = (ray_block_predicate_t){p->predicates[i].column, p->predicates[i].opcode,
+                                          p->predicates[i].value};
+    ray_block_scan_source_t source = {p->has_sym ? p->sym_path : NULL, p->immutable};
+    return ray_block_query_open_source(path, &source, columns, count, pred, n, &p->options, out);
+}
+
+/* Name schema of a later partition: a prefix of the first partition's. */
+static bool parted_names_prefix(const block_parted_t* p, const ray_t* names) {
+    if (!names || names->len > p->names->len) return false;
+    for (int64_t i = 0; i < names->len; i++) {
+        size_t a, b;
+        const char* x = ray_str_vec_get((ray_t*)names, i, &a);
+        const char* y = ray_str_vec_get(p->names, i, &b);
+        if (a != b || memcmp(x, y, a)) return false;
+    }
+    return true;
+}
+
+static ray_err_t parted_check_schema(const block_parted_t* p, ray_block_query_t* q) {
+    ray_block_scan_t* scan = q->scan;
+    if (!parted_names_prefix(p, ray_block_scan_names(scan))) return RAY_ERR_SCHEMA;
+    for (size_t i = 0; i < p->n_data; i++) {
+        ray_t* col = ray_table_get_col_idx(q->schema, (int64_t)i);
+        if (!col || col->type != p->data_types[i]) return RAY_ERR_SCHEMA;
+    }
+    return RAY_OK;
+}
+
+ray_err_t ray_block_query_open_parted(const char* root, const char* table, bool immutable,
+                                      const char* const* columns, size_t count,
+                                      const ray_block_predicate_t* predicates,
+                                      size_t n_predicates,
+                                      const ray_block_scan_options_t* options,
+                                      ray_block_query_t** out) {
+    if (!out || *out || !root || !*root || !query_name_safe(table) || !columns || !count ||
+        !options || (n_predicates && !predicates)) return RAY_ERR_DOMAIN;
+    if (count > RAY_BLOCK_SCAN_MAX_COLUMNS || n_predicates > RAY_BLOCK_QUERY_MAX_PREDICATES)
+        return RAY_ERR_LIMIT;
+    if (strlen(root) >= sizeof(((block_parted_t*)0)->root)) return RAY_ERR_RANGE;
+    for (size_t i = 0; i < count; i++) {
+        if (!query_name_safe(columns[i])) return RAY_ERR_DOMAIN;
+        for (size_t j = 0; j < i; j++)
+            if (!strcmp(columns[i], columns[j])) return RAY_ERR_DOMAIN;
+    }
+    for (size_t i = 0; i < n_predicates; i++) {
+        if (!query_name_safe(predicates[i].column)) return RAY_ERR_DOMAIN;
+        if (!query_opcode_admitted(predicates[i].opcode)) return RAY_ERR_NYI;
+        if (!query_atom_admitted(predicates[i].value)) return RAY_ERR_TYPE;
+    }
+    block_parted_t* p = calloc(1, sizeof(*p));
+    ray_block_query_t* q = calloc(1, sizeof(*q));
+    if (!p || !q) { free(p); free(q); return RAY_ERR_OOM; }
+    q->parted = p;
+    ray_err_t err = RAY_OK;
+    memcpy(p->root, root, strlen(root) + 1);
+    memcpy(p->table, table, strlen(table) + 1);
+    p->immutable = immutable;
+    p->options = *options;
+    p->outputs = calloc(count, sizeof(*p->outputs));
+    p->data = calloc(count, sizeof(*p->data));
+    p->data_types = calloc(count, sizeof(*p->data_types));
+    if (!p->outputs || !p->data || !p->data_types) err = RAY_ERR_OOM;
+    struct stat st;
+    int n = snprintf(p->sym_path, sizeof(p->sym_path), "%s/.sym", root);
+    if (!err && (n < 0 || (size_t)n >= sizeof(p->sym_path))) err = RAY_ERR_RANGE;
+    p->has_sym = !err && stat(p->sym_path, &st) == 0;
+    ray_t* listed = err ? NULL : ray_parted_dirs(root, &p->dirs, &p->n_dirs, &p->mc_type);
+    if (listed) { err = ray_err_from_obj(listed); ray_error_free(listed); }
+    if (!err && !p->n_dirs) err = RAY_ERR_IO;
+    if (!err) {
+        const char* key = p->mc_type == RAY_MC_DATE ? "date" : "part";
+        p->key_type = p->mc_type == RAY_MC_DATE ? RAY_DATE :
+            p->mc_type == RAY_MC_I64 ? RAY_I64 : RAY_SYM;
+        p->key_name = ray_sym_intern(key, strlen(key));
+        if (p->key_name < 0) err = RAY_ERR_OOM;
+    }
+    const char* key_column = p->mc_type == RAY_MC_DATE ? "date" : "part";
+    for (size_t i = 0; !err && i < count; i++) {
+        parted_output_t* o = &p->outputs[i];
+        o->name = ray_sym_intern(columns[i], strlen(columns[i]));
+        if (o->name < 0) { err = RAY_ERR_OOM; break; }
+        o->key = !strcmp(columns[i], key_column);
+        if (o->key) { p->row_bytes += p->key_type == RAY_DATE ? 4 : 8; continue; }
+        o->data = p->n_data;
+        memcpy(p->data[p->n_data], columns[i], strlen(columns[i]) + 1);
+        p->data_names[p->n_data] = p->data[p->n_data];
+        p->n_data++;
+    }
+    p->n_outputs = count;
+    if (!err && !p->n_data) err = RAY_ERR_NYI;
+    for (size_t i = 0; !err && i < n_predicates; i++) {
+        const ray_t* v = predicates[i].value;
+        if (strcmp(predicates[i].column, key_column)) {
+            predicate_t* d = &p->predicates[p->n_predicates];
+            memcpy(d->column, predicates[i].column, strlen(predicates[i].column) + 1);
+            d->opcode = predicates[i].opcode;
+            d->value = ray_i64(0);
+            if (!d->value || RAY_IS_ERR(d->value)) { d->value = NULL; err = RAY_ERR_OOM; break; }
+            /* Admitted atoms contain only inline scalar data, never pointers. */
+            d->value->type = v->type;
+            memcpy(&d->value->i64, &v->i64, sizeof(int64_t));
+            d->value->aux[0] = v->aux[0] & 1;
+            p->n_predicates++;
+            continue;
+        }
+        if (v->type != -p->key_type) { err = RAY_ERR_TYPE; break; }
+        if (RAY_ATOM_IS_NULL(v)) { err = RAY_ERR_NYI; break; }
+        p->keys[p->n_keys++] = (key_predicate_t){predicates[i].opcode, query_atom_value(v)};
+    }
+    /* The first partition defines the schema, as for .db.parted.get. */
+    ray_block_query_t* first = NULL;
+    if (!err) err = parted_open_partition(p, 0, p->data_names, p->n_data, true, &first);
+    if (!err && ray_block_scan_has_column(first->scan, key_column)) err = RAY_ERR_SCHEMA;
+    if (!err) {
+        p->names = ray_block_scan_names(first->scan);
+        ray_retain(p->names);
+        p->first_rows = ray_block_query_rows(first);
+        q->schema = ray_table_new((int64_t)count);
+        if (!q->schema || RAY_IS_ERR(q->schema)) { q->schema = NULL; err = RAY_ERR_OOM; }
+    }
+    for (size_t i = 0; !err && i < count; i++) {
+        parted_output_t* o = &p->outputs[i];
+        int8_t type = o->key ? p->key_type :
+            ray_table_get_col_idx(first->schema, (int64_t)o->data)->type;
+        if (!o->key) p->data_types[o->data] = type;
+        if (!o->key && type == RAY_SYM) p->row_bytes += 8;
+        ray_t* col = type == RAY_SYM ? ray_sym_vec_new(RAY_SYM_W64, 0) : ray_vec_new(type, 0);
+        if (!col || RAY_IS_ERR(col)) { err = RAY_ERR_OOM; break; }
+        q->schema = ray_table_add_col(q->schema, o->name, col);
+        ray_release(col);
+        if (!q->schema || RAY_IS_ERR(q->schema)) { q->schema = NULL; err = RAY_ERR_OOM; }
+    }
+    q->count = count;
+    if (!err && !parted_pruned(p, 0)) {
+        p->current = first; first = NULL;
+        p->reading = 0;
+        p->rows_read = p->first_rows;
+    }
+    p->next = 1;
+    ray_block_query_close(&first);
+    if (err) { ray_block_query_close(&q); return err; }
+    *out = q;
+    return RAY_OK;
+}
+
+static ray_err_t parted_reserve(block_parted_t* p) {
+    if (!p->current) return RAY_OK;
+    size_t extra = (size_t)p->options.batch_rows;
+    if (p->row_bytes && extra > SIZE_MAX / p->row_bytes) return RAY_ERR_LIMIT;
+    extra *= p->row_bytes;
+    if (extra > SIZE_MAX - p->external_reserve) return RAY_ERR_LIMIT;
+    return ray_block_query_reserve(p->current, p->external_reserve + extra);
+}
+
+static ray_t* parted_key_vector(const block_parted_t* p, int64_t rows) {
+    int64_t key = ray_parted_dir_key(p->dirs[p->reading], p->mc_type);
+    if (key < 0 && p->key_type == RAY_SYM) return ray_error("oom", NULL);
+    ray_t* v = p->key_type == RAY_SYM ? ray_sym_vec_new(RAY_SYM_W64, rows) :
+        ray_vec_new(p->key_type, rows);
+    if (!v || RAY_IS_ERR(v)) return v;
+    for (int64_t i = 0; i < rows; i++) {
+        if (p->key_type == RAY_DATE) ((int32_t*)ray_data(v))[i] = (int32_t)key;
+        else ((int64_t*)ray_data(v))[i] = key;
+    }
+    v->len = rows;
+    return v;
+}
+
+/* Generation dictionaries differ between partitions: intern into the
+ * runtime table so every batch of one column shares a single domain. */
+static ray_t* parted_global_symbols(ray_t* src) {
+    ray_t* v = ray_sym_vec_new(RAY_SYM_W64, src->len);
+    if (!v || RAY_IS_ERR(v)) return v;
+    int64_t last_pos = -1, last_id = 0;
+    for (int64_t i = 0; i < src->len; i++) {
+        int64_t pos = ray_read_sym(ray_data(src), i, RAY_SYM, src->attrs);
+        if (pos != last_pos) {
+            ray_t* s = ray_sym_vec_cell(src, i);
+            if (!s) { ray_release(v); return ray_error("corrupt", "symbol outside its dictionary"); }
+            last_id = ray_sym_intern(ray_str_ptr(s), ray_str_len(s));
+            if (last_id < 0) { ray_release(v); return ray_error("oom", NULL); }
+            last_pos = pos;
+        }
+        ((int64_t*)ray_data(v))[i] = last_id;
+    }
+    v->len = src->len;
+    v->attrs |= src->attrs & RAY_ATTR_HAS_NULLS;
+    return v;
+}
+
+static ray_t* parted_batch(const block_parted_t* p, ray_t* batch) {
+    int64_t rows = ray_table_nrows(batch);
+    ray_t* out = ray_table_new((int64_t)p->n_outputs);
+    for (size_t c = 0; out && !RAY_IS_ERR(out) && c < p->n_outputs; c++) {
+        const parted_output_t* o = &p->outputs[c];
+        ray_t* col;
+        if (o->key) col = parted_key_vector(p, rows);
+        else {
+            col = ray_table_get_col_idx(batch, (int64_t)o->data);
+            if (col->type == RAY_SYM) col = parted_global_symbols(col);
+            else ray_retain(col);
+        }
+        if (!col || RAY_IS_ERR(col)) { ray_release(out); out = col; break; }
+        out = ray_table_add_col(out, o->name, col);
+        ray_release(col);
+    }
+    return out ? out : ray_error("oom", NULL);
+}
+
+static ray_t* parted_error(const block_parted_t* p, ray_err_t err, int64_t partition,
+                           const char* what) {
+    return ray_error(ray_err_code_str(err), "block parted %s: partition %s/%s: %s",
+                     p->root, p->dirs[partition], p->table, what);
+}
+
+static ray_t* parted_next(ray_block_query_t* q) {
+    block_parted_t* p = q->parted;
+    for (;;) {
+        if (p->cancelled || ray_eval_is_interrupted())
+            return ray_error("cancel", "block query cancelled");
+        if (!p->current) {
+            while (p->next < p->n_dirs && parted_pruned(p, p->next)) p->next++;
+            if (p->next == p->n_dirs) return NULL;
+            int64_t partition = p->next++;
+            ray_err_t err = parted_open_partition(p, partition, p->data_names, p->n_data,
+                                                  true, &p->current);
+            if (!err) err = parted_check_schema(p, p->current);
+            if (err) {
+                ray_block_query_close(&p->current);
+                return parted_error(p, err, partition, "open failed");
+            }
+            p->reading = partition;
+            p->rows_read += ray_block_query_rows(p->current);
+        }
+        ray_err_t err = parted_reserve(p);
+        if (err) return ray_error(ray_err_code_str(err), "block query working set exceeds limit");
+        ray_t* batch = ray_block_query_next(p->current);
+        if (!batch) { ray_block_query_close(&p->current); continue; }
+        if (RAY_IS_ERR(batch)) return batch;
+        ray_t* out = parted_batch(p, batch);
+        ray_release(batch);
+        return out;
+    }
+}
+
+static ray_err_t parted_source_empty(block_parted_t* p, bool* empty) {
+    *empty = false;
+    if (p->first_rows || p->rows_read) return RAY_OK;
+    for (int64_t i = 1; i < p->n_dirs; i++) {
+        ray_block_query_t* metadata = NULL;
+        ray_err_t err = parted_open_partition(p, i, p->data_names, 1, false, &metadata);
+        uint64_t rows = err ? 0 : ray_block_query_rows(metadata);
+        ray_block_query_close(&metadata);
+        if (err) return err;
+        if (rows) return RAY_OK;
+    }
+    *empty = true;
+    return RAY_OK;
+}
+
+static bool parted_has_column(const block_parted_t* p, const char* name) {
+    if (!name) return false;
+    if (!strcmp(name, p->mc_type == RAY_MC_DATE ? "date" : "part")) return true;
+    size_t len = strlen(name);
+    for (int64_t i = 0; i < p->names->len; i++) {
+        size_t n;
+        const char* s = ray_str_vec_get(p->names, i, &n);
+        if (n == len && !memcmp(s, name, n)) return true;
+    }
+    return false;
+}
+
+static void parted_cancel(block_parted_t* p) {
+    p->cancelled = true;
+    ray_block_query_cancel(p->current);
+}
+
+static uint64_t parted_rows(const block_parted_t* p) {
+    return p->rows_read;
+}
+
+static ray_err_t parted_set_reserve(block_parted_t* p, size_t bytes) {
+    if (p->options.work_limit && bytes > p->options.work_limit) return RAY_ERR_LIMIT;
+    size_t previous = p->external_reserve;
+    p->external_reserve = bytes;
+    ray_err_t err = parted_reserve(p);
+    if (err) p->external_reserve = previous;
+    return err;
 }
