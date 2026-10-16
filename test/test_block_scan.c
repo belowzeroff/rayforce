@@ -18,6 +18,7 @@
 #include <dirent.h>
 #include <signal.h>
 #include <sys/wait.h>
+#include <sys/stat.h>
 #include <time.h>
 
 static char root[64];
@@ -482,6 +483,36 @@ static test_result_t scan_during_write(void) {
     int64_t e = 0;
     TEST_ASSERT_EQ_I(epoch_read(rows, &e), 0);
     TEST_ASSERT_EQ_I(e, 1);
+    PASS();
+}
+
+/* .publish.lock is only ever opened read-only: a lock file created by
+ * another user (here: made read-only) never stops a publication, and a reader
+ * that cannot create it in a read-only table directory falls back to the
+ * writer lock. */
+static test_result_t publish_lock_permissions(void) {
+    const int64_t rows = 1000;
+    ray_block_store_options_t store = {4096, 1, false};
+    ray_t* t = epoch_table(1, rows);
+    TEST_ASSERT_EQ_I(ray_block_store_save(t, root, &store), RAY_OK);
+    ray_release(t);
+    char lock[128];
+    snprintf(lock, sizeof(lock), "%s/.publish.lock", root);
+    TEST_ASSERT_EQ_I(chmod(lock, 0444), 0);
+    t = epoch_table(2, rows);
+    TEST_ASSERT_EQ_I(ray_block_store_save(t, root, &store), RAY_OK);
+    ray_release(t);
+    int64_t e = 0;
+    TEST_ASSERT_EQ_I(epoch_read(rows, &e), 0);
+    TEST_ASSERT_EQ_I(e, 2);
+    TEST_ASSERT_EQ_I(unlink(lock), 0);
+    TEST_ASSERT_EQ_I(chmod(root, 0555), 0);
+    int read = epoch_read(rows, &e);
+    int created = access(lock, F_OK) == 0;
+    TEST_ASSERT_EQ_I(chmod(root, 0755), 0);
+    TEST_ASSERT_EQ_I(read, 0);
+    TEST_ASSERT_EQ_I(e, 2);
+    if (geteuid() != 0) TEST_ASSERT_FALSE(created);  /* root ignores the mode */
     PASS();
 }
 
@@ -1804,6 +1835,7 @@ const test_entry_t block_scan_entries[] = {
     {"block_scan/crash_publication", crash_publication, setup, teardown},
     {"block_scan/concurrent_readers", concurrent_readers, setup, teardown},
     {"block_scan/scan_during_write", scan_during_write, setup, teardown},
+    {"block_scan/publish_lock_permissions", publish_lock_permissions, setup, teardown},
     {"block_scan/auto_batch_rows", auto_batch_rows, setup, teardown},
     {"block_scan/auto_batch_raw_strings", auto_batch_raw_strings, setup, teardown},
     {"block_scan/flat_immutable", flat_immutable, setup, teardown},
