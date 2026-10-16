@@ -1404,7 +1404,46 @@ static test_result_t storage_parted(void) {
     PASS();
 }
 
+/* STR columns decode once into an arena when it fits scratch-bytes, else
+ * twice through one block of scratch: the same rows either way. */
+static test_result_t string_arena_fallback(void) {
+    fixture(4103, false);
+    const char* clauses[] = {"text: s i: id", "where: (== x 2) text: s i: id"};
+    const char* options[] = {"", "{scratch-bytes: 300}", "{batch-rows: 777}", "{batch-rows: 777 scratch-bytes: 300}"};
+    for (unsigned c = 0; c < 2; c++) {
+        char command[512];
+        snprintf(command, sizeof(command), "(select {from: raw %s})", clauses[c]);
+        ray_t* expected = ray_eval_str(command);
+        for (unsigned o = 0; o < 4; o++) {
+            snprintf(command, sizeof(command), "(select {from: (.db.block.scan \"%s\" 100000000 %s) %s})",
+                     root, options[o], clauses[c]);
+            ray_t* actual = ray_eval_str(command);
+            test_result_t r = tables_equal(actual, expected);
+            ray_release(actual);
+            if (r.status != TEST_PASS) { ray_release(expected); return r; }
+        }
+        ray_release(expected);
+    }
+    /* Arena and fallback count their STR decodes: once versus twice. */
+    const char* output[] = {"s"};
+    ray_block_scan_options_t read = {0, UINT64_MAX, 8192, 1u << 20, 1u << 20, 0};
+    uint64_t decoded[2];
+    for (unsigned o = 0; o < 2; o++) {
+        read.scratch_limit = o ? 300 : 1u << 20;
+        ray_block_query_t* q = NULL;
+        TEST_ASSERT_EQ_I(ray_block_query_open(root, output, 1, NULL, 0, &read, &q), RAY_OK);
+        for (ray_t* b; (b = ray_block_query_next(q)); ray_release(b)) TEST_ASSERT_FALSE(RAY_IS_ERR(b));
+        ray_block_query_stats_t stats;
+        ray_block_query_stats(q, &stats);
+        decoded[o] = stats.scan.blocks_decoded;
+        ray_block_query_close(&q);
+    }
+    TEST_ASSERT_EQ_I(decoded[1], decoded[0] * 2);
+    PASS();
+}
+
 const test_entry_t block_source_entries[] = {
+    {"block_source/string_arena_fallback", string_arena_fallback, setup, teardown},
     {"block_source/storage_parted", storage_parted, setup, teardown},
     {"block_source/parallel_decode", parallel_decode, setup, teardown},
     {"block_source/storage_info_verify", storage_info_verify, setup, teardown},
