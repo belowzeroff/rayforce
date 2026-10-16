@@ -4,6 +4,7 @@
 #include "lang/eval.h"
 #include "store/part.h"
 #include "mem/heap.h"
+#include "vec/str.h"
 #include "table/sym.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -231,6 +232,44 @@ oom:
     return ray_error("oom", "block query graph allocation failed");
 }
 
+/* Rows of window whose mask byte is set, as fresh owned vectors. SYM keeps
+ * its dictionary domain and width, STR copies its strings into a new pool. */
+static ray_t* query_compact(ray_t* window, const uint8_t* mask) {
+    int64_t rows = ray_table_nrows(window), count = 0;
+    for (int64_t i = 0; i < rows; i++) count += mask[i] != 0;
+    ray_t* out = ray_table_new(ray_table_ncols(window));
+    for (int64_t c = 0; out && !RAY_IS_ERR(out) && c < ray_table_ncols(window); c++) {
+        ray_t* src = ray_table_get_col_idx(window, c);
+        ray_t* v;
+        if (src->type == RAY_STR) {
+            v = ray_vec_new(RAY_STR, count);
+            for (int64_t i = 0; v && !RAY_IS_ERR(v) && i < rows; i++) {
+                if (!mask[i]) continue;
+                size_t len;
+                const char* str = ray_str_vec_get(src, i, &len);
+                v = ray_str_vec_append(v, str, len);
+            }
+        } else {
+            size_t width = ray_sym_elem_size(src->type, src->attrs);
+            v = src->type == RAY_SYM ? ray_sym_vec_new(src->attrs & RAY_SYM_W_MASK, count) :
+                ray_vec_new(src->type, count);
+            if (v && !RAY_IS_ERR(v)) {
+                const uint8_t* from = ray_data(src);
+                uint8_t* to = ray_data(v);
+                for (int64_t i = 0; i < rows; i++)
+                    if (mask[i]) { memcpy(to, from + (size_t)i * width, width); to += width; }
+                v->len = count;
+                if (src->type == RAY_SYM) ray_sym_vec_adopt_domain(v, src);
+            }
+        }
+        if (!v || RAY_IS_ERR(v)) { ray_release(out); return v ? v : ray_error("oom", NULL); }
+        v->attrs |= src->attrs & RAY_ATTR_HAS_NULLS;
+        out = ray_table_add_col(out, ray_table_col_name(window, c), v);
+        ray_release(v);
+    }
+    return out ? out : ray_error("oom", NULL);
+}
+
 static ray_err_t query_scan_reserve(ray_block_query_t* q, size_t query_bytes) {
     if (query_bytes > SIZE_MAX - q->external_reserve) return RAY_ERR_LIMIT;
     return ray_block_scan_reserve(q->scan, q->external_reserve + query_bytes);
@@ -301,10 +340,26 @@ ray_t* ray_block_query_next(ray_block_query_t* q) {
             while (q->position < rows && !mask[q->position]) q->position++;
             uint64_t begin = q->position;
             while (q->position < rows && mask[q->position]) q->position++;
+            /* Runs a short gap apart share blocks: read them as one window
+             * and compact, instead of decoding those blocks once per run. */
+            bool fragmented = false;
+            for (;;) {
+                uint64_t next = q->position;
+                while (next < rows && !mask[next]) next++;
+                if (next == rows || next - q->position > RAY_BLOCK_QUERY_COALESCE_ROWS) break;
+                q->position = next;
+                while (q->position < rows && mask[q->position]) q->position++;
+                fragmented = true;
+            }
             if (q->position > begin) {
                 result = query_reserve_error(q, (size_t)q->mask->len);
                 if (!result) result = ray_block_scan_read_columns(q->scan, NULL, q->count,
                                                         q->start + begin, q->position - begin);
+                if (fragmented && result && !RAY_IS_ERR(result)) {
+                    ray_t* window = result;
+                    result = query_compact(window, mask + begin);
+                    ray_release(window);
+                }
                 break;
             }
             ray_release(q->mask); q->mask = NULL;
