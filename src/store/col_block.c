@@ -116,6 +116,7 @@ ray_err_t ray_col_block_open(ray_col_block_reader_t* r, const void* data, size_t
                 (count > limit / w || decoded != count * w)) ||
             get_le(e + 16, 8) != offset || !stored || stored > dir - offset ||
             e[32] > 1 || e[33] != (strings ? 1 : 0) ||
+            (e[32] == 0 && get_le(e + 40, 4) != get_le(e + 44, 4)) ||
             (e[34] & ~7u) || !zero(e + 35, 5) ||
             (e[32] == 0 ? stored != decoded : stored >= decoded))
             return RAY_ERR_CORRUPT;
@@ -129,7 +130,7 @@ ray_err_t ray_col_block_open(ray_col_block_reader_t* r, const void* data, size_t
     }
     if (row != rows || offset != dir) return RAY_ERR_CORRUPT;
     *r = (ray_col_block_reader_t){h, size, rows, blocks, dir,
-        get_le(h + 72, 8), limit, h[18], sym_count, sym_crc};
+        get_le(h + 72, 8), limit, h[18], sym_count, sym_crc, NULL};
     return RAY_OK;
 }
 
@@ -155,12 +156,15 @@ ray_err_t ray_col_block_read(const ray_col_block_reader_t* r, uint64_t block,
     size_t stored = (size_t)get_le(e + 24, 4), decoded = (size_t)get_le(e + 28, 4);
     if (capacity < decoded) return RAY_ERR_LIMIT;
     const uint8_t* payload = r->data + get_le(e + 16, 8);
-    if (ray_crc32(0, payload, stored) != get_le(e + 40, 4)) return RAY_ERR_CORRUPT;
+    bool checked = r->verified && (r->verified[block >> 3] >> (block & 7) & 1);
+    /* Uncompressed payload is the decoded block: open requires equal CRCs. */
+    if (!checked && ray_crc32(0, payload, stored) != get_le(e + 40, 4)) return RAY_ERR_CORRUPT;
     if (!e[32]) memcpy(output, payload, decoded);
     else if (!ray_snappy_decompress(payload, stored, output, decoded)) return RAY_ERR_CORRUPT;
-    if (ray_crc32(0, output, decoded) != get_le(e + 44, 4)) return RAY_ERR_CORRUPT;
+    if (!checked && e[32] && ray_crc32(0, output, decoded) != get_le(e + 44, 4)) return RAY_ERR_CORRUPT;
     if (r->type == RAY_STR && !strings_valid(output, decoded, get_le(e + 8, 8)))
         return RAY_ERR_CORRUPT;
+    if (r->verified) r->verified[block >> 3] |= (uint8_t)(1u << (block & 7));
     *row_start = get_le(e, 8); *row_count = get_le(e + 8, 8);
     return RAY_OK;
 }
@@ -180,10 +184,13 @@ ray_err_t ray_col_block_summary(const ray_col_block_reader_t* r,
     return RAY_OK;
 }
 
-ray_err_t ray_col_block_verify(const ray_col_block_reader_t* r, void* scratch,
+ray_err_t ray_col_block_verify(const ray_col_block_reader_t* reader, void* scratch,
                                size_t capacity, uint64_t* bad_block) {
-    if (!r || !r->data || !scratch) return RAY_ERR_DOMAIN;
-    if (capacity < r->block_bytes) return RAY_ERR_LIMIT;
+    if (!reader || !reader->data || !scratch) return RAY_ERR_DOMAIN;
+    if (capacity < reader->block_bytes) return RAY_ERR_LIMIT;
+    ray_col_block_reader_t copy = *reader;
+    copy.verified = NULL;
+    const ray_col_block_reader_t* r = &copy;
     for (uint64_t b = 0; b < r->blocks; b++) {
         uint64_t row, rows;
         ray_err_t err = ray_col_block_read(r, b, scratch, capacity, &row, &rows);
