@@ -53,13 +53,17 @@ static uint64_t entry_u64(const ray_col_block_reader_t* r, uint64_t block, unsig
 
 /* With arena, blocks were already decoded and validated there in order by
  * ray_col_block_decode_arena; otherwise each is decoded into scratch. */
+/* select (optional, one byte per range row) keeps only marked rows; output
+ * rows are numbered among the kept ones. */
 static ray_err_t walk_strings(const ray_col_block_reader_t* r, uint64_t start,
                                uint64_t count, void* scratch, size_t capacity,
-                               const uint8_t* arena, ray_t* output, size_t* pool_bytes) {
+                               const uint8_t* arena, const uint8_t* select,
+                               ray_t* output, size_t* pool_bytes) {
     uint64_t first, end;
     ray_err_t err = ray_col_block_range_blocks(r, start, count, &first, &end);
     if (err) return err;
     size_t used = 0, at = 0;
+    uint64_t kept = 0;
     for (uint64_t b = first; b < end; b++) {
         uint64_t row, rows;
         const uint8_t* p;
@@ -76,11 +80,12 @@ static ray_err_t walk_strings(const ray_col_block_reader_t* r, uint64_t start,
         for (uint64_t i = 0; i < rows; i++) {
             uint32_t len = string_length(p);
             p += 4;
-            if (row + i >= start && row + i < start + count) {
+            if (row + i >= start && row + i < start + count &&
+                (!select || select[row + i - start])) {
                 bool pooled = len > RAY_STR_INLINE_MAX;
                 if (pooled && len > UINT32_MAX - used) return RAY_ERR_RANGE;
                 if (output) {
-                    ray_str_t* d = &((ray_str_t*)ray_data(output))[row + i - start];
+                    ray_str_t* d = &((ray_str_t*)ray_data(output))[kept];
                     memset(d, 0, sizeof(*d));
                     d->len = len;
                     if (pooled) {
@@ -95,6 +100,7 @@ static ray_err_t walk_strings(const ray_col_block_reader_t* r, uint64_t start,
                     else output->attrs |= RAY_ATTR_HAS_NULLS;
                 }
                 if (pooled) used += len;
+                kept++;
             }
             p += len;
         }
@@ -114,24 +120,53 @@ ray_err_t ray_col_block_payload_size(const ray_col_block_reader_t* r,
     if (capacity < needed) return RAY_ERR_LIMIT;
     if (needed && !scratch) return RAY_ERR_DOMAIN;
     size_t pool;
-    err = walk_strings(r, start, count, scratch, capacity, NULL, NULL, &pool);
+    err = walk_strings(r, start, count, scratch, capacity, NULL, NULL, NULL, &pool);
     if (err) return err;
     if (pool > SIZE_MAX - base) return RAY_ERR_LIMIT;
     *bytes = base + pool;
     return RAY_OK;
 }
 
+static uint64_t selected_rows(const uint8_t* select, uint64_t count) {
+    if (!select) return count;
+    uint64_t n = 0;
+    for (uint64_t i = 0; i < count; i++) n += select[i] != 0;
+    return n;
+}
+
 ray_err_t ray_col_block_payload_size_arena(const ray_col_block_reader_t* r,
                                           uint64_t start, uint64_t count,
-                                          const uint8_t* arena, size_t* bytes) {
+                                          const uint8_t* arena, const uint8_t* select,
+                                          size_t* bytes) {
     if (!r || !bytes) return RAY_ERR_DOMAIN;
     if (r->type != RAY_STR) return RAY_ERR_TYPE;
     size_t base, needed, pool;
     ray_err_t err = ray_col_block_range_size(r, start, count, &base, &needed);
     if (err) return err;
     if (count && !arena) return RAY_ERR_DOMAIN;
-    err = walk_strings(r, start, count, NULL, 0, arena, NULL, &pool);
+    /* Measuring needs only the length prefixes of the selected rows. Blocks
+     * in the arena were validated when decoded. */
+    uint64_t first, end;
+    err = ray_col_block_range_blocks(r, start, count, &first, &end);
     if (err) return err;
+    pool = 0;
+    const uint8_t* p = arena;
+    for (uint64_t b = first; b < end; b++) {
+        uint64_t row = entry_u64(r, b, 0, 8), rows = entry_u64(r, b, 8, 8);
+        uint64_t lo = start > row ? start - row : 0;
+        uint64_t hi = start + count < row + rows ? start + count - row : rows;
+        const uint8_t* q = p;
+        for (uint64_t i = 0; i < hi; i++) {
+            uint32_t len = string_length(q);
+            if (i >= lo && len > RAY_STR_INLINE_MAX && (!select || select[row + i - start])) {
+                if (len > UINT32_MAX - pool) return RAY_ERR_RANGE;
+                pool += len;
+            }
+            q += 4 + (size_t)len;
+        }
+        p += (size_t)entry_u64(r, b, 28, 4);
+    }
+    base = (size_t)selected_rows(select, count) * sizeof(ray_str_t);
     if (pool > SIZE_MAX - base) return RAY_ERR_LIMIT;
     *bytes = base + pool;
     return RAY_OK;
@@ -139,35 +174,38 @@ ray_err_t ray_col_block_payload_size_arena(const ray_col_block_reader_t* r,
 
 static ray_t* materialize_str(const ray_col_block_reader_t* r, uint64_t start, uint64_t count,
                               size_t measured_bytes, void* scratch, size_t capacity,
-                              const uint8_t* arena);
+                              const uint8_t* arena, const uint8_t* select);
 
 ray_t* ray_col_block_materialize_str_arena(const ray_col_block_reader_t* r,
                                           uint64_t start, uint64_t count,
-                                          size_t measured_bytes, const uint8_t* arena) {
+                                          const uint8_t* select, size_t measured_bytes,
+                                          const uint8_t* arena) {
     if (count && !arena) return ray_error("domain", "STR arena required");
-    return materialize_str(r, start, count, measured_bytes, NULL, 0, arena);
+    return materialize_str(r, start, count, measured_bytes, NULL, 0, arena, select);
 }
 
 ray_t* ray_col_block_materialize_str(const ray_col_block_reader_t* r,
                                     uint64_t start, uint64_t count,
                                     size_t measured_bytes, void* scratch, size_t capacity) {
-    return materialize_str(r, start, count, measured_bytes, scratch, capacity, NULL);
+    return materialize_str(r, start, count, measured_bytes, scratch, capacity, NULL, NULL);
 }
 
 static ray_t* materialize_str(const ray_col_block_reader_t* r, uint64_t start, uint64_t count,
                               size_t measured_bytes, void* scratch, size_t capacity,
-                              const uint8_t* arena) {
+                              const uint8_t* arena, const uint8_t* select) {
     if (!r || r->type != RAY_STR) return ray_error("type", "expected STR block column");
     size_t base, needed;
     ray_err_t err = ray_col_block_range_size(r, start, count, &base, &needed);
-    if (!err && measured_bytes < base) err = RAY_ERR_LIMIT;
     if (!err && !arena && capacity < needed) err = RAY_ERR_LIMIT;
     if (!err && !arena && needed && !scratch) err = RAY_ERR_DOMAIN;
     if (err) return ray_error(ray_err_code_str(err), "invalid STR materialization range");
+    uint64_t out = selected_rows(select, count);
+    base = (size_t)out * sizeof(ray_str_t);
+    if (measured_bytes < base) return ray_error("limit", "invalid STR materialization range");
     size_t pool = measured_bytes - base;
     if (pool > UINT32_MAX || pool > SIZE_MAX - sizeof(ray_t))
         return ray_error("range", "STR pool exceeds native offset limit");
-    ray_t* v = ray_vec_new(RAY_STR, (int64_t)count);
+    ray_t* v = ray_vec_new(RAY_STR, (int64_t)out);
     if (!v) return ray_error("oom", "cannot allocate STR output");
     if (RAY_IS_ERR(v)) return v;
     if (pool) {
@@ -180,9 +218,9 @@ static ray_t* materialize_str(const ray_col_block_reader_t* r, uint64_t start, u
         v->str_pool = p;
     }
     size_t used;
-    err = walk_strings(r, start, count, scratch, capacity, arena, v, &used);
+    err = walk_strings(r, start, count, scratch, capacity, arena, select, v, &used);
     if (!err && used != pool) err = RAY_ERR_CORRUPT;
     if (err) { ray_release(v); return ray_error(ray_err_code_str(err), "invalid STR block payload"); }
-    v->len = (int64_t)count;
+    v->len = (int64_t)out;
     return v;
 }
