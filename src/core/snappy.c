@@ -117,6 +117,48 @@ bool ray_snappy_decompress(const uint8_t* src, size_t len,
         if (!(b & 128)) break;
     }
     if (expected != size) return false;
+    /* Fast loop while both buffers have slack for unconditional wide moves:
+     * 20 input bytes cover a tag, its operands and a 16-byte literal move;
+     * 80 output bytes cover a 64-byte copy plus a trailing 8-byte move. Long
+     * literals and 4-byte offsets fall through to the exact loop below. */
+    const uint8_t* ip = src + in;
+    const uint8_t* const end = src + len;
+    uint8_t* op = dst + at;
+    while (end - ip >= 20 && (dst + size) - op >= 80) {
+        uint8_t tag = *ip++;
+        size_t n, off;
+        if (!(tag & 3)) {
+            n = (size_t)(tag >> 2) + 1;
+            if (n > 60) { ip--; break; }
+            if (n > (size_t)(end - ip)) return false;
+            snappy_copy8(op, ip);
+            snappy_copy8(op + 8, ip + 8);
+            if (n > 16) memcpy(op + 16, ip + 16, n - 16);
+            op += n; ip += n;
+            continue;
+        }
+        if ((tag & 3) == 1) {
+            n = 4 + ((tag >> 2) & 7);
+            off = ((size_t)(tag & 224) << 3) | *ip++;
+        } else if ((tag & 3) == 2) {
+            n = 1 + (tag >> 2);
+            off = (size_t)ip[0] | (size_t)ip[1] << 8;
+            ip += 2;
+        } else { ip--; break; }
+        if (!off || off > (size_t)(op - dst)) return false;
+        if (off >= 8) {
+            /* Sources end at or before their destinations: already decoded. */
+            snappy_copy8(op, op - off);
+            snappy_copy8(op + 8, op + 8 - off);
+            for (size_t i = 16; i < n; i += 8) snappy_copy8(op + i, op + i - off);
+        } else {
+            const uint8_t* from = op - off;
+            for (size_t i = 0; i < n; i++) op[i] = from[i];
+        }
+        op += n;
+    }
+    in = (size_t)(ip - src);
+    at = (size_t)(op - dst);
     while (in < len && at < size) {
         uint8_t tag = src[in++];
         if (!(tag & 3)) {
@@ -154,10 +196,14 @@ bool ray_snappy_decompress(const uint8_t* src, size_t len,
                 n = 1 + (tag >> 2);
             }
             if (!off || off > at || n > size - at) return false;
-            if (off >= 8 && size - at - n >= 8) {
+            if (off >= 8 && size - at - n >= 16) {
                 /* Each 8-byte source ends at or before its destination, so it
-                 * is already decoded; writes past n stay inside the slack. */
-                for (size_t i = 0; i < n; i += 8)
+                 * is already decoded; writes past n stay inside the slack.
+                 * Copy tags of 1-byte offsets hold at most 11 bytes: the
+                 * common case is two unconditional moves. */
+                snappy_copy8(dst + at, dst + at - off);
+                snappy_copy8(dst + at + 8, dst + at + 8 - off);
+                for (size_t i = 16; i < n; i += 8)
                     snappy_copy8(dst + at + i, dst + at + i - off);
                 at += n;
                 continue;
