@@ -11,14 +11,21 @@
  * computing), SYM dictionary count@88, dictionary CRC@96, reserved[100,128).
  * Dictionary fields must be zero for non-SYM. Prefix: major@17, type@18, row count@24.
  * Entry: row@0, count@8, payload offset@16, stored size@24, decoded size@28,
- * codec@32, encoding@33 (0 fixed, 1 STR lengths/bytes), reserved[34,40), stored CRC@40, decoded CRC@44,
- * reserved[48,64). Footer: magic[0,8), blocks@8, directory@16, file size@24.
+ * codec@32, encoding@33 (0 fixed, 1 STR lengths/bytes), zone flags@34,
+ * reserved[35,40), stored CRC@40, decoded CRC@44, zone min@48, zone max@56.
+ * Zone flags: bit0 present, bit1 has null, bit2 has non-null values.
  * Regions are canonical and contiguous: header, blocks, directory, footer.
  * Empty columns have no blocks. Reserved bytes MUST be zero. */
 static uint64_t get_le(const uint8_t* p, unsigned n) {
     uint64_t v = 0;
     for (unsigned i = 0; i < n; i++) v |= (uint64_t)p[i] << (8 * i);
     return v;
+}
+static int64_t get_i64_le(const uint8_t* p) {
+    uint64_t bits = get_le(p, 8);
+    int64_t value;
+    memcpy(&value, &bits, sizeof(value));
+    return value;
 }
 static void put_le(uint8_t* p, uint64_t v, unsigned n) {
     for (unsigned i = 0; i < n; i++) { p[i] = (uint8_t)v; v >>= 8; }
@@ -40,6 +47,25 @@ static unsigned width(uint8_t type) {
     case RAY_GUID: return 16;
     default: return 0;
     }
+}
+static bool zone_type(uint8_t type) {
+    return type == RAY_BOOL || type == RAY_U8 || type == RAY_I16 ||
+        type == RAY_I32 || type == RAY_I64 || type == RAY_DATE ||
+        type == RAY_TIME || type == RAY_TIMESTAMP;
+}
+static int64_t zone_value(const uint8_t* p, uint64_t i, uint8_t type) {
+    switch (type) {
+    case RAY_BOOL: case RAY_U8: return p[i];
+    case RAY_I16: return (int16_t)get_le(p + i * 2, 2);
+    case RAY_I32: case RAY_DATE: case RAY_TIME:
+        return (int32_t)get_le(p + i * 4, 4);
+    default: return get_i64_le(p + i * 8);
+    }
+}
+static bool zone_null(int64_t value, uint8_t type) {
+    return (type == RAY_I16 && value == NULL_I16) ||
+        ((type == RAY_I32 || type == RAY_DATE || type == RAY_TIME) && value == NULL_I32) ||
+        ((type == RAY_I64 || type == RAY_TIMESTAMP) && value == NULL_I64);
 }
 static uint32_t header_crc(const uint8_t* h) {
     const uint8_t zeros[4] = {0};
@@ -90,8 +116,14 @@ ray_err_t ray_col_block_open(ray_col_block_reader_t* r, const void* data, size_t
                 (count > limit / w || decoded != count * w)) ||
             get_le(e + 16, 8) != offset || !stored || stored > dir - offset ||
             e[32] > 1 || e[33] != (strings ? 1 : 0) ||
-            !zero(e + 34, 6) || !zero(e + 48, 16) ||
+            (e[34] & ~7u) || !zero(e + 35, 5) ||
             (e[32] == 0 ? stored != decoded : stored >= decoded))
+            return RAY_ERR_CORRUPT;
+        uint8_t zone = e[34];
+        if ((!zone && !zero(e + 48, 16)) ||
+            (zone && (!(zone & 1) || !zone_type(h[18]) || !(zone & 6) ||
+                (!(zone & 4) && !zero(e + 48, 16)) ||
+                ((zone & 4) && get_i64_le(e + 48) > get_i64_le(e + 56)))))
             return RAY_ERR_CORRUPT;
         row += count; offset += stored;
     }
@@ -152,6 +184,49 @@ ray_err_t ray_col_block_range_blocks(const ray_col_block_reader_t* r,
     if (start > r->rows || count > r->rows - start) return RAY_ERR_RANGE;
     *first = count ? block_for_row(r, start) : 0;
     *end = count ? block_for_row(r, start + count - 1) + 1 : 0;
+    return RAY_OK;
+}
+
+static bool zone_may_match(const uint8_t* e, ray_col_block_cmp_t op,
+                           int64_t value, bool value_is_null) {
+    uint8_t flags = e[34];
+    if (!(flags & 1)) return true;
+    bool has_null = flags & 2, has_value = flags & 4;
+    int64_t min = get_i64_le(e + 48), max = get_i64_le(e + 56);
+    if (value_is_null) {
+        switch (op) {
+        case RAY_COL_BLOCK_EQ: return has_null;
+        case RAY_COL_BLOCK_NE: return has_value;
+        case RAY_COL_BLOCK_LT: return false;
+        case RAY_COL_BLOCK_LE: return has_null;
+        case RAY_COL_BLOCK_GT: return has_value;
+        case RAY_COL_BLOCK_GE: return has_null || has_value;
+        }
+    }
+    switch (op) {
+    case RAY_COL_BLOCK_EQ: return has_value && min <= value && value <= max;
+    case RAY_COL_BLOCK_NE: return has_null || (has_value && (min != value || max != value));
+    case RAY_COL_BLOCK_LT: return has_null || (has_value && min < value);
+    case RAY_COL_BLOCK_LE: return has_null || (has_value && min <= value);
+    case RAY_COL_BLOCK_GT: return has_value && max > value;
+    case RAY_COL_BLOCK_GE: return has_value && max >= value;
+    }
+    return true;
+}
+
+ray_err_t ray_col_block_range_may_match(const ray_col_block_reader_t* r,
+                                       uint64_t start, uint64_t count,
+                                       ray_col_block_cmp_t op, int64_t value,
+                                       bool value_is_null, bool* may_match) {
+    if (!may_match || op > RAY_COL_BLOCK_GE) return RAY_ERR_DOMAIN;
+    uint64_t first, end;
+    ray_err_t err = ray_col_block_range_blocks(r, start, count, &first, &end);
+    if (err) return err;
+    *may_match = false;
+    for (uint64_t b = first; b < end; b++) {
+        const uint8_t* e = r->data + r->directory + b * RAY_COL_BLOCK_ENTRY;
+        if (zone_may_match(e, op, value, value_is_null)) { *may_match = true; break; }
+    }
     return RAY_OK;
 }
 
@@ -301,6 +376,19 @@ static ray_err_t append_block(ray_col_block_writer_t* w, const uint8_t* p,
     put_le(e, w->rows, 8); put_le(e + 8, count, 8); put_le(e + 16, w->offset, 8);
     put_le(e + 24, stored, 4); put_le(e + 28, bytes, 4); e[32] = codec;
     e[33] = w->type == RAY_STR ? 1 : 0;
+    if (zone_type(w->type)) {
+        bool has_null = false, has_value = false;
+        int64_t min = 0, max = 0;
+        for (uint64_t i = 0; i < count; i++) {
+            int64_t value = zone_value(p, i, w->type);
+            if (zone_null(value, w->type)) { has_null = true; continue; }
+            if (!has_value) min = max = value;
+            else { if (value < min) min = value; if (value > max) max = value; }
+            has_value = true;
+        }
+        e[34] = 1u | (has_null ? 2u : 0u) | (has_value ? 4u : 0u);
+        if (has_value) { put_le(e + 48, (uint64_t)min, 8); put_le(e + 56, (uint64_t)max, 8); }
+    }
     put_le(e + 40, ray_crc32(0, payload, stored), 4);
     put_le(e + 44, ray_crc32(0, p, bytes), 4);
     if (fwrite(payload, 1, stored, w->output) != stored ||
