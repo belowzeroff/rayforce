@@ -33,12 +33,14 @@
 ;; read, splayed, parted, write
 ;; .db.* — three-level reserved namespace for storage I/O.  The
 ;; root resolves to a dict whose values are themselves dicts
-;; ({splayed: …, parted: …}); each format dict carries set/get
-;; entries.  Probes the multi-level reg_bind path.
+;; ({block: …, splayed: …, parted: …}); each format dict carries
+;; its set/get/scan entries.  Probes the multi-level reg_bind path.
 (type .db) -- 'DICT
 (type .db.splayed) -- 'DICT
 (type .db.parted) -- 'DICT
-(count .db) -- 2          ;; splayed, parted
+(type .db.block) -- 'DICT
+(count .db) -- 3          ;; block, splayed, parted
+(count .db.block) -- 2    ;; set, scan
 (count .db.splayed) -- 2  ;; set, get
 (count .db.parted) -- 3   ;; get, tables, fill
 (nil? (resolve '.db.splayed.set))    -- false
@@ -46,6 +48,8 @@
 (nil? (resolve '.db.parted.get))     -- false
 (nil? (resolve '.db.parted.tables))  -- false
 (nil? (resolve '.db.parted.fill))    -- false
+(nil? (resolve '.db.block.set))       -- false
+(nil? (resolve '.db.block.scan))      -- false
 ;; REPL completion + syntax highlighting go through
 ;; ray_env_lookup_prefix scanning flat g_env keys.  The namespace
 ;; dicts alone don't satisfy that path, so every reserved builtin
