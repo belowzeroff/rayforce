@@ -4394,6 +4394,7 @@ static void ray_register_builtins(void) {
     register_vary("write-csv",  RAY_FN_RESTRICTED, ray_write_csv_fn);
     register_vary(".csv.read",         RAY_FN_RESTRICTED, ray_read_csv_fn);
     register_vary(".csv.splayed",      RAY_FN_RESTRICTED, ray_read_csv_splayed_fn);
+    register_vary(".csv.block",        RAY_FN_RESTRICTED, ray_read_csv_block_fn);
     register_vary(".csv.parted",       RAY_FN_RESTRICTED, ray_read_csv_parted_fn);
     register_vary(".csv.write",        RAY_FN_RESTRICTED, ray_write_csv_fn);
     register_vary(".parquet.scan",     RAY_FN_RESTRICTED, ray_parquet_scan_fn);

@@ -729,6 +729,7 @@ ray_t* ray_timeit_fn(ray_t** args, int64_t n);
 ray_t* ray_exit_fn(ray_t* arg);
 ray_t* ray_read_csv_fn(ray_t** args, int64_t n);
 ray_t* ray_read_csv_splayed_fn(ray_t** args, int64_t n);
+ray_t* ray_read_csv_block_fn(ray_t** args, int64_t n);
 ray_t* ray_parquet_read_fn(ray_t** args, int64_t n);
 ray_t* ray_parquet_scan_fn(ray_t** args, int64_t n);
 ray_t* ray_parquet_metadata_fn(ray_t* path);
