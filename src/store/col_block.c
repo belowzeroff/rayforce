@@ -130,7 +130,7 @@ ray_err_t ray_col_block_open(ray_col_block_reader_t* r, const void* data, size_t
     }
     if (row != rows || offset != dir) return RAY_ERR_CORRUPT;
     *r = (ray_col_block_reader_t){h, size, rows, blocks, dir,
-        get_le(h + 72, 8), limit, h[18], sym_count, sym_crc, NULL};
+        get_le(h + 72, 8), limit, h[18], sym_count, sym_crc, NULL, NULL};
     return RAY_OK;
 }
 
@@ -326,10 +326,25 @@ ray_err_t ray_col_block_read_range(const ray_col_block_reader_t* r,
         bool whole = start == row && stop == row + rows;
         size_t n = (size_t)(stop - start) * esz;
         uint64_t ignored_row, ignored_count;
-        err = ray_col_block_read(r, block, whole ? dst : scratch,
-            whole ? n : scratch_capacity, &ignored_row, &ignored_count);
+        ray_col_block_cache_t* cache = r->cache;
+        if (!whole && cache && !cache->data) cache->data = malloc(r->block_bytes);
+        const uint8_t* src;
+        if (whole) {
+            err = ray_col_block_read(r, block, dst, n, &ignored_row, &ignored_count);
+            src = NULL;
+        } else if (cache && cache->data && cache->block == block) {
+            src = cache->data;
+        } else if (cache && cache->data) {
+            cache->block = UINT64_MAX;
+            err = ray_col_block_read(r, block, cache->data, r->block_bytes, &ignored_row, &ignored_count);
+            if (!err) cache->block = block;
+            src = cache->data;
+        } else {
+            err = ray_col_block_read(r, block, scratch, scratch_capacity, &ignored_row, &ignored_count);
+            src = scratch;
+        }
         if (err) return err;
-        if (!whole) memcpy(dst, (uint8_t*)scratch + (size_t)(start - row) * esz, n);
+        if (!whole) memcpy(dst, src + (size_t)(start - row) * esz, n);
         dst += n; start = stop; block++;
     }
     return RAY_OK;
