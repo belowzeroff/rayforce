@@ -1,0 +1,132 @@
+# Compressed Block Tables
+
+!!! warning "Experimental"
+    Block tables, their builtins and the on-disk format (major version 2) are experimental. Names, defaults and the supported query subset may change.
+
+A **block table** stores each column as a sequence of independently compressed blocks instead of one flat, memory-mapped vector. Each block carries CRC-32 checksums of its stored and decoded bytes, and integer and temporal blocks carry min/max statistics ("zone maps"). Tables are published atomically as generations, exactly like staged splayed writes, and readers hold a lease on the generation they read.
+
+Compared with raw splayed and partitioned tables:
+
+- **Smaller on disk.** Snappy typically stores market data at a fraction of its raw size (2.9× in the benchmark below).
+- **Faster selective queries.** Zone maps let a filtered read skip whole blocks without reading or decoding them, and partition predicates skip whole partitions before any of their files are opened.
+- **Slower full scans.** Every byte read is decoded and checksummed. Decoding and global aggregates run on the native pool, but a full scan still costs more CPU than reading mmapped columns.
+- **Not a drop-in replacement.** Block tables are read through explicit scan descriptors that support a bounded `select` subset; `.db.splayed.get` and `.db.parted.get` do not read them.
+
+## Writing
+
+| Function | Description |
+|---|---|
+| `(.db.block.set "dir" table options)` | Save an in-memory table as a new generation of `dir`. Returns the table. |
+| `(.csv.block [names types] "file.csv" "dir" options)` | Stream a CSV file into a block table; the same parse and schema arguments as `.csv.splayed`. Returns the row count. |
+| `(.parquet.block [read-options] "file.parquet" "dir" options)` | Stream a Parquet file into a block table; `read-options` are those of `.parquet.read`. Returns the row count. |
+| `(.db.block.convert "src" "dest" options [read-options])` | Rewrite an existing raw or block table as a block table at `dest`. Returns the row count. |
+
+`options` is a dictionary:
+
+| Key | Type | Meaning |
+|---|---|---|
+| `block-bytes` | `I64` | Uncompressed bytes per block, at most 64 MiB. Fixed-width columns hold `block-bytes / width` rows per block; a string must fit in one block. 64 KiB is a good start. |
+| `codec` | `SYM` | `none` or `snappy`. Snappy stores a block raw when compression does not shrink it. |
+| `durable` | `BOOL` | Optional, default `true`: fsync files and directories before publishing. |
+
+Supported column types are `B8`, `U8`, `I16`, `I32`, `I64`, `F32`, `F64`, `DATE`, `TIME`, `TIMESTAMP`, `GUID`, `SYM` and `STR`. Symbols are stored in a dictionary private to the generation. Column attributes are not stored: a column carrying `sorted` (or link and index attributes) is rejected with `nyi` rather than silently losing them.
+
+Writes stream: CSV and Parquet imports and conversions hold one input batch plus one block per column, never the whole table. A failed write publishes nothing and leaves the previous generation readable.
+
+```lisp
+(set t (table [ts sym px size]
+  (list (as 'TIMESTAMP [1000 2000 3000 4000])
+        ['AAPL 'MSFT 'AAPL 'IBM]
+        [101 102 103 104]
+        [10 20 30 40])))
+(.db.block.set "/tmp/rayforce-block-doc/2024.01.02/trades" t {block-bytes: 65536 codec: snappy})
+(.db.block.set "/tmp/rayforce-block-doc/2024.01.03/trades" t {block-bytes: 65536 codec: snappy})
+```
+
+### Converting existing data
+
+`.db.block.convert` reads its source through a block scan of every column and writes a new generation of `dest`. `dest` may not be the source, inside it, or contain it: the source is never modified. Convert a partitioned database one partition at a time into a new root.
+
+`read-options` describe the source:
+
+| Key | Type | Meaning |
+|---|---|---|
+| `immutable` | `BOOL` | Read a flat directory written by `.db.splayed.set` (no generations, no reader lease). You promise that nothing rewrites it while it is read. |
+| `sym` | `STR` | Symbol file of raw `SYM` columns. For a partition path `root/<partition>/<table>` it defaults to `root/.sym`. |
+
+```text
+(.db.block.convert "/data/raw/2024.01.02/trades" "/data/block/2024.01.02/trades"
+  {block-bytes: 65536 codec: snappy durable: true} {immutable: true})
+```
+
+## Reading
+
+Block tables are read with `select` over a scan descriptor:
+
+| Function | Description |
+|---|---|
+| `(.db.block.scan "dir" result-bytes [options])` | One table. |
+| `(.db.block.parted "root" 'table result-bytes [options])` | A partitioned database `root/<partition>/table`. Partitions may mix block generations and flat raw tables. |
+
+`result-bytes` caps the logical size of the result. Scan `options`:
+
+| Key | Default | Meaning |
+|---|---|---|
+| `batch-rows` | 65536 | Rows decoded per read. |
+| `payload-bytes` | 64 MiB | Decoded bytes per read. |
+| `scratch-bytes` | 8 MiB | Decode scratch per read. |
+| `work-bytes` | none | Optional cap on retained result plus the current read, masks and aggregate state. |
+| `immutable` | `false` | Admit flat raw directories, as for conversion. |
+
+The supported `select` is deliberately narrow; anything else fails with `nyi` instead of materializing the source:
+
+- Outputs are either bare columns (with aliases) or only global aggregates: `count` of any column, `sum` and `avg` of integers, `min` and `max` of integers, booleans and temporals.
+- `where` is a conjunction (`and`) of `==`, `!=`, `<`, `<=`, `>`, `>=` between a column and a literal of the same integer, boolean or temporal type.
+- No `by`, `take`, `asc`, `desc`.
+
+A partitioned scan adds the virtual key column `date` (for `YYYY.MM.DD` partitions) or `part`. It can be projected, aggregated and compared; comparisons on it skip partitions before their files are opened. Partitions are listed once and read one at a time, each under its own lease, so there is no snapshot across partitions. The first partition defines the column schema, as for `.db.parted.get`. Symbols from different partitions are returned in the runtime symbol table.
+
+```lisp
+(set trades (.db.block.parted "/tmp/rayforce-block-doc" 'trades 100000000))
+(select {from: trades where: (and (== date 2024.01.03) (> px 102)) t: ts k: sym p: px})
+(select {from: trades n: (count px) total: (sum size) hi: (max px)})
+```
+
+## Inspecting and verifying
+
+| Function | Description |
+|---|---|
+| `(.db.storage.info "dir" [read-options])` | One row per column: `column`, `type`, `format` (`raw`/`block`), `codec` (`none`/`snappy`/`mixed`), `rows`, `blocks`, `block_bytes`, `stored`, `logical`, `ratio`. Reads metadata only. |
+| `(.db.storage.verify "dir" [read-options])` | Decodes every block, checking both checksums, string framing, symbol bounds and that zone statistics describe the data. Returns blocks checked per column, or a `corrupt` error naming the column and block. |
+
+Ordinary reads check each block's checksums the first time it is decoded through an open file, and the directory and header checksums on open. `verify` is the full check to run after copying or restoring data.
+
+```lisp
+(.db.storage.info "/tmp/rayforce-block-doc/2024.01.02/trades")
+(.db.storage.verify "/tmp/rayforce-block-doc/2024.01.02/trades")
+```
+
+## Performance
+
+`bench/block_hdb/bench.py` compares a raw partitioned database with block tables (codec `none` and `snappy`, 64 KiB blocks) on 100 million trade-like rows over 20 days; see `bench/block_hdb/results/` for complete reports including cold-cache runs. Warm medians on a shared 2×Xeon E5-2690 server:
+
+| Query | raw | block none | block snappy |
+|---|---|---|---|
+| One minute of one day | 531 ms | 32 ms | 34 ms |
+| One minute across all days | 104 ms | 39 ms | 41 ms |
+| One column of one day (5M rows) | 198 ms | 113 ms | 150 ms |
+| 0.5% of one day, six columns | 242 ms | 382 ms | 961 ms |
+| Full scan, four aggregates | 330 ms | 839 ms | 1594 ms |
+| Disk | 7.36 GiB | 5.92 GiB | 2.56 GiB |
+
+Selective and time-range queries benefit most; full scans and wide late materialization pay for decoding, which scales with core count. Zone maps prune whole reads: a smaller `batch-rows`, down to the rows per block, prunes narrow ranges more finely at the cost of more reads.
+
+## Errors
+
+| Code | Meaning |
+|---|---|
+| `nyi` | Unsupported query shape, a flat source without `immutable: true`, or a column attribute blocks cannot keep. |
+| `limit` | A read or the result exceeds its configured byte limit. |
+| `schema` | Partitions or columns disagree in names or types. |
+| `corrupt` | A checksum, structure or statistic does not match. |
+| `access` | Called in restricted mode. |
