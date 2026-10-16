@@ -425,6 +425,14 @@ static bool convert_nested(const char* a, const char* b) {
     return !n || (!strncmp(a, b, n) && (b[n] == '\0' || b[n] == '/'));
 }
 
+ray_err_t ray_block_store_paths_overlap(const char* a, const char* b, bool* overlap) {
+    if (!a || !*a || !b || !*b || !overlap) return RAY_ERR_DOMAIN;
+    char x[PATH_MAX + 256], y[PATH_MAX + 256];
+    if (!convert_canonical(a, x, sizeof(x)) || !convert_canonical(b, y, sizeof(y))) return RAY_ERR_RANGE;
+    *overlap = convert_nested(x, y) || convert_nested(y, x);
+    return RAY_OK;
+}
+
 ray_err_t ray_block_store_convert(const char* src, const ray_block_scan_source_t* source,
                                   const char* dest, const ray_block_store_options_t* options,
                                   uint64_t* rows_out) {

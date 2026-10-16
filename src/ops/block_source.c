@@ -381,8 +381,72 @@ ray_t* ray_storage_verify_fn(ray_t** args, int64_t n) {
 }
 
 /* (.db.block.convert src dest block-options [{immutable: BOOL sym: STR}]) */
+/* (.db.block.convert src-root 'table dest-root block-options [read-options]):
+ * every partition src-root/<p>/table into dest-root/<p>/table, in key order. */
+static ray_t* convert_parted(ray_t** args, int64_t n) {
+    const char* src = string(args[0]);
+    const char* table = table_name(args[1]);
+    const char* dest = string(args[2]);
+    if (!src || !table || !dest)
+        return ray_error("domain", ".db.block.convert: nonempty roots and a table symbol required");
+    ray_block_store_options_t options;
+    ray_err_t err = ray_block_store_parse_options(args[3], &options);
+    if (err) return ray_error(ray_err_code_str(err), ".db.block.convert: invalid block options");
+    bool overlap;
+    err = ray_block_store_paths_overlap(src, dest, &overlap);
+    if (err) return ray_error(ray_err_code_str(err), ".db.block.convert: invalid paths");
+    if (overlap) return ray_error("domain", ".db.block.convert: %s and %s overlap", src, dest);
+    ray_block_scan_source_t source;
+    char sym[1100];
+    ray_t* bad = read_source(".db.block.convert", src, n == 5 ? args[4] : NULL, &source, sym, sizeof(sym));
+    if (bad) return bad;
+    if (!source.sym_path) {
+        struct stat st;
+        int len = snprintf(sym, sizeof(sym), "%s/.sym", src);
+        if (len > 0 && (size_t)len < sizeof(sym) && stat(sym, &st) == 0) source.sym_path = sym;
+    }
+    char** dirs = NULL;
+    int64_t count = 0;
+    bad = ray_parted_dirs(src, &dirs, &count, &(uint8_t){0});
+    if (bad) return bad;
+    if (!count) return ray_error("io", ".db.block.convert: %s has no partition directories", src);
+    ray_t* parts = ray_sym_vec_new(RAY_SYM_W64, 0);
+    ray_t* rows = ray_vec_new(RAY_I64, 0);
+    ray_t* result = !parts || RAY_IS_ERR(parts) || !rows || RAY_IS_ERR(rows) ? ray_error("oom", NULL) : NULL;
+    for (int64_t p = 0; !result && p < count; p++) {
+        if (ray_eval_is_interrupted()) { result = ray_error("cancel", ".db.block.convert: interrupted"); break; }
+        char from[1300], to[1300];
+        int a = snprintf(from, sizeof(from), "%s/%s/%s", src, dirs[p], table);
+        int b = snprintf(to, sizeof(to), "%s/%s/%s", dest, dirs[p], table);
+        if (a < 0 || (size_t)a >= sizeof(from) || b < 0 || (size_t)b >= sizeof(to)) {
+            result = ray_error("range", ".db.block.convert: partition path too long"); break;
+        }
+        uint64_t converted = 0;
+        err = ray_block_store_convert(from, &source, to, &options, &converted);
+        if (err) {
+            result = ray_error(ray_err_code_str(err), ".db.block.convert: partition %s failed; earlier partitions are published", dirs[p]);
+            break;
+        }
+        int64_t name = ray_sym_intern(dirs[p], strlen(dirs[p]));
+        int64_t value = (int64_t)converted;
+        ray_t* np = ray_vec_append_raw(parts, &name, 1);
+        if (np && !RAY_IS_ERR(np)) parts = np;
+        ray_t* nr = np && !RAY_IS_ERR(np) ? ray_vec_append_raw(rows, &value, 1) : NULL;
+        if (nr && !RAY_IS_ERR(nr)) rows = nr;
+        else result = ray_error("oom", NULL);
+    }
+    ray_parted_dirs_free(dirs, count);
+    if (result) { ray_release(parts); ray_release(rows); return result; }
+    ray_t* t = ray_table_new(2);
+    t = ray_table_add_col(t, ray_sym_intern("partition", 9), parts);
+    t = ray_table_add_col(t, ray_sym_intern("rows", 4), rows);
+    ray_release(parts); ray_release(rows);
+    return t ? t : ray_error("oom", NULL);
+}
+
 ray_t* ray_block_convert_fn(ray_t** args, int64_t n) {
     if (ray_eval_get_restricted()) return ray_error("access", "restricted");
+    if ((n == 4 || n == 5) && args[1] && args[1]->type == -RAY_SYM) return convert_parted(args, n);
     if (n != 3 && n != 4) return ray_error("arity", ".db.block.convert: src dest block-options [read-options]");
     const char* src = string(args[0]);
     const char* dest = string(args[1]);
