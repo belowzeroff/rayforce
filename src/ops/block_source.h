@@ -2,6 +2,7 @@
 #ifndef RAY_BLOCK_SOURCE_H
 #define RAY_BLOCK_SOURCE_H
 #include <rayforce.h>
+#include "store/block_scan.h"
 /* Experimental (.db.block.scan path result-bytes [options]) data-only descriptor.
  * Opening occurs at select time, not construction. Result limit covers logical
  * vector bytes and STR pools, not total RSS, vocabulary, or allocator capacity.
@@ -61,6 +62,9 @@ ray_t* ray_block_convert_fn(ray_t** args, int64_t n);
  * cover every partition <root>/<p>/<table> (raw SYM defaulting to <root>/.sym)
  * and add a leading partition column; errors also name the partition. */
 ray_t* ray_storage_info_fn(ray_t** args, int64_t n);
+/* Every row of the table at dir, raw or compressed (see block scans), into
+ * an in-memory table whose logical size may not exceed limit bytes. */
+ray_t* ray_block_materialize(const char* dir, const ray_block_scan_source_t* source, size_t limit);
 ray_t* ray_storage_verify_fn(ray_t** args, int64_t n);
 /* NULL means not our descriptor; otherwise owned final result/error. */
 ray_t* ray_block_select_source(ray_t* source, ray_t* query);
