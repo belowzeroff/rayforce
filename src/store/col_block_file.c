@@ -16,6 +16,10 @@ ray_err_t ray_col_block_file_open(const char* path, ray_col_block_file_t** out) 
     file->mapping = ray_vm_map_file(path, &file->size);
     if (!file->mapping) { free(file); return RAY_ERR_IO; }
     ray_err_t err = ray_col_block_open(&file->reader, file->mapping, file->size);
+    if (!err) {
+        file->reader.verified = calloc((size_t)(file->reader.blocks / 8 + 1), 1);
+        if (!file->reader.verified) err = RAY_ERR_OOM;
+    }
     if (err) {
         ray_vm_unmap_file(file->mapping, file->size);
         free(file);
@@ -32,6 +36,7 @@ const ray_col_block_reader_t* ray_col_block_file_reader(const ray_col_block_file
 void ray_col_block_file_close(ray_col_block_file_t** file) {
     if (!file || !*file) return;
     ray_vm_unmap_file((*file)->mapping, (*file)->size);
+    free((*file)->reader.verified);
     free(*file);
     *file = NULL;
 }
