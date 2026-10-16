@@ -321,6 +321,17 @@ ray_err_t ray_block_scan_range_may_match(const ray_block_scan_t* s,
         scan_col_cmp(op), value, value_is_null, may_match);
 }
 
+uint64_t ray_block_scan_zone_rows(const ray_block_scan_t* s, size_t column) {
+    if (!s || column >= s->count || s->columns[column].raw) return 0;
+    const ray_col_block_reader_t* r = ray_col_block_file_reader(s->columns[column].file);
+    switch (r->type) {
+    case RAY_BOOL: case RAY_U8: case RAY_I16: case RAY_I32: case RAY_I64:
+    case RAY_DATE: case RAY_TIME: case RAY_TIMESTAMP:
+        return r->block_bytes / ray_elem_size((int8_t)r->type);
+    default: return 0;
+    }
+}
+
 ray_err_t ray_block_scan_skip_next(ray_block_scan_t* s, uint64_t* row_start) {
     if (!s || s->failed) return RAY_ERR_DOMAIN;
     if (s->cancelled) return RAY_ERR_CANCEL;
