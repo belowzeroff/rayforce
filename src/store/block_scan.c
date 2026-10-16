@@ -408,7 +408,7 @@ uint32_t ray_block_scan_batch_rows(const ray_block_scan_t* s) {
 /* Logical bytes per output row: fixed widths, SYM as W64, STR as its
  * descriptor plus the average decoded string of the column. */
 static uint32_t scan_auto_rows(const ray_block_scan_t* s) {
-    double width = 0;
+    double width = 0, decoded = 0;  /* decoded: STR arena bytes per row */
     for (size_t i = 0; i < s->count; i++) {
         const scan_column_t* c = &s->columns[i];
         int8_t type = scan_column_type(c);
@@ -421,11 +421,15 @@ static uint32_t scan_auto_rows(const ray_block_scan_t* s) {
             double avg = r->rows && !ray_col_block_summary(r, &sum) ?
                 (double)sum.decoded_bytes / (double)r->rows : 0;
             width += 12 + avg;
+            decoded += avg;
         }
     }
     size_t budget = s->options.payload_limit / 2;
     if (s->options.work_limit && s->options.work_limit / 4 < budget) budget = s->options.work_limit / 4;
     double rows = (double)budget / (width > 1 ? width : 1);
+    /* Keep string arenas within scratch, so strings decode once per read. */
+    if (decoded > 0 && (double)s->options.scratch_limit / decoded < rows)
+        rows = (double)s->options.scratch_limit / decoded;
     if (rows > RAY_BLOCK_SCAN_AUTO_MAX) rows = RAY_BLOCK_SCAN_AUTO_MAX;
     return rows < 1 ? 1 : (uint32_t)rows;
 }

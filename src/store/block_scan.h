@@ -10,7 +10,8 @@
 typedef struct ray_block_scan_s ray_block_scan_t;
 /* batch_rows value asking open to size batches itself: half the payload
  * limit (a quarter of a work limit) over the estimated row width of the
- * projection, at most RAY_BLOCK_SCAN_AUTO_MAX rows. */
+ * projection, no more rows than the scratch limit holds of decoded string
+ * blocks, and at most RAY_BLOCK_SCAN_AUTO_MAX rows. */
 #define RAY_BLOCK_SCAN_AUTO_ROWS UINT32_MAX
 #define RAY_BLOCK_SCAN_AUTO_MAX (1u << 20)
 typedef struct {
