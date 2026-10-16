@@ -668,6 +668,19 @@ static test_result_t summary_and_verify(void) {
     TEST_ASSERT_EQ_I(ray_col_block_open(&r, bytes, file_size), RAY_OK);
     TEST_ASSERT_EQ_I(ray_col_block_verify(&r, scratch, sizeof(scratch), &bad), RAY_ERR_CORRUPT);
     TEST_ASSERT_EQ_I(bad, 1);
+
+    /* An uncompressed block is its own decoded bytes: its two CRCs agree. */
+    reset_file();
+    TEST_ASSERT_EQ_I(ray_col_block_begin(&writer, file, RAY_I64, 800, 0, 0), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_block_append(&writer, values, 300), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_block_finish(&writer), RAY_OK);
+    snapshot();
+    TEST_ASSERT_EQ_I(ray_col_block_open(&r, bytes, file_size), RAY_OK);
+    uint8_t* entry = bytes + r.directory;
+    TEST_ASSERT_EQ_I(get(entry + 40, 4), get(entry + 44, 4));
+    put(entry + 44, get(entry + 44, 4) ^ 1, 4);
+    rechecksum(bytes);
+    TEST_ASSERT_EQ_I(ray_col_block_open(&r, bytes, file_size), RAY_ERR_CORRUPT);
     PASS();
 }
 

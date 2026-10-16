@@ -18,7 +18,8 @@
  * by count and file CRC. They are never process-local symbol identifiers.
  * Payload is little-endian; callers supply native values on little-endian
  * hosts only. The mapped bytes must remain immutable and alive until the
- * reader is discarded. Opening checks all metadata, not payload CRCs. */
+ * reader is discarded. Opening checks all metadata, not payload CRCs; an
+ * uncompressed block must carry equal payload and decoded CRCs. */
 typedef struct {
     const uint8_t* data;
     size_t size;
@@ -27,6 +28,9 @@ typedef struct {
     uint8_t type;
     uint64_t sym_count;
     uint32_t sym_crc;
+    /* Optional bit per block whose checksums already passed over these
+     * immutable bytes; read skips them again. NULL checks every read. */
+    uint8_t* verified;
 } ray_col_block_reader_t;
 
 typedef enum {
@@ -59,7 +63,7 @@ typedef struct {
 } ray_col_block_summary_t;
 ray_err_t ray_col_block_summary(const ray_col_block_reader_t* reader,
                                 ray_col_block_summary_t* out);
-/* Full check of every block in order: payload CRC, codec, decoded CRC, STR
+/* Full check of every block in order, ignoring reader->verified: payload CRC, codec, decoded CRC, STR
  * framing and SYM positions below sym_count. scratch must hold block_bytes.
  * On corrupt, *bad_block (optional) is the first failing block. */
 ray_err_t ray_col_block_verify(const ray_col_block_reader_t* reader,
@@ -116,6 +120,8 @@ ray_t* ray_col_block_materialize_str(const ray_col_block_reader_t* reader,
                                     size_t scratch_capacity);
 
 /* Owning file handle. Open requires *out == NULL; failures leave it NULL.
+ * Its reader remembers verified blocks (see reader->verified), so a block
+ * decoded again through the same handle is not checksummed again.
  * Close clears the caller's pointer and accepts NULL. The borrowed reader is
  * valid until close; do not copy it past the handle lifetime or mutate it.
  * Uses the platform file mapper. The inode must remain immutable: this is NOT
