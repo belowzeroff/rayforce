@@ -51,6 +51,7 @@
 #include "store/fileio.h"
 #include "store/splay.h"
 #include "store/stream.h"
+#include "store/block_store.h"
 #include "table/sym.h"
 #include "table/domain.h"
 #include "vec/str.h"
@@ -3644,9 +3645,15 @@ static ray_err_t csv_save_splayed_to_dir(const char* path, char delimiter, bool 
                                           const int8_t* col_types_in, int32_t n_types,
                                           const int64_t* col_names_in, int32_t n_names,
                                           const char* dir, int64_t rows_per_chunk,
-                                          const char* sym_path) {
+                                          const char* sym_path,
+                                          const ray_block_store_options_t* block,
+                                          int64_t* rows_out) {
+    /* block: dir is a block table root and every parsed chunk goes to one
+     * streaming block generation instead of the raw column writers. */
     if (ray_interrupted()) return RAY_ERR_CANCEL;
-    if (!path || !dir || !sym_path) return RAY_ERR_DOMAIN;
+    if (!path || !dir || (!sym_path && !block)) return RAY_ERR_DOMAIN;
+    ray_block_table_writer_t* block_writer = NULL;
+    int64_t rows_written = 0;
     if (rows_per_chunk <= 0) rows_per_chunk = CSV_PART_ROWS_DEFAULT;
     /* RAY_CSV_TRACE: phase timings to stderr, as csv.parted prints them. */
     bool trace = getenv("RAY_CSV_TRACE") != NULL;
@@ -3778,7 +3785,7 @@ static ray_err_t csv_save_splayed_to_dir(const char* path, char delimiter, bool 
         return RAY_ERR_CANCEL;
     }
 
-    err = ray_mkdir_p(dir);
+    err = block ? RAY_OK : ray_mkdir_p(dir);
     if (err != RAY_OK) {
         ray_vm_unmap_file(buf, file_size);
         return err;
@@ -3796,7 +3803,7 @@ static ray_err_t csv_save_splayed_to_dir(const char* path, char delimiter, bool 
         ray_vm_unmap_file(buf, file_size);
         return RAY_ERR_RANGE;
     }
-    remove(schema_path); /* best-effort; ENOENT is the common case */
+    if (!block) remove(schema_path); /* best-effort; ENOENT is the common case */
 
     /* SYM columns encode against the table's symfile domain (dir/.sym):
      * open-or-create it up front; cells intern as they stream. */
@@ -3805,7 +3812,8 @@ static ray_err_t csv_save_splayed_to_dir(const char* path, char delimiter, bool 
         bool any_sym = false;
         for (int c = 0; c < ncols; c++)
             if (resolved_types[c] == RAY_SYM) any_sym = true;
-        if (any_sym) {
+        /* A block generation keeps its own dictionary: chunks stay runtime. */
+        if (any_sym && !block) {
             sym_dom = ray_sym_domain_open_or_create(sym_path);
             if (!sym_dom) {
                 ray_vm_unmap_file(buf, file_size);
@@ -3828,7 +3836,7 @@ static ray_err_t csv_save_splayed_to_dir(const char* path, char delimiter, bool 
 
     ray_col_stream_t writers[CSV_MAX_COLS];
     memset(writers, 0, sizeof(writers));
-    for (int c = 0; c < ncols; c++) {
+    for (int c = 0; !block && c < ncols; c++) {
         err = ray_col_stream_open(&writers[c], dir, col_name_ids[c],
                                       resolved_types[c], sym_dom);
         if (err == RAY_OK) err = ray_col_stream_index_begin(&writers[c], 0);
@@ -3885,11 +3893,16 @@ static ray_err_t csv_save_splayed_to_dir(const char* path, char delimiter, bool 
         }
         int64_t tr_c2 = ray_profile_now_ns();
 
+        if (block) {
+            err = block_writer ? RAY_OK : ray_block_table_begin(dir, tbl, block, &block_writer);
+            if (err == RAY_OK) err = ray_block_table_append(block_writer, tbl);
+            rows_written += cnt;
+        }
         /* One task per column: each writer owns its file, its cache and
          * its symfile domain (the domain probe takes the domain lock, the
          * symbol table read its own), so the columns of a chunk are
          * encoded and written side by side. */
-        {
+        else {
             csv_splayed_append_ctx_t actx = { .writers = writers, .tbl = tbl,
                                               .ncols = ncols, .err = RAY_OK,
                                               .col_ns = trace ? tr_col_ns : NULL };
@@ -3918,6 +3931,14 @@ static ray_err_t csv_save_splayed_to_dir(const char* path, char delimiter, bool 
         }
         if (cnt == 0) break;
         chunk_offset = next_offset;
+    }
+
+    if (block) {
+        if (err == RAY_OK) err = ray_block_table_finish(&block_writer);
+        else ray_block_table_abort(&block_writer);
+        if (err == RAY_OK && rows_out) *rows_out = rows_written;
+        ray_vm_unmap_file(buf, file_size);
+        return err;
     }
 
     /* Flush the symfile BEFORE committing column files (writer_close
@@ -4036,8 +4057,19 @@ ray_err_t ray_csv_save_splayed_named_opts(const char* path, char delimiter, bool
     if (err != RAY_OK) return err;
     err = csv_save_splayed_to_dir(path, delimiter, header, col_types_in, n_types,
                                   col_names_in, n_names, write.dir,
-                                  rows_per_chunk, sym_path);
+                                  rows_per_chunk, sym_path, NULL, NULL);
     return ray_splay_write_finish(&write, err, false);
+}
+
+ray_err_t ray_csv_save_block(const char* path, char delimiter, bool header,
+                             const int8_t* col_types_in, int32_t n_types,
+                             const int64_t* col_names_in, int32_t n_names,
+                             const char* root, int64_t rows_per_chunk,
+                             const ray_block_store_options_t* options, int64_t* rows) {
+    if (!options) return RAY_ERR_DOMAIN;
+    return csv_save_splayed_to_dir(path, delimiter, header, col_types_in, n_types,
+                                   col_names_in, n_names, root, rows_per_chunk,
+                                   NULL, options, rows);
 }
 
 static ray_err_t csv_save_parted_impl(const char* path, char delimiter, bool header,
