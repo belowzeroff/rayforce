@@ -30,5 +30,7 @@
 /* CRC-32 (IEEE, reflected, poly 0xEDB88320) of n bytes, continuing from
  * `seed` (0 for a fresh checksum; pass a previous result to extend it). */
 uint32_t ray_crc32(uint32_t seed, const void* data, size_t n);
+/* Same result without CPU-specific folding; for cross-checks. */
+uint32_t ray_crc32_portable(uint32_t seed, const void* data, size_t n);
 
 #endif /* RAY_CRC32_H */
