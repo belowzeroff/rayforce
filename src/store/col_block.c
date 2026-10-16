@@ -92,7 +92,7 @@ ray_err_t ray_col_block_open(ray_col_block_reader_t* r, const void* data, size_t
     uint64_t sym_count = get_le(h + 88, 8);
     uint32_t sym_crc = (uint32_t)get_le(h + 96, 4);
     if (memcmp(h + 32, "RAYHDB2", 8) || !zero(h, 17) ||
-        !zero(h + 19, 5) || !zero(h + 100, 28) ||
+        !zero(h + 19, 5) || !zero(h + 104, 24) ||
         (h[18] == RAY_SYM ? (!sym_count || sym_count > INT64_MAX) : (sym_count || sym_crc)) ||
         get_le(h + 40, 4) != RAY_COL_BLOCK_HEADER ||
         get_le(h + 84, 4) != header_crc(h) || !w ||
@@ -107,9 +107,13 @@ ray_err_t ray_col_block_open(ray_col_block_reader_t* r, const void* data, size_t
         get_le(footer + 16, 8) != dir || get_le(footer + 24, 8) != size ||
         get_le(h + 80, 4) != ray_crc32(0, h + dir, (size_t)(blocks * RAY_COL_BLOCK_ENTRY)))
         return RAY_ERR_CORRUPT;
+    /* Checksummed metadata that this reader cannot interpret: a newer file,
+     * not a damaged one. */
+    if ((uint32_t)get_le(h + 100, 4) & ~(uint32_t)RAY_COL_BLOCK_FEATURES) return RAY_ERR_NYI;
     uint64_t row = 0, offset = RAY_COL_BLOCK_HEADER;
     for (uint64_t i = 0; i < blocks; i++) {
         const uint8_t* e = h + dir + i * RAY_COL_BLOCK_ENTRY;
+        if (e[32] > 1) return RAY_ERR_NYI;
         uint64_t count = get_le(e + 8, 8);
         uint32_t stored = (uint32_t)get_le(e + 24, 4);
         uint32_t decoded = (uint32_t)get_le(e + 28, 4);

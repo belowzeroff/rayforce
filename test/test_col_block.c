@@ -161,12 +161,16 @@ static test_result_t corruption(void) {
     /* Repair metadata CRCs to exercise structural checks, not only checksums. */
     const size_t offsets[] = {0, 19, 40, 47, 88,
         dir, dir + 8, dir + 16, dir + 24, dir + 28,
-        dir + 32, dir + 33, dir + 34, dir + 48, dir + 64};
+        dir + 33, dir + 34, dir + 48, dir + 64};
     for (size_t i = 0; i < sizeof(offsets) / sizeof(*offsets); i++) {
         memcpy(copy, bytes, file_size); copy[offsets[i]] ^= 0x80;
         rechecksum(copy);
         TEST_ASSERT_EQ_I(ray_col_block_open(&r, copy, file_size), RAY_ERR_CORRUPT);
     }
+    /* A re-signed unknown codec byte reads as a newer file, not damage. */
+    memcpy(copy, bytes, file_size); copy[dir + 32] ^= 0x80;
+    rechecksum(copy);
+    TEST_ASSERT_EQ_I(ray_col_block_open(&r, copy, file_size), RAY_ERR_NYI);
     memcpy(copy, bytes, file_size); copy[RAY_COL_BLOCK_HEADER] ^= 1;
     TEST_ASSERT_EQ_I(ray_col_block_open(&r, copy, file_size), RAY_OK);
     uint64_t row = 99, count = 99;
@@ -721,7 +725,39 @@ static test_result_t crc32_paths(void) {
     PASS();
 }
 
+static test_result_t newer_features(void) {
+    int64_t values[64];
+    for (int i = 0; i < 64; i++) values[i] = i;
+    TEST_ASSERT_EQ_I(ray_col_block_begin(&writer, file, RAY_I64, 256, 0, 0), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_block_append(&writer, values, 64), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_block_finish(&writer), RAY_OK);
+    snapshot();
+    ray_col_block_reader_t r;
+    TEST_ASSERT_EQ_I(ray_col_block_open(&r, bytes, file_size), RAY_OK);
+    TEST_ASSERT_EQ_I(get(bytes + 100, 4), 0);
+    /* An unknown codec in a checksummed directory: a newer file. */
+    uint8_t* entry = bytes + r.directory + RAY_COL_BLOCK_ENTRY;
+    entry[32] = 2;
+    rechecksum(bytes);
+    TEST_ASSERT_EQ_I(ray_col_block_open(&r, bytes, file_size), RAY_ERR_NYI);
+    entry[32] = 0;
+    rechecksum(bytes);
+    TEST_ASSERT_EQ_I(ray_col_block_open(&r, bytes, file_size), RAY_OK);
+    /* A required feature bit this reader lacks. */
+    put(bytes + 100, 1, 4);
+    rechecksum(bytes);
+    TEST_ASSERT_EQ_I(ray_col_block_open(&r, bytes, file_size), RAY_ERR_NYI);
+    /* The same bit without a valid header checksum is damage, not a feature. */
+    bytes[100] = 0; rechecksum(bytes); bytes[100] = 1;
+    TEST_ASSERT_EQ_I(ray_col_block_open(&r, bytes, file_size), RAY_ERR_CORRUPT);
+    /* Other reserved bytes stay zero. */
+    bytes[100] = 0; bytes[110] = 1; rechecksum(bytes);
+    TEST_ASSERT_EQ_I(ray_col_block_open(&r, bytes, file_size), RAY_ERR_CORRUPT);
+    PASS();
+}
+
 const test_entry_t col_block_entries[] = {
+    {"col_block/newer_features", newer_features, setup, teardown},
     {"col_block/crc32_paths", crc32_paths, setup, teardown},
     {"col_block/summary_and_verify", summary_and_verify, setup, teardown},
     {"col_block/strings", strings, setup, teardown},

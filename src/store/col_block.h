@@ -9,6 +9,10 @@
 #define RAY_COL_BLOCK_HEADER 128u
 #define RAY_COL_BLOCK_ENTRY 64u
 #define RAY_COL_BLOCK_FOOTER 32u
+/* Required-feature bits (header bytes 100..103) this reader implements. A
+ * file setting any other bit, or a block using an unknown codec, opens as
+ * RAY_ERR_NYI: it needs a newer reader. Reserved bytes 104..127 stay zero. */
+#define RAY_COL_BLOCK_FEATURES 0u
 
 /* Experimental major-2 block container. No semantic attrs or external indexes.
  * Integer and temporal blocks may carry CRC-protected min/max zone metadata.
