@@ -4402,6 +4402,7 @@ static void ray_register_builtins(void) {
     register_vary(".parquet.each",     RAY_FN_RESTRICTED, ray_parquet_each_fn);
     register_vary(".parquet.splayed",  RAY_FN_RESTRICTED, ray_parquet_splayed_fn);
     register_vary(".parquet.parted",   RAY_FN_RESTRICTED, ray_parquet_parted_fn);
+    register_vary(".parquet.block",    RAY_FN_RESTRICTED, ray_parquet_block_fn);
     register_binary("as",       RAY_FN_NONE, ray_cast_fn);
     register_unary("type",      RAY_FN_NONE, ray_type_fn);
     register_unary("read",      RAY_FN_RESTRICTED, ray_read_file_fn);
