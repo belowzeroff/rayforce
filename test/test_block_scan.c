@@ -1418,6 +1418,44 @@ static test_result_t gate_range_pruning(void) {
     PASS();
 }
 
+/* Scattered matches: every output block is decoded once, not once per run. */
+static test_result_t query_scattered_matches(void) {
+    const uint32_t rows = 4096;
+    ray_t* x = ray_vec_new(RAY_I64, rows);
+    ray_t* v = ray_vec_new(RAY_I32, rows);
+    for (uint32_t i = 0; i < rows; i++) {
+        ((int64_t*)ray_data(x))[i] = i % 7;
+        ((int32_t*)ray_data(v))[i] = (int32_t)i;
+    }
+    x->len = v->len = rows;
+    ray_t* table = ray_table_new(2);
+    table = ray_table_add_col(table, ray_sym_intern("x", 1), x);
+    table = ray_table_add_col(table, ray_sym_intern("v", 1), v);
+    ray_release(x); ray_release(v);
+    ray_block_store_options_t store = {512, 1, false};
+    TEST_ASSERT_EQ_I(ray_block_store_save(table, root, &store), RAY_OK);
+    ray_release(table);
+    const char* output[] = {"v"};
+    ray_t* three = ray_i64(3);
+    ray_block_predicate_t pred = {"x", OP_EQ, three};
+    ray_block_scan_options_t read = {0, UINT64_MAX, 4096, 1u << 20, 1u << 20, 0};
+    TEST_ASSERT_EQ_I(ray_block_query_open(root, output, 1, &pred, 1, &read, &query), RAY_OK);
+    ray_release(three);
+    int64_t seen = 0;
+    for (ray_t* b; (b = ray_block_query_next(query)); ray_release(b)) {
+        TEST_ASSERT_FALSE(RAY_IS_ERR(b));
+        ray_t* col = ray_table_get_col_idx(b, 0);
+        for (int64_t i = 0; i < col->len; i++, seen++)
+            TEST_ASSERT_EQ_I(((int32_t*)ray_data(col))[i], (int32_t)(3 + 7 * seen));
+    }
+    TEST_ASSERT_EQ_I(seen, (rows - 3 + 6) / 7);
+    ray_block_query_stats_t stats;
+    ray_block_query_stats(query, &stats);
+    /* 64 x blocks for the filter, 32 v blocks for the output. */
+    TEST_ASSERT_EQ_I(stats.scan.blocks_decoded, 64 + 32);
+    PASS();
+}
+
 static test_result_t query_admission(void) {
     publish(1, 16, 16, 1);
     const char* output[] = {"y"};
@@ -1502,6 +1540,7 @@ const test_entry_t block_scan_entries[] = {
     {"block_scan/query_native_parity", query_native_parity, setup, teardown},
     {"block_scan/query_zone_pruning", query_zone_pruning, setup, teardown},
     {"block_scan/gate_range_pruning", gate_range_pruning, setup, teardown},
+    {"block_scan/query_scattered_matches", query_scattered_matches, setup, teardown},
     {"block_scan/query_admission", query_admission, setup, teardown},
     {"block_scan/subset_variable_width", subset_variable_width, setup, teardown},
     {"block_scan/subset_ranges", subset_ranges, setup, teardown},

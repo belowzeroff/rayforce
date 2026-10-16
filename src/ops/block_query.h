@@ -4,6 +4,9 @@
 #include "store/block_scan.h"
 
 #define RAY_BLOCK_QUERY_MAX_PREDICATES 32u
+/* Matching runs at most this many rows apart are read as one window and
+ * compacted, so blocks they share are decoded once. */
+#define RAY_BLOCK_QUERY_COALESCE_ROWS 8192u
 typedef struct ray_block_query_s ray_block_query_t;
 typedef struct {
     const char* column;
@@ -16,7 +19,8 @@ typedef struct {
  * Uses native graph execution, including native null semantics. No promotion,
  * arbitrary expressions, aggregates, ordering, or hidden full materialization.
  * One scan pins the union of filter and output columns. Filter-only batches
- * precede output-only contiguous matching ranges, in original row order.
+ * precede output-only matching rows, in original row order: runs at most
+ * RAY_BLOCK_QUERY_COALESCE_ROWS apart are read as one window and compacted.
  * Conjunctive predicates use compressed integer/temporal zone metadata to
  * skip provably nonmatching batches; raw, legacy, and unsupported data remain
  * conservative and are evaluated normally.
