@@ -37,6 +37,7 @@
 #include "lang/parse.h"
 #include "core/pool.h"
 #include "core/types.h"
+#include "store/block_store.h"
 #include "io/csv.h"
 #include "ops/ops.h"
 
@@ -627,11 +628,20 @@ static const char* csv_default_sym_path(const char* dir, char* buf, size_t bufsz
     return buf;
 }
 
-ray_t* ray_read_csv_splayed_fn(ray_t** args, int64_t n) {
-    if (n < 2 || n > 4) return ray_error("arity", "csv.splayed: expects 2 to 4 arguments, got %lld", (long long)n);
-
+/* [names types] path dir, as .csv.splayed and .csv.block take them. */
+typedef struct {
     char dir[1024];
-    if (!csv_str_arg(args[n - 1], dir, sizeof(dir))) return ray_error("type", "csv.splayed: target dir must be str, got %s", args[n - 1] ? ray_type_name(args[n - 1]->type) : "null");
+    const char* path;
+    int8_t col_types[256];
+    int64_t col_names[256];
+    int32_t ncols;
+    const int8_t* types;
+    const int64_t* names;
+    bool header;
+} csv_target_t;
+
+static ray_t* csv_target_args(const char* who, ray_t** args, int64_t n, csv_target_t* t) {
+    if (!csv_str_arg(args[n - 1], t->dir, sizeof(t->dir))) return ray_error("type", "%s: target dir must be str, got %s", who, args[n - 1] ? ray_type_name(args[n - 1]->type) : "null");
 
     int64_t data_n = n - 1;
     ray_t* path_obj = NULL;
@@ -648,51 +658,74 @@ ray_t* ray_read_csv_splayed_fn(ray_t** args, int64_t n) {
     } else if (data_n == 1) {
         path_obj = args[0];
     } else {
-        return ray_error("domain", "csv.splayed: invalid argument arrangement");
+        return ray_error("domain", "%s: invalid argument arrangement", who);
     }
-    if (!path_obj || path_obj->type != -RAY_STR) return ray_error("type", "csv.splayed: source path must be str, got %s", path_obj ? ray_type_name(path_obj->type) : "null");
-    const char* path = ray_str_ptr(path_obj);
-    if (!path) return ray_error("domain", "csv.splayed: empty source path");
+    if (!path_obj || path_obj->type != -RAY_STR) return ray_error("type", "%s: source path must be str, got %s", who, path_obj ? ray_type_name(path_obj->type) : "null");
+    t->path = ray_str_ptr(path_obj);
+    if (!t->path) return ray_error("domain", "%s: empty source path", who);
 
-    int8_t col_types[256];
-    int64_t col_names[256];
-    int32_t ncols = 0;
-    const int8_t* types_arg = NULL;
-    const int64_t* names_arg = NULL;
-    bool header = true;
-
+    t->ncols = 0;
+    t->types = NULL;
+    t->names = NULL;
+    t->header = true;
     if (schema) {
         if (schema->len > 256) return ray_error("limit", NULL);
-        ncols = (int32_t)schema->len;
+        t->ncols = (int32_t)schema->len;
         void* sym_data = ray_data(schema);
         for (int64_t i = 0; i < schema->len; i++) {
             int64_t sid = ray_read_sym(sym_data, i, schema->type, schema->attrs);
-            col_types[i] = resolve_type_name(sid);
-            if (col_types[i] < 0) return ray_error("type", "csv.splayed: unknown column type name in schema");
+            t->col_types[i] = resolve_type_name(sid);
+            if (t->col_types[i] < 0) return ray_error("type", "%s: unknown column type name in schema", who);
         }
-        types_arg = col_types;
+        t->types = t->col_types;
         if (names) {
-            if (names->len != schema->len) return ray_error("length", "csv.splayed: names and types must match, got %lld names and %lld types", (long long)names->len, (long long)schema->len);
+            if (names->len != schema->len) return ray_error("length", "%s: names and types must match, got %lld names and %lld types", who, (long long)names->len, (long long)schema->len);
             void* name_data = ray_data(names);
             for (int64_t i = 0; i < names->len; i++)
-                col_names[i] = ray_read_sym(name_data, i, names->type, names->attrs);
-            names_arg = col_names;
-            header = false;
+                t->col_names[i] = ray_read_sym(name_data, i, names->type, names->attrs);
+            t->names = t->col_names;
+            t->header = false;
         }
     }
+    return NULL;
+}
 
-    ray_err_t err = ray_csv_save_splayed_named_opts(path, 0, header,
-                                                    types_arg, ncols,
-                                                    names_arg, ncols,
-                                                    dir, 0);
+ray_t* ray_read_csv_splayed_fn(ray_t** args, int64_t n) {
+    if (n < 2 || n > 4) return ray_error("arity", "csv.splayed: expects 2 to 4 arguments, got %lld", (long long)n);
+    csv_target_t t;
+    ray_t* bad = csv_target_args("csv.splayed", args, n, &t);
+    if (bad) return bad;
+
+    ray_err_t err = ray_csv_save_splayed_named_opts(t.path, 0, t.header,
+                                                    t.types, t.ncols,
+                                                    t.names, t.ncols,
+                                                    t.dir, 0);
     if (err != RAY_OK) return ray_error(ray_err_code_str(err), NULL);
 
     char sym_path[1024];
-    const char* sym = csv_default_sym_path(dir, sym_path, sizeof(sym_path));
+    const char* sym = csv_default_sym_path(t.dir, sym_path, sizeof(sym_path));
     if (!sym) return ray_error("io", NULL);
 
     /* The writer builds indexes before publishing its generation. */
-    return ray_read_splayed(dir, sym);
+    return ray_read_splayed(t.dir, sym);
+}
+
+/* (.csv.block [names types] path root block-options): row count. */
+ray_t* ray_read_csv_block_fn(ray_t** args, int64_t n) {
+    if (n < 2 || n > 5) return ray_error("arity", "csv.block: expects 2 to 5 arguments, got %lld", (long long)n);
+    /* Block options, when given, are the trailing dictionary. */
+    bool has_options = args[n - 1] && args[n - 1]->type == RAY_DICT;
+    ray_block_store_options_t options;
+    ray_err_t err = ray_block_store_parse_options(has_options ? args[n - 1] : NULL, &options);
+    if (err) return ray_error(ray_err_code_str(err), "csv.block: invalid block options");
+    csv_target_t t;
+    ray_t* bad = csv_target_args("csv.block", args, has_options ? n - 1 : n, &t);
+    if (bad) return bad;
+    int64_t rows = 0;
+    err = ray_csv_save_block(t.path, 0, t.header, t.types, t.ncols, t.names, t.ncols,
+                             t.dir, 0, &options, &rows);
+    if (err != RAY_OK) return ray_error(ray_err_code_str(err), "csv.block: import failed");
+    return ray_i64(rows);
 }
 
 ray_t* ray_read_csv_parted_fn(ray_t** args, int64_t n) {

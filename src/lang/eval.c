@@ -22,6 +22,7 @@
  */
 
 #include "lang/eval.h"
+#include "ops/block_source.h"
 #include "core/runtime.h"
 #include "lang/internal.h"
 #include "app/repl.h"
@@ -4393,6 +4394,7 @@ static void ray_register_builtins(void) {
     register_vary("write-csv",  RAY_FN_RESTRICTED, ray_write_csv_fn);
     register_vary(".csv.read",         RAY_FN_RESTRICTED, ray_read_csv_fn);
     register_vary(".csv.splayed",      RAY_FN_RESTRICTED, ray_read_csv_splayed_fn);
+    register_vary(".csv.block",        RAY_FN_RESTRICTED, ray_read_csv_block_fn);
     register_vary(".csv.parted",       RAY_FN_RESTRICTED, ray_read_csv_parted_fn);
     register_vary(".csv.write",        RAY_FN_RESTRICTED, ray_write_csv_fn);
     register_vary(".parquet.scan",     RAY_FN_RESTRICTED, ray_parquet_scan_fn);
@@ -4401,6 +4403,7 @@ static void ray_register_builtins(void) {
     register_vary(".parquet.each",     RAY_FN_RESTRICTED, ray_parquet_each_fn);
     register_vary(".parquet.splayed",  RAY_FN_RESTRICTED, ray_parquet_splayed_fn);
     register_vary(".parquet.parted",   RAY_FN_RESTRICTED, ray_parquet_parted_fn);
+    register_vary(".parquet.block",    RAY_FN_RESTRICTED, ray_parquet_block_fn);
     register_binary("as",       RAY_FN_NONE, ray_cast_fn);
     register_unary("type",      RAY_FN_NONE, ray_type_fn);
     register_unary("read",      RAY_FN_RESTRICTED, ray_read_file_fn);
@@ -4448,6 +4451,12 @@ static void ray_register_builtins(void) {
      * dedicated `.db.*` namespace so format-specific siblings stay
      * grouped (set/get per format) and there's room to grow
      * without polluting the top-level builtin namespace. */
+    register_vary(".db.block.set",     RAY_FN_RESTRICTED, ray_block_store_fn);
+    register_vary(".db.block.scan",    RAY_FN_RESTRICTED, ray_block_source_fn);
+    register_vary(".db.block.parted",  RAY_FN_RESTRICTED, ray_block_parted_fn);
+    register_vary(".db.block.convert", RAY_FN_RESTRICTED, ray_block_convert_fn);
+    register_vary(".db.storage.info",  RAY_FN_RESTRICTED, ray_storage_info_fn);
+    register_vary(".db.storage.verify", RAY_FN_RESTRICTED, ray_storage_verify_fn);
     register_vary(".db.splayed.set",   RAY_FN_RESTRICTED, ray_set_splayed_fn);
     register_vary(".db.splayed.get",   RAY_FN_NONE,       ray_get_splayed_fn);
     register_vary(".db.parted.get",    RAY_FN_NONE,       ray_get_parted_fn);

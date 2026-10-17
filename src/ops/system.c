@@ -41,6 +41,8 @@
 #include "core/qmeasure.h"  /* shared per-query measurement lifecycle */
 #include "core/qlog.h"      /* g_qlog — (.sys.querylog) */
 #include "store/serde.h"
+#include "store/block_store.h"
+#include "ops/block_source.h"
 #include "store/splay.h"
 #include "store/part.h"
 #include "core/ipc.h"
@@ -176,8 +178,85 @@ static const char* str_to_cpath(ray_t* s, char* buf, size_t bufsz) {
     return buf;
 }
 
+static const char* block_codec_name(ray_t* value, size_t* len) {
+    if (!value || value->type != -RAY_SYM) return NULL;
+    ray_t* text = ray_sym_str(value->i64);
+    if (!text) return NULL;
+    *len = ray_str_len(text);
+    return ray_str_ptr(text);
+}
+
+ray_err_t ray_block_store_parse_options(ray_t* value, ray_block_store_options_t* out) {
+    *out = (ray_block_store_options_t){RAY_BLOCK_STORE_DEFAULT_BYTES, RAY_BLOCK_STORE_DEFAULT_CODEC, true};
+    if (!value) return RAY_OK;
+    if (value->type != RAY_DICT) return RAY_ERR_TYPE;
+    ray_t* keys = ray_dict_keys(value);
+    ray_t* vals = ray_dict_vals(value);
+    /* The parser represents {} with empty LIST keys and values. */
+    if (keys && vals && keys->type == RAY_LIST && vals->type == RAY_LIST && !keys->len && !vals->len)
+        return RAY_OK;
+    if (!keys || !vals || keys->type != RAY_SYM || vals->type != RAY_LIST ||
+        keys->len != vals->len || keys->len > 3) return RAY_ERR_DOMAIN;
+    unsigned seen = 0;
+    for (int64_t i = 0; i < keys->len; i++) {
+        ray_t* key = ray_sym_vec_cell(keys, i);
+        const char* name = key && key->type == -RAY_STR ? ray_str_ptr(key) : NULL;
+        size_t len = name ? ray_str_len(key) : 0;
+        unsigned bit = name && len == 11 && !memcmp(name, "block-bytes", 11) ? 1 :
+            name && len == 5 && !memcmp(name, "codec", 5) ? 2 :
+            name && len == 7 && !memcmp(name, "durable", 7) ? 4 : 0;
+        if (!bit || (seen & bit)) return RAY_ERR_DOMAIN;
+        seen |= bit;
+        ray_t* option = ray_list_get(vals, i);
+        if (bit == 1) {
+            if (!option || option->type != -RAY_I64) return RAY_ERR_TYPE;
+            if (option->i64 <= 0 || (uint64_t)option->i64 > UINT32_MAX) return RAY_ERR_RANGE;
+            out->block_bytes = (uint32_t)option->i64;
+        } else if (bit == 2) {
+            size_t codec_len;
+            const char* codec = block_codec_name(option, &codec_len);
+            if (!codec) return RAY_ERR_TYPE;
+            if (codec_len == 4 && !memcmp(codec, "none", 4)) out->codec = 0;
+            else if (codec_len == 6 && !memcmp(codec, "snappy", 6)) out->codec = 1;
+            else return RAY_ERR_DOMAIN;
+        } else {
+            if (!option || option->type != -RAY_BOOL) return RAY_ERR_TYPE;
+            out->durable = option->b8 != 0;
+        }
+    }
+    return RAY_OK;
+}
+
+/* (.db.block.set path table {block-bytes: I64 codec: SYM durable: BOOL})
+ * All keys are optional: 64 KiB blocks, Snappy, durable. */
+ray_t* ray_block_store_fn(ray_t** args, int64_t n) {
+    if (n != 2 && n != 3) return ray_error("arity", ".db.block.set: path table [options]");
+    char path[1024];
+    if (!str_to_cpath(args[0], path, sizeof(path)))
+        return ray_error(args[0] && args[0]->type == -RAY_STR ? "domain" : "type",
+                         ".db.block.set: invalid path");
+    if (!args[1] || args[1]->type != RAY_TABLE)
+        return ray_error("type", ".db.block.set: value must be a table");
+    ray_block_store_options_t options;
+    ray_err_t err = ray_block_store_parse_options(n == 3 ? args[2] : NULL, &options);
+    if (err) return ray_error(ray_err_code_str(err), ".db.block.set: invalid options");
+    err = ray_block_store_save(args[1], path, &options);
+    if (err) return ray_error(ray_err_code_str(err), ".db.block.set: save failed");
+    ray_retain(args[1]);
+    return args[1];
+}
+
 /* (.db.splayed.set "dir" table) or (.db.splayed.set "dir" table "sym_path") */
 ray_t* ray_set_splayed_fn(ray_t** args, int64_t n) {
+    /* A trailing options dictionary, after the dir and table or after an
+     * explicit sym path, writes compressed blocks (see .db.block.set): their
+     * symbols live in the generation's own dictionary, not the sym path. */
+    if ((n == 3 || n == 4) && args[n - 1] && args[n - 1]->type == RAY_DICT) {
+        if (n == 4 && (!args[2] || args[2]->type != -RAY_STR))
+            return ray_error("type", ".db.splayed.set: dir table [sym_path] options");
+        ray_t* forward[3] = {args[0], args[1], args[n - 1]};
+        return ray_block_store_fn(forward, 3);
+    }
     if (n < 2 || n > 3)
         return ray_error("domain", ".db.splayed.set expects 2 or 3 arguments, got %lld", (long long)n);
 
@@ -204,7 +283,30 @@ ray_t* ray_set_splayed_fn(ray_t** args, int64_t n) {
 }
 
 /* (.db.splayed.get "dir") or (.db.splayed.get "dir" "sym_path") */
+/* {materialize: I64}: the byte limit of an in-memory load, else 0. */
+static ray_err_t splayed_get_options(ray_t* opts, size_t* limit) {
+    ray_t* keys = ray_dict_keys(opts);
+    ray_t* vals = ray_dict_vals(opts);
+    if (!keys || !vals || keys->type != RAY_SYM || vals->type != RAY_LIST || keys->len != 1)
+        return RAY_ERR_DOMAIN;
+    ray_t* key = ray_sym_vec_cell(keys, 0);
+    ray_t* value = ray_list_get(vals, 0);
+    if (!key || ray_str_len(key) != 11 || memcmp(ray_str_ptr(key), "materialize", 11)) return RAY_ERR_DOMAIN;
+    if (!value || value->type != -RAY_I64) return RAY_ERR_TYPE;
+    if (value->i64 <= 0) return RAY_ERR_RANGE;
+    *limit = (size_t)value->i64;
+    return RAY_OK;
+}
+
 ray_t* ray_get_splayed_fn(ray_t** args, int64_t n) {
+    /* A trailing {materialize: bytes} loads every row into memory through a
+     * block scan, which also reads compressed tables. */
+    size_t limit = 0;
+    if (n >= 2 && args[n - 1] && args[n - 1]->type == RAY_DICT) {
+        ray_err_t err = splayed_get_options(args[n - 1], &limit);
+        if (err) return ray_error(ray_err_code_str(err), ".db.splayed.get: options are {materialize: bytes}");
+        n--;
+    }
     if (n < 1 || n > 2)
         return ray_error("domain", ".db.splayed.get expects 1 or 2 arguments, got %lld", (long long)n);
 
@@ -223,6 +325,10 @@ ray_t* ray_get_splayed_fn(ray_t** args, int64_t n) {
      * dir/sym, no partition root/sym).  The load layer raises the loud
      * "sym" error if the table actually has SYM columns; symbol-free
      * tables load fine without one. */
+    if (limit) {
+        ray_block_scan_source_t source = {sym_path, true};
+        return ray_block_materialize(dir, &source, limit);
+    }
     return ray_read_splayed(dir, sym_path);
 }
 

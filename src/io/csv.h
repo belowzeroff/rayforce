@@ -83,6 +83,16 @@ ray_err_t ray_csv_save_parted_named_opts(const char* path, char delimiter, bool 
                                          const int64_t* col_names, int32_t n_names,
                                          const char* root, const char* table_name,
                                          int64_t rows_per_part);
+/* The same parse as .csv.splayed, streamed chunk by chunk into a compressed
+ * block generation of root (see ray_block_table_begin). Only parse buffers of
+ * one chunk and one block per column are held. *rows (optional) receives the
+ * data row count on success. Failure publishes nothing. */
+struct ray_block_store_options_s;
+ray_err_t ray_csv_save_block(const char* path, char delimiter, bool header,
+                             const int8_t* col_types_in, int32_t n_types,
+                             const int64_t* col_names_in, int32_t n_names,
+                             const char* root, int64_t rows_per_chunk,
+                             const struct ray_block_store_options_s* options, int64_t* rows);
 ray_err_t ray_csv_save_splayed_named_opts(const char* path, char delimiter, bool header,
                                           const int8_t* col_types, int32_t n_types,
                                           const int64_t* col_names, int32_t n_names,
