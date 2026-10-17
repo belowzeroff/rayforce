@@ -83,6 +83,19 @@ static ray_err_t scan_open_domain(ray_block_scan_t* s, const char* dir,
     return RAY_OK;
 }
 
+/* Raw SYM columns use the table's own symbol file: <root>/.sym, where raw
+ * writers put it whether or not the table has generations; a flat immutable
+ * root is its own directory. Block columns use the generation's dictionary. */
+static const char* scan_root_sym(const char* root, const char* dir, char* buf, size_t size) {
+    size_t len = strlen(root);
+    while (len > 1 && root[len - 1] == '/') len--;
+    int n = snprintf(buf, size, "%.*s/.sym", (int)len, root);
+    struct stat st;
+    if (n > 0 && (size_t)n < size && stat(buf, &st) == 0) return buf;
+    n = snprintf(buf, size, "%s/.sym", dir);
+    return n > 0 && (size_t)n < size ? buf : "";
+}
+
 static ray_err_t scan_open_raw_domain(ray_block_scan_t* s, const char* path) {
     struct stat st;
     if (stat(path, &st) != 0) return RAY_ERR_IO;
@@ -235,13 +248,13 @@ ray_err_t ray_block_scan_open_source(const char* root, const ray_block_scan_sour
         uint64_t column_rows;
         if (err == RAY_ERR_VERSION) {
             err = RAY_OK;
-            ray_sym_domain_t** dom = sym_path ? &s->raw_domain : &s->domain;
-            ray_t* raw = ray_col_mmap_splayed_dom(path, *dom);
-            if (RAY_IS_ERR(raw) && !strcmp(ray_err_code(raw), "sym") && !*dom) {
+            ray_t* raw = ray_col_mmap_splayed_dom(path, s->raw_domain);
+            if (RAY_IS_ERR(raw) && !strcmp(ray_err_code(raw), "sym") && !s->raw_domain) {
                 ray_error_free(raw);
-                err = sym_path ? scan_open_raw_domain(s, sym_path) :
-                    scan_open_domain(s, s->dir, &actual_sym_count, &actual_sym_crc);
-                if (!err) raw = ray_col_mmap_splayed_dom(path, *dom);
+                char sym[1100];
+                err = scan_open_raw_domain(s, sym_path ? sym_path :
+                                           scan_root_sym(root, s->dir, sym, sizeof(sym)));
+                if (!err) raw = ray_col_mmap_splayed_dom(path, s->raw_domain);
             }
             if (!err) {
                 err = scan_value_error(raw);
