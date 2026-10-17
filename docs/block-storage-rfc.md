@@ -56,16 +56,20 @@ All integers little-endian, written field by field; big-endian hosts get
 
 | Region | Bytes | Fields |
 |---|---|---|
-| Header | 128 | `[17]` major = 2, `[18]` type, `[24]` rows, `[32]` magic `RAYHDB2`, `[40]` header length, `[44]` block bytes (≤ 64 MiB), `[48]` blocks, `[56]` directory offset, `[64]` file size, `[72]` generation, `[80]` directory CRC, `[84]` header CRC, `[88]` SYM dictionary count, `[96]` dictionary CRC, `[100]` required-feature bits, `[104..127]` reserved zero |
-| Directory entry | 64 per block | `[0]` first row, `[8]` row count, `[16]` file offset, `[24]` stored bytes, `[28]` decoded bytes, `[32]` codec (0 none, 1 Snappy), `[33]` encoding (1 = STR framing), `[34]` zone flags (present / has null / has value), `[40]` stored CRC, `[44]` decoded CRC, `[48]` min, `[56]` max |
+| Header | 128 | `[17]` major = 2, `[18]` type, `[24]` rows, `[32]` magic `RAYHDB2`, `[40]` header length, `[44]` block bytes (≤ 64 MiB), `[48]` blocks, `[56]` directory offset, `[64]` file size, `[72]` generation, `[80]` directory CRC, `[84]` header CRC, `[88]` SYM dictionary count, `[96]` dictionary CRC, `[100]` required-feature bits, `[104]` optional-feature bits, `[108..127]` reserved |
+| Directory entry | 64 per block | `[0]` first row, `[8]` row count, `[16]` file offset, `[24]` stored bytes, `[28]` decoded bytes, `[32]` codec (0 none, 1 Snappy), `[33]` encoding (1 = STR framing), `[34]` zone flags (present / has null / has value), `[35..39]` reserved, `[40]` stored CRC, `[44]` decoded CRC, `[48]` min, `[56]` max |
 | Footer | 32 | magic `RAYEND2`, blocks, directory offset, file size |
 
 Invariants checked on open, before any allocation: bytes 0..16 zero (old
 readers see major 2 and refuse it), row ranges contiguous and summing to the
 column length, regions inside the file and not overlapping metadata, codec
 none ⇒ stored = decoded and equal CRCs, Snappy ⇒ stored < decoded (a block that
-does not shrink is stored raw). An unknown codec or required-feature bit is
-`nyi` (newer file), not `corrupt`. Zone maps exist for integer, boolean and
+does not shrink is stored raw). An unknown codec, encoding, zone flag or
+required-feature bit is `nyi` (newer file), not `corrupt`. Optional-feature
+bits mark metadata an older reader may ignore, stored in the reserved header
+and entry bytes; with no optional bit set those bytes must be zero. Every one
+of these fields is under the header or directory CRC, so damage is still
+`corrupt`. Zone maps exist for integer, boolean and
 temporal types only.
 
 STR blocks hold `[u32 length, bytes]` records; a string never spans blocks.

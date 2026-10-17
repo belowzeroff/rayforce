@@ -10,8 +10,11 @@
 #define RAY_COL_BLOCK_ENTRY 64u
 #define RAY_COL_BLOCK_FOOTER 32u
 /* Required-feature bits (header bytes 100..103) this reader implements. A
- * file setting any other bit, or a block using an unknown codec, opens as
- * RAY_ERR_NYI: it needs a newer reader. Reserved bytes 104..127 stay zero. */
+ * file setting any other bit, or a block using an unknown codec, encoding or
+ * zone flag, opens as RAY_ERR_NYI: it needs a newer reader. Optional-feature
+ * bits (bytes 104..107) mark metadata older readers ignore, kept in the
+ * reserved header bytes 108..127 and entry bytes 35..39, which are zero when
+ * no optional bit is set. This writer sets none. */
 #define RAY_COL_BLOCK_FEATURES 0u
 
 /* Experimental major-2 block container. No semantic attrs or external indexes.

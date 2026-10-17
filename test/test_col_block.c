@@ -161,12 +161,23 @@ static test_result_t corruption(void) {
     /* Repair metadata CRCs to exercise structural checks, not only checksums. */
     const size_t offsets[] = {0, 19, 40, 47, 88,
         dir, dir + 8, dir + 16, dir + 24, dir + 28,
-        dir + 33, dir + 34, dir + 48, dir + 64};
+        dir + 48, dir + 64};
     for (size_t i = 0; i < sizeof(offsets) / sizeof(*offsets); i++) {
         memcpy(copy, bytes, file_size); copy[offsets[i]] ^= 0x80;
         rechecksum(copy);
         TEST_ASSERT_EQ_I(ray_col_block_open(&r, copy, file_size), RAY_ERR_CORRUPT);
     }
+    /* Re-signed unknown encoding or zone flags: a newer file; a known
+     * encoding that does not fit the type is damage. */
+    const size_t newer[] = {dir + 33, dir + 34};
+    for (size_t i = 0; i < 2; i++) {
+        memcpy(copy, bytes, file_size); copy[newer[i]] ^= 0x80;
+        rechecksum(copy);
+        TEST_ASSERT_EQ_I(ray_col_block_open(&r, copy, file_size), RAY_ERR_NYI);
+    }
+    memcpy(copy, bytes, file_size); copy[dir + 33] ^= 1;
+    rechecksum(copy);
+    TEST_ASSERT_EQ_I(ray_col_block_open(&r, copy, file_size), RAY_ERR_CORRUPT);
     /* A re-signed unknown codec byte reads as a newer file, not damage. */
     memcpy(copy, bytes, file_size); copy[dir + 32] ^= 0x80;
     rechecksum(copy);
@@ -314,7 +325,7 @@ static test_result_t zone_maps(void) {
     TEST_ASSERT_TRUE(match); /* Legacy directory entries are conservative. */
 
     memcpy(copy, bytes, file_size); copy[dir + 34] = 0x80; rechecksum(copy);
-    TEST_ASSERT_EQ_I(ray_col_block_open(&r, copy, file_size), RAY_ERR_CORRUPT);
+    TEST_ASSERT_EQ_I(ray_col_block_open(&r, copy, file_size), RAY_ERR_NYI);
     memcpy(copy, bytes, file_size); copy[dir + 34] = 1; rechecksum(copy);
     TEST_ASSERT_EQ_I(ray_col_block_open(&r, copy, file_size), RAY_ERR_CORRUPT);
     memcpy(copy, bytes, file_size); copy[dir + 34] = 5;
@@ -753,6 +764,22 @@ static test_result_t newer_features(void) {
     /* Other reserved bytes stay zero. */
     bytes[100] = 0; bytes[110] = 1; rechecksum(bytes);
     TEST_ASSERT_EQ_I(ray_col_block_open(&r, bytes, file_size), RAY_ERR_CORRUPT);
+    /* With an optional feature bit they carry metadata this reader ignores. */
+    put(bytes + 104, 1, 4);
+    entry[36] = 7;
+    rechecksum(bytes);
+    TEST_ASSERT_EQ_I(ray_col_block_open(&r, bytes, file_size), RAY_OK);
+    put(bytes + 104, 0, 4); rechecksum(bytes);
+    TEST_ASSERT_EQ_I(ray_col_block_open(&r, bytes, file_size), RAY_ERR_CORRUPT);
+    bytes[110] = 0; entry[36] = 0; rechecksum(bytes);
+    TEST_ASSERT_EQ_I(ray_col_block_open(&r, bytes, file_size), RAY_OK);
+    /* An unknown encoding or zone flag is a newer file too. */
+    entry[33] = 2; rechecksum(bytes);
+    TEST_ASSERT_EQ_I(ray_col_block_open(&r, bytes, file_size), RAY_ERR_NYI);
+    entry[33] = 0; entry[34] |= 8; rechecksum(bytes);
+    TEST_ASSERT_EQ_I(ray_col_block_open(&r, bytes, file_size), RAY_ERR_NYI);
+    entry[34] &= 7; rechecksum(bytes);
+    TEST_ASSERT_EQ_I(ray_col_block_open(&r, bytes, file_size), RAY_OK);
     PASS();
 }
 
