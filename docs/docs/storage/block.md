@@ -80,7 +80,7 @@ Block tables are read with `select` over a scan descriptor:
 |---|---|---|
 | `batch-rows` | automatic | Rows decoded per read. By default half the payload limit over the projection's row width, no more rows than `scratch-bytes` holds of decoded strings, at most 1Mi. |
 | `payload-bytes` | 64 MiB | Decoded bytes per read. |
-| `scratch-bytes` | 8 MiB | Temporary decode memory per read. String columns decode a read's blocks once into it when they fit, otherwise twice through one block; results are the same. |
+| `scratch-bytes` | 8 MiB | Temporary decode memory per read. String columns decode a read's blocks once into it when they fit, otherwise twice through one block; results are the same. Not counted: one decoded block per open column kept for reuse between reads, and per-read block offsets. |
 | `work-bytes` | none | Optional cap on retained result plus the current read, masks and aggregate state. |
 | `immutable` | `false` | Admit flat raw directories, as for conversion. |
 

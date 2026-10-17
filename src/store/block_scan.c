@@ -619,17 +619,19 @@ static ray_t* scan_compact(ray_t* src, const uint8_t* mask, int64_t kept) {
             v = ray_str_vec_append(v, str, len);
         }
     } else {
+        /* Fixed widths compact in place, within the column's own payload:
+         * every materialized column is a fresh copy this scan owns. */
         size_t width = ray_sym_elem_size(src->type, src->attrs);
-        v = src->type == RAY_SYM ? ray_sym_vec_new(src->attrs & RAY_SYM_W_MASK, kept) :
-            ray_vec_new(src->type, kept);
-        if (v && !RAY_IS_ERR(v)) {
-            const uint8_t* from = ray_data(src);
-            uint8_t* to = ray_data(v);
-            for (int64_t i = 0; i < rows; i++)
-                if (mask[i]) { memcpy(to, from + (size_t)i * width, width); to += width; }
-            v->len = kept;
-            if (src->type == RAY_SYM) ray_sym_vec_adopt_domain(v, src);
-        }
+        uint8_t* data = ray_data(src);
+        int64_t to = 0;
+        for (int64_t i = 0; i < rows; i++)
+            if (mask[i]) {
+                if (to != i) memmove(data + (size_t)to * width, data + (size_t)i * width, width);
+                to++;
+            }
+        src->len = kept;
+        ray_retain(src);
+        return src;
     }
     if (!v) return ray_error("oom", NULL);
     if (!RAY_IS_ERR(v)) v->attrs |= src->attrs & RAY_ATTR_HAS_NULLS;
@@ -672,8 +674,9 @@ static ray_t* scan_materialize(ray_block_scan_t* s, const size_t* indices,
     if (!err && scan_work_exceeds(s, total, scratch_bytes)) err = RAY_ERR_LIMIT;
     /* A pool never exceeds its decoded bytes: admit arenas only if the batch
      * fits with that bound, so tight limits keep the exact two-pass path. */
-    if (!err && strings && arena_total <= s->options.scratch_limit &&
-        arena_total <= SIZE_MAX - scratch_fixed && arena_total <= SIZE_MAX - total &&
+    /* Arenas and the fixed scratch are live together: both within scratch. */
+    if (!err && strings && arena_total <= SIZE_MAX - scratch_fixed &&
+        scratch_fixed + arena_total <= s->options.scratch_limit && arena_total <= SIZE_MAX - total &&
         total + arena_total <= s->options.payload_limit &&
         !scan_work_exceeds(s, total + arena_total, scratch_fixed + arena_total)) {
         arenas = true;
@@ -711,7 +714,16 @@ static ray_t* scan_materialize(ray_block_scan_t* s, const size_t* indices,
         column->payload_bytes = bytes;
         total += bytes;
     }
-    if (!err && scan_work_exceeds(s, total, scratch_bytes + (arenas ? arena_total : 0)))
+    /* A masked string column without an arena is compacted into a copy. */
+    size_t compact = 0;
+    for (size_t i = 0; !err && mask && i < count; i++) {
+        const scan_column_t* column = &s->columns[indices ? indices[i] : i];
+        bool str = column->raw ? column->raw->type == RAY_STR :
+            ray_col_block_file_reader(column->file)->type == RAY_STR;
+        if (str && !column->arena && compact < column->payload_bytes) compact = column->payload_bytes;
+    }
+    if (!err && (compact > SIZE_MAX - total ||
+                 scan_work_exceeds(s, total + compact, scratch_bytes + (arenas ? arena_total : 0))))
         err = RAY_ERR_LIMIT;
     if (err) {
         free(scratch);
