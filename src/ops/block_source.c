@@ -942,6 +942,8 @@ done:
 }
 
 ray_t* ray_block_materialize(const char* dir, const ray_block_scan_source_t* source, size_t limit) {
+    /* Decodes compressed tables, which restricted sessions cannot scan. */
+    if (ray_eval_get_restricted()) return ray_error("access", "restricted");
     ray_block_scan_options_t read = {0, UINT64_MAX, RAY_BLOCK_SCAN_AUTO_ROWS,
                                      BLOCK_SOURCE_PAYLOAD_BYTES, 8u * 1024 * 1024, 0};
     ray_block_scan_t* scan = NULL;

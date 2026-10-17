@@ -27,7 +27,7 @@ Compared with raw splayed and partitioned tables:
 |---|---|---|
 | `block-bytes` | `I64` | Default 65536. Uncompressed bytes per block, at most 64 MiB. Fixed-width columns hold `block-bytes / width` rows per block; a string must fit in one block. |
 | `codec` | `SYM` | Default `snappy`; or `none`. Snappy stores a block raw when compression does not shrink it. |
-| `durable` | `BOOL` | Optional, default `true`: fsync files and directories before publishing. |
+| `durable` | `BOOL` | Optional, default `true`: fsync files and directories before publishing. With `false` a process crash still publishes all or nothing, but after a power loss or OS crash the table, including its previous generation, may be unreadable until it is written again: the previous generation is removed right after publication, before the new one is known to be on disk. |
 
 Supported column types are `B8`, `U8`, `I16`, `I32`, `I64`, `F32`, `F64`, `DATE`, `TIME`, `TIMESTAMP`, `GUID`, `SYM` and `STR`. Symbols are stored in a dictionary private to the generation. Column attributes are not stored: a column carrying `sorted` (or link and index attributes) is rejected with `nyi` rather than silently losing them.
 
@@ -63,7 +63,7 @@ A whole partitioned database converts with `(.db.block.convert "src-root" 'table
 
 ## Loading into memory
 
-`(.db.splayed.get "dir" [sym_path] {materialize: bytes})` reads every row of a block or raw table through a block scan into an ordinary in-memory table and fails with `limit` once its logical size would exceed `bytes`. Nothing is decompressed implicitly: without the option, compressed columns are refused. `(.db.splayed.set "dir" table [sym_path] options)` with an options dictionary writes a block table, as `.db.block.set`; its symbols go to the generation's own dictionary, not `sym_path`.
+`(.db.splayed.get "dir" [sym_path] {materialize: bytes})` reads every row of a block or raw table through a block scan into an ordinary in-memory table and fails with `limit` once its logical size would exceed `bytes`. Nothing is decompressed implicitly: without the option, compressed columns are refused. Restricted sessions get `access`, as for the scan builtins. `(.db.splayed.set "dir" table [sym_path] options)` with an options dictionary writes a block table, as `.db.block.set`; its symbols go to the generation's own dictionary, not `sym_path`.
 
 ## Reading
 

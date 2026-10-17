@@ -1588,6 +1588,12 @@ static test_result_t splayed_integration(void) {
     snprintf(command, sizeof(command), "(.db.splayed.get \"%s\" {materialize: 100})", root);
     r = ray_eval_str(command);
     TEST_ASSERT_TRUE(RAY_IS_ERR(r)); TEST_ASSERT_STR_EQ(ray_err_code(r), "limit"); ray_release(r);
+    /* Restricted sessions cannot scan compressed tables, nor load them. */
+    snprintf(command, sizeof(command), "(.db.splayed.get \"%s\" {materialize: 100000000})", root);
+    ray_eval_set_restricted(true);
+    r = ray_eval_str(command);
+    ray_eval_set_restricted(false);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r)); TEST_ASSERT_STR_EQ(ray_err_code(r), "access"); ray_release(r);
     const char* invalid[] = {"(.db.splayed.get \"%s\" {materialize: 0})", "(.db.splayed.get \"%s\" {other: 1})",
                              "(.db.splayed.get \"%s\" {materialize: 1.5})"};
     for (unsigned i = 0; i < 3; i++) {

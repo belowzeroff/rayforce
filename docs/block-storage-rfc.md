@@ -128,7 +128,7 @@ is not reliable there) are untested and not claimed.
 
 | Builtin | Behaviour |
 |---|---|
-| `.db.block.set dir t [opts]` | Write a generation. Options all optional: `block-bytes` (64 KiB), `codec` (`snappy`/`none`), `durable` (true) |
+| `.db.block.set dir t [opts]` | Write a generation. Options all optional: `block-bytes` (64 KiB), `codec` (`snappy`/`none`), `durable` (true; `false` survives process crashes but not power loss, which can take the previous generation too, as for raw bulk writes) |
 | `.csv.block`, `.parquet.block` | Streaming imports, one input batch plus one block per column in memory |
 | `.db.block.convert src dest [opts [read]]` | Raw or block → block, single table or `root 'table` over all partitions; overlapping paths refused |
 | `.db.block.scan dir bytes [opts]`, `.db.block.parted root 't bytes [opts]` | Scan descriptors for `select`; result, payload, scratch and work budgets |
