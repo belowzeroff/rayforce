@@ -191,9 +191,15 @@ static test_result_t select_rejections(void) {
         "(select {from: source id: id where: (> 1 x)})",
         "(select {from: source id: id where: (> x missing)})"
     };
+    /* Each is a supported source with an unsupported query: nyi. */
     for (unsigned i = 0; i < sizeof(commands) / sizeof(*commands); i++) {
         ray_t* r = ray_eval_str(commands[i]);
-        TEST_ASSERT_TRUE(RAY_IS_ERR(r)); ray_release(r);
+        TEST_ASSERT_TRUE(RAY_IS_ERR(r));
+        if (strcmp(ray_err_code(r), "nyi")) {
+            fprintf(stderr, "    %s: %s\n", commands[i], ray_err_code(r));
+            TEST_ASSERT_STR_EQ(ray_err_code(r), "nyi");
+        }
+        ray_release(r);
     }
     ray_t* saved = ray_env_get(ray_sym_intern(">", 1)); ray_retain(saved);
     ray_t* replacement = ray_env_get(ray_sym_intern("<", 1));
