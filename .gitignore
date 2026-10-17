@@ -61,3 +61,5 @@ leak-*
 timeout-*
 oom-*
 .superpowers/
+# Table schemas of golden storage fixtures are data, not build deps.
+!test/data/**/.d
