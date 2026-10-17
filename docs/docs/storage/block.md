@@ -47,7 +47,7 @@ Writes stream: CSV and Parquet imports and conversions hold one input batch plus
 
 `.db.block.convert` reads its source through a block scan of every column and writes a new generation of `dest`. `dest` may not be the source, inside it, or contain it: the source is never modified.
 
-A whole partitioned database converts with `(.db.block.convert "src-root" 'table "dest-root" options [read-options])`: every partition `src-root/<p>/table` becomes `dest-root/<p>/table`, in partition order, and the result lists each partition's row count with the effective codec and block size. Raw `SYM` columns default to `src-root/.sym`. A failure names its partition; partitions converted before it stay published, and running the command again republishes every partition.
+A whole partitioned database converts with `(.db.block.convert "src-root" 'table "dest-root" options [read-options])`: every partition `src-root/<p>/table` becomes `dest-root/<p>/table`, in partition order, and the result lists each partition's row count with the effective codec and block size. Raw `SYM` columns default to `src-root/.sym`. A failure names its partition; partitions converted before it stay published, the failed one leaves nothing behind, and running the command again republishes every partition. A conversion killed mid-partition leaves that partition's lock files and unpublished generation, which make reads of the destination fail until it is run again.
 
 `read-options` describe the source:
 
