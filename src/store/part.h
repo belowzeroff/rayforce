@@ -36,6 +36,16 @@ ray_t*    ray_read_parted(const char* db_root, const char* table_name);
 void      ray_parted_cache_clear(void);
 void      ray_parted_cache_prune(void);
 
+/* Partition directory names of db_root in key order, exactly as
+ * ray_read_parted lists them, with their key type (RAY_MC_DATE / I64 / SYM).
+ * NULL on success (*count may be 0), else an owned error.  Free the names
+ * with ray_parted_dirs_free. */
+ray_t*    ray_parted_dirs(const char* db_root, char*** dirs, int64_t* count,
+                          uint8_t* mc_type);
+void      ray_parted_dirs_free(char** dirs, int64_t count);
+/* Key of one listed partition: DATE days, I64 value or interned SYM id. */
+int64_t   ray_parted_dir_key(const char* name, uint8_t mc_type);
+
 /* Enumerate the table names under a parted db root — the splayed-table
  * subdirectories (those with a `.d` schema) of the first partition.
  * Returns a sorted RAY_SYM vector of names suitable for ray_read_parted,
