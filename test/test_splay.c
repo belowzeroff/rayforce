@@ -56,12 +56,16 @@
 
 /* ---- Setup / Teardown -------------------------------------------------- */
 
+static ray_splay_lease_t *lease_a, *lease_b;
+
 static void splay_setup(void) {
     ray_heap_init();
     (void)ray_sym_init();
 }
 
 static void splay_teardown(void) {
+    ray_splay_lease_release(&lease_a);
+    ray_splay_lease_release(&lease_b);
     ray_sym_destroy();
     ray_heap_destroy();
 }
@@ -2539,6 +2543,34 @@ static int generation_dir_count(const char* dir) {
 }
 
 #ifndef _WIN32
+/* A failed first write clears what it created in the table directory, but
+ * only unlinks a link found there, never what the link points to. */
+static test_result_t test_failed_first_write_unlinks_symlink(void) {
+    const char* dir = TMP_SPLAY_BASE "/first_write_symlink";
+    const char* victim = TMP_SPLAY_BASE "/first_write_symlink_victim";
+    const char* victim_file = TMP_SPLAY_BASE "/first_write_symlink_victim/keep";
+    rm_rf(dir);
+    rm_rf(victim);
+    TEST_ASSERT_EQ_I(ray_test_mkdir_p(victim), 0);
+    FILE* f = fopen(victim_file, "wb");
+    TEST_ASSERT_NOT_NULL(f);
+    fputs("keep", f);
+    fclose(f);
+    ray_splay_write_t write;
+    TEST_ASSERT_EQ_I(ray_splay_write_begin(dir, &write), RAY_OK);
+    char link_path[1024];
+    int n = snprintf(link_path, sizeof(link_path), "%s/outside", dir);
+    TEST_ASSERT_TRUE(n > 0 && (size_t)n < sizeof(link_path));
+    TEST_ASSERT_EQ_I(symlink(victim, link_path), 0);
+    TEST_ASSERT_EQ_I(ray_splay_write_finish(&write, RAY_ERR_IO, false), RAY_ERR_IO);
+    TEST_ASSERT_EQ_I(access(victim_file, F_OK), 0);
+    struct stat st;
+    TEST_ASSERT_TRUE(lstat(link_path, &st) != 0);
+    rm_rf(dir);
+    rm_rf(victim);
+    PASS();
+}
+
 static test_result_t test_generation_prune_unlinks_symlink(void) {
     const char* dir = TMP_SPLAY_BASE "/generation_symlink";
     const char* victim = TMP_SPLAY_BASE "/generation_symlink_victim";
@@ -2747,7 +2779,7 @@ static test_result_t test_generation_first_write_removed(void) {
 
     char listing[512];
     dir_listing(dir, listing, sizeof(listing));
-    TEST_ASSERT_STR_EQ(listing, ".current .generations .sym .sym.lk .write.lock");
+    TEST_ASSERT_STR_EQ(listing, ".current .generations .publish.lock .sym .sym.lk .write.lock");
     TEST_ASSERT_EQ_I(generation_dir_count(dir), 1);
     ray_t* loaded = ray_read_splayed(dir, sym);
     TEST_ASSERT_FALSE(RAY_IS_ERR(loaded));
@@ -2781,7 +2813,7 @@ static test_result_t test_generation_first_write_keeps_others(void) {
     TEST_ASSERT_EQ_I(ray_splay_save(two, dir, NULL), RAY_OK);
     char listing[512];
     dir_listing(dir, listing, sizeof(listing));
-    TEST_ASSERT_STR_EQ(listing, ".current .generations .write.lock 2026.10.05 notes");
+    TEST_ASSERT_STR_EQ(listing, ".current .generations .publish.lock .write.lock 2026.10.05 notes");
     TEST_ASSERT_EQ_I(access(TMP_SPLAY_BASE "/generation_shared_root/2026.10.05/t/keep", F_OK), 0);
     TEST_ASSERT_TRUE(generation_matches(dir, true, 2));
     ray_release(two);
@@ -3232,9 +3264,98 @@ static test_result_t test_save_hash_in_place(void) {
     PASS();
 }
 
+static test_result_t test_generation_leases(void) {
+    const char* dir = TMP_SPLAY_BASE "/generation_leases";
+    rm_rf(dir);
+    ray_t* old = generation_pair(1);
+    ray_t* next = generation_pair(9);
+    TEST_ASSERT_EQ_I(ray_splay_save(old, dir, NULL), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_splay_lease_acquire(dir, &lease_a), RAY_ERR_NYI);
+    TEST_ASSERT_TRUE(lease_a == NULL);
+    TEST_ASSERT_EQ_I(ray_splay_save(old, dir, NULL), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_splay_lease_acquire(dir, &lease_a), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_splay_lease_acquire(dir, &lease_b), RAY_OK);
+    char pinned[1024], path[1100];
+    snprintf(pinned, sizeof(pinned), "%s", ray_splay_lease_dir(lease_a));
+    TEST_ASSERT_STR_EQ(pinned, ray_splay_lease_dir(lease_b));
+    TEST_ASSERT_EQ_I(ray_splay_lease_acquire(dir, &lease_a), RAY_ERR_DOMAIN);
+    for (unsigned i = 0; i < 4; i++) {
+        TEST_ASSERT_EQ_I(ray_splay_save(next, dir, NULL), RAY_OK);
+        TEST_ASSERT_TRUE(generation_matches(dir, true, 9));
+        snprintf(path, sizeof(path), "%s/y", pinned);
+        ray_t* late = ray_col_load(path);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(late));
+        TEST_ASSERT_EQ_I(((int64_t*)ray_data(late))[0], 10);
+        ray_release(late);
+    }
+    TEST_ASSERT_EQ_I(generation_dir_count(dir), 2);
+    ray_splay_lease_release(&lease_a);
+    TEST_ASSERT_TRUE(lease_a == NULL);
+    TEST_ASSERT_EQ_I(ray_splay_save(next, dir, NULL), RAY_OK);
+    TEST_ASSERT_EQ_I(access(pinned, F_OK), 0); /* The second reader still pins it. */
+    ray_splay_lease_release(&lease_b);
+    ray_splay_lease_release(&lease_b); ray_splay_lease_release(NULL);
+    TEST_ASSERT_TRUE(ray_splay_lease_dir(NULL) == NULL);
+    TEST_ASSERT_EQ_I(ray_splay_save(next, dir, NULL), RAY_OK);
+    TEST_ASSERT_EQ_I(access(pinned, F_OK), -1);
+    TEST_ASSERT_EQ_I(generation_dir_count(dir), 1);
+    ray_release(old); ray_release(next); rm_rf(dir);
+    PASS();
+}
+
+static test_result_t test_generation_lease_errors(void) {
+    const char* dir = TMP_SPLAY_BASE "/generation_lease_errors";
+    rm_rf(dir);
+    TEST_ASSERT_EQ_I(ray_splay_lease_acquire(NULL, &lease_a), RAY_ERR_DOMAIN);
+    TEST_ASSERT_EQ_I(ray_splay_lease_acquire(dir, NULL), RAY_ERR_DOMAIN);
+    TEST_ASSERT_EQ_I(ray_splay_lease_acquire(dir, &lease_a), RAY_ERR_NYI);
+    ray_t* t = generation_pair(1);
+    TEST_ASSERT_EQ_I(ray_splay_save(t, dir, NULL), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_splay_save(t, dir, NULL), RAY_OK);
+    char resolved[1024], path[1100];
+    TEST_ASSERT_EQ_I(ray_splay_resolve_dir(dir, resolved, sizeof(resolved)), RAY_OK);
+    snprintf(path, sizeof(path), "%s/.lease", resolved);
+    TEST_ASSERT_EQ_I(chmod(path, 0444), 0);
+    TEST_ASSERT_EQ_I(ray_splay_lease_acquire(dir, &lease_a), RAY_OK);
+    ray_fd_t probe = ray_file_open(path, RAY_OPEN_READ);
+    TEST_ASSERT_TRUE(probe != RAY_FD_INVALID);
+    ray_err_t err = ray_file_trylock_ex(probe);
+    ray_file_close(probe);
+    TEST_ASSERT_EQ_I(err, RAY_ERR_IO);
+    ray_splay_lease_release(&lease_a);
+    probe = ray_file_open(path, RAY_OPEN_READ);
+    TEST_ASSERT_TRUE(probe != RAY_FD_INVALID);
+    err = ray_file_trylock_ex(probe);
+    if (err == RAY_OK) (void)ray_file_unlock(probe);
+    ray_file_close(probe);
+    TEST_ASSERT_EQ_I(err, RAY_OK);
+    TEST_ASSERT_EQ_I(ray_file_trylock_ex(RAY_FD_INVALID), RAY_ERR_IO);
+    TEST_ASSERT_EQ_I(unlink(path), 0);
+    TEST_ASSERT_EQ_I(ray_splay_lease_acquire(dir, &lease_a), RAY_ERR_NYI);
+    TEST_ASSERT_TRUE(lease_a == NULL);
+    snprintf(path, sizeof(path), "%s/.current", dir);
+    FILE* f = fopen(path, "wb"); TEST_ASSERT_NOT_NULL(f);
+    TEST_ASSERT_TRUE(fputs(".generations/../escape\n", f) >= 0);
+    TEST_ASSERT_EQ_I(fclose(f), 0);
+    TEST_ASSERT_EQ_I(ray_splay_lease_acquire(dir, &lease_a), RAY_ERR_CORRUPT);
+    TEST_ASSERT_TRUE(lease_a == NULL);
+    /* Restore a valid manifest; acquisition failure must release root lock. */
+    f = fopen(path, "wb"); TEST_ASSERT_NOT_NULL(f);
+    TEST_ASSERT_TRUE(fprintf(f, "%s\n", resolved + strlen(dir) + 1) > 0);
+    TEST_ASSERT_EQ_I(fclose(f), 0);
+    TEST_ASSERT_EQ_I(ray_splay_save(t, dir, NULL), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_splay_lease_acquire(dir, &lease_a), RAY_OK);
+    ray_splay_lease_release(&lease_a);
+    ray_release(t); rm_rf(dir);
+    PASS();
+}
+
 const test_entry_t splay_entries[] = {
+    { "splay/generation_leases", test_generation_leases, splay_setup, splay_teardown },
+    { "splay/generation_lease_errors", test_generation_lease_errors, splay_setup, splay_teardown },
 #ifndef _WIN32
     { "splay/generation_prune_unlinks_symlink", test_generation_prune_unlinks_symlink, splay_setup, splay_teardown },
+    { "splay/failed_first_write_unlinks_symlink", test_failed_first_write_unlinks_symlink, splay_setup, splay_teardown },
 #endif
     { "splay/generation_io_failures", test_generation_io_failures, splay_setup, splay_teardown },
     { "splay/generation_keeps_only_current", test_generation_keeps_only_current, splay_setup, splay_teardown },

@@ -204,6 +204,114 @@ ray_err_t ray_splay_resolve_dir(const char* dir, char* out, size_t out_sz) {
     return n < 0 || (size_t)n >= out_sz ? RAY_ERR_RANGE : RAY_OK;
 }
 
+struct ray_splay_lease_s {
+    ray_fd_t lock;
+    char dir[1024];
+};
+
+/* Locks of a generation-published table, always taken in this order:
+ *
+ *   .write.lock    writers only, exclusive for a whole write: one writer
+ *   .publish.lock  writer exclusive around the .current rename and the GC
+ *                  pass; reader shared around reading .current and locking
+ *                  the generation's .lease
+ *   .lease         reader shared while it reads the generation; GC only
+ *                  tries it exclusively and skips a generation it cannot get
+ *
+ * Readers never touch .write.lock and GC never waits, so there is no cycle:
+ * a scan does not wait for a long write, only for a publication. Under the
+ * shared .publish.lock no generation can be published or removed, so the
+ * generation a reader resolves still exists when its lease is taken.  Locks
+ * are flock()s on a descriptor opened per acquisition; the kernel drops them
+ * when a process dies.  Both sides open .publish.lock read-only, creating it
+ * if missing: flock needs no write access, so whoever created it (reader or
+ * writer, any uid) never locks the other out.  A reader that can neither open
+ * nor create it (a read-only table directory before any new writer has
+ * published) takes .write.lock shared instead, the older protocol: it then
+ * waits for a write in progress, but stays correct, as a writer publishes
+ * holding both.
+ *
+ * The eager loaders (splay_load_impl) take neither lock nor lease: they
+ * resolve .current, map the files and resolve again if one went missing.
+ * Unlinked files stay readable while open or mapped on POSIX.  On Windows an
+ * open file cannot be deleted, so GC leaves such a generation for the next
+ * publication (removal is best-effort). */
+static ray_err_t splay_lock_file(const char* root, const char* name, bool exclusive,
+                                 bool create, ray_fd_t* out) {
+    char path[1100];
+    int n = snprintf(path, sizeof(path), "%s/%s", root, name);
+    if (n < 0 || (size_t)n >= sizeof(path)) return RAY_ERR_RANGE;
+    ray_fd_t fd = ray_file_open(path, RAY_OPEN_READ | (create ? RAY_OPEN_CREATE : 0));
+    if (fd == RAY_FD_INVALID) return errno == ENOENT ? RAY_ERR_NYI : RAY_ERR_IO;
+    ray_err_t err;
+    do err = exclusive ? ray_file_lock_ex(fd) : ray_file_lock_sh(fd);
+    while (err && errno == EINTR);
+    if (err) { ray_file_close(fd); return err; }
+    *out = fd;
+    return RAY_OK;
+}
+
+static ray_err_t splay_publish_lock(const char* root, bool exclusive, ray_fd_t* out) {
+    return splay_lock_file(root, ".publish.lock", exclusive, true, out);
+}
+
+static void splay_publish_unlock(ray_fd_t fd) {
+    (void)ray_file_unlock(fd);
+    ray_file_close(fd);
+}
+
+ray_err_t ray_splay_lease_acquire(const char* root, ray_splay_lease_t** out) {
+    if (!root || !*root || !out || *out) return RAY_ERR_DOMAIN;
+    char path[1100];
+    int n = snprintf(path, sizeof(path), "%s/.write.lock", root);
+    if (n < 0 || (size_t)n >= sizeof(path)) return RAY_ERR_RANGE;
+    /* No writer lock file: a legacy table that never had generations. */
+    struct stat st;
+    if (stat(path, &st) != 0) return errno == ENOENT ? RAY_ERR_NYI : RAY_ERR_IO;
+    ray_fd_t publish = RAY_FD_INVALID;
+    ray_err_t err = splay_publish_lock(root, false, &publish);
+    if (err == RAY_ERR_NYI || err == RAY_ERR_IO)
+        err = splay_lock_file(root, ".write.lock", false, false, &publish);
+    if (err) return err;
+    ray_splay_lease_t* lease = calloc(1, sizeof(*lease));
+    if (!lease) err = RAY_ERR_OOM;
+    else {
+        lease->lock = RAY_FD_INVALID;
+        bool active = false;
+        err = splay_current_dir(root, lease->dir, sizeof(lease->dir), &active);
+        if (!err && !active) err = RAY_ERR_NYI;
+        if (!err) {
+            n = snprintf(path, sizeof(path), "%s/.lease", lease->dir);
+            if (n < 0 || (size_t)n >= sizeof(path)) err = RAY_ERR_RANGE;
+            else {
+                lease->lock = ray_file_open(path, RAY_OPEN_READ);
+                if (lease->lock == RAY_FD_INVALID)
+                    err = errno == ENOENT ? RAY_ERR_NYI : RAY_ERR_IO;
+                else err = ray_file_lock_sh(lease->lock);
+            }
+        }
+    }
+    splay_publish_unlock(publish);
+    if (err) {
+        if (lease) { ray_file_close(lease->lock); free(lease); }
+        return err;
+    }
+    *out = lease;
+    return RAY_OK;
+}
+
+const char* ray_splay_lease_dir(const ray_splay_lease_t* lease) {
+    return lease ? lease->dir : NULL;
+}
+
+void ray_splay_lease_release(ray_splay_lease_t** lease) {
+    if (!lease || !*lease) return;
+    (void)ray_file_unlock((*lease)->lock);
+    ray_file_close((*lease)->lock);
+    free(*lease);
+    *lease = NULL;
+}
+
 static ray_err_t splay_publish_generation(const char* dir, const char* gen,
                                           bool durable) {
     char manifest[1024], tmp[1024];
@@ -339,6 +447,35 @@ static void splay_retire_legacy_schema(const char* root) {
     if (all_gone) (void)unlink(retired);
 }
 
+/* The .lease file goes last, after the rest of the generation: a lease
+ * protocol that ever let a reader race GC would still find the lease gone
+ * before any data file. */
+static void splay_remove_generation(const char* full) {
+    DIR* d = opendir(full);
+    if (d) {
+        struct dirent* entry;
+        while ((entry = readdir(d))) {
+            if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, "..") ||
+                !strcmp(entry->d_name, ".lease"))
+                continue;
+            char child[1100];
+            int n = snprintf(child, sizeof(child), "%s/%s", full, entry->d_name);
+            if (n <= 0 || (size_t)n >= sizeof(child)) continue;
+            /* Never follow a link out of the generation. */
+            struct stat st;
+#ifdef RAY_OS_WINDOWS
+            if (stat(child, &st) != 0) continue;
+#else
+            if (lstat(child, &st) != 0) continue;
+#endif
+            if (S_ISDIR(st.st_mode)) splay_remove_tree_best_effort(child);
+            else (void)unlink(child);
+        }
+        closedir(d);
+    }
+    splay_remove_tree_best_effort(full);
+}
+
 /* Every generation but the selected one goes.  A reader that resolved an
  * older one and has not opened all its files yet finds one missing, resolves
  * again and reads the selected generation (see splay_load_impl); files it
@@ -362,7 +499,26 @@ static void splay_prune_generations(const char* root, const char* current) {
             fn < 0 || (size_t)fn >= sizeof(full))
             continue;
         if (current && strcmp(rel, current) == 0) continue;
-        splay_remove_tree_best_effort(full);
+        /* The exclusive .publish.lock prevents new lease acquisitions
+         * between this nonblocking probe and removal. Never wait for readers. */
+#ifndef RAY_OS_WINDOWS
+        struct stat st;
+        if (lstat(full, &st) != 0) continue;
+        if (S_ISLNK(st.st_mode)) { (void)unlink(full); continue; }
+#endif
+        char lease_path[1100];
+        int ln = snprintf(lease_path, sizeof(lease_path), "%s/.lease", full);
+        if (ln < 0 || (size_t)ln >= sizeof(lease_path)) continue;
+        ray_fd_t lease_lock = ray_file_open(lease_path, RAY_OPEN_READ);
+        if (lease_lock != RAY_FD_INVALID) {
+            if (ray_file_trylock_ex(lease_lock) != RAY_OK) {
+                ray_file_close(lease_lock);
+                continue;
+            }
+            (void)ray_file_unlock(lease_lock);
+            ray_file_close(lease_lock);
+        } else if (errno != ENOENT) continue; /* Conservative on lock I/O errors. */
+        splay_remove_generation(full);
     }
     closedir(d);
 }
@@ -681,7 +837,8 @@ static void splay_clear_created(const ray_splay_write_t* write) {
     struct dirent* entry;
     while ((entry = readdir(d))) {
         if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0 ||
-            strcmp(entry->d_name, ".write.lock") == 0)
+            strcmp(entry->d_name, ".write.lock") == 0 ||
+            strcmp(entry->d_name, ".publish.lock") == 0)
             continue;
         char child[1100];
         int n = snprintf(child, sizeof(child), "%s/%s", write->root, entry->d_name);
@@ -691,7 +848,15 @@ static void splay_clear_created(const ray_splay_write_t* write) {
             if (stat(child, &st) != 0 || splay_was_there(write, (uint64_t)st.st_ino))
                 continue;
         }
-        splay_remove_tree_best_effort(child);
+        /* A link goes, never what it points to. */
+        struct stat st;
+#ifdef RAY_OS_WINDOWS
+        if (stat(child, &st) != 0) continue;
+#else
+        if (lstat(child, &st) != 0) continue;
+#endif
+        if (S_ISDIR(st.st_mode)) splay_remove_tree_best_effort(child);
+        else (void)unlink(child);
     }
     closedir(d);
 }
@@ -704,7 +869,8 @@ static bool splay_root_is_bare(const ray_splay_write_t* write) {
     struct dirent* entry;
     while (bare && (entry = readdir(d))) {
         if (strcmp(entry->d_name, ".") != 0 && strcmp(entry->d_name, "..") != 0 &&
-            strcmp(entry->d_name, ".write.lock") != 0)
+            strcmp(entry->d_name, ".write.lock") != 0 &&
+            strcmp(entry->d_name, ".publish.lock") != 0)
             bare = false;
     }
     closedir(d);
@@ -722,7 +888,12 @@ static void splay_remove_created(const ray_splay_write_t* write, bool unlink_loc
     if (!splay_root_is_bare(write)) return;
     if (unlink_lock) {
         char lock[1100];
-        int n = snprintf(lock, sizeof(lock), "%s/.write.lock", write->root);
+        /* The only place a lock file changes inode: allowed only here, with
+         * the root empty (no .current, nothing to protect) under the
+         * exclusive .write.lock. */
+        int n = snprintf(lock, sizeof(lock), "%s/.publish.lock", write->root);
+        if (n > 0 && (size_t)n < sizeof(lock)) (void)unlink(lock);
+        n = snprintf(lock, sizeof(lock), "%s/.write.lock", write->root);
         if (n > 0 && (size_t)n < sizeof(lock)) (void)unlink(lock);
     }
     if (rmdir(write->root) != 0 || !write->created[0]) return;
@@ -754,11 +925,16 @@ ray_err_t ray_splay_write_finish(ray_splay_write_t* write, ray_err_t result,
         if (durable && (ray_file_sync_dir(schema) != RAY_OK ||
                         ray_file_sync_dir(write->dir) != RAY_OK))
             result = RAY_ERR_IO;
-        if (result == RAY_OK)
-            result = splay_publish_generation(write->root, write->generation, durable);
+        /* .write.lock is held; .publish.lock covers the rename and GC. */
+        ray_fd_t publish = RAY_FD_INVALID;
+        if (result == RAY_OK) result = splay_publish_lock(write->root, true, &publish);
         if (result == RAY_OK) {
-            splay_retire_legacy_schema(write->root);
-            splay_prune_generations(write->root, write->generation);
+            result = splay_publish_generation(write->root, write->generation, durable);
+            if (result == RAY_OK) {
+                splay_retire_legacy_schema(write->root);
+                splay_prune_generations(write->root, write->generation);
+            }
+            splay_publish_unlock(publish);
         }
     }
     if (result != RAY_OK && write->staged && write->dir[0] &&
@@ -781,6 +957,29 @@ ray_err_t ray_splay_write_finish(ray_splay_write_t* write, ray_err_t result,
             drop_created = false;
         else
             splay_clear_created(write);
+    }
+    /* A failed staged write to a root that holds no table yet (no flat .d, no
+     * .current) leaves only lock files and unpublished generations, some
+     * perhaps from killed writers: nothing a reader can lease.  Clear them
+     * like a failed first write, so a partition this write created does not
+     * stay behind as a table that cannot be read. */
+    if (result != RAY_OK && write->staged && locked) {
+        bool schema = false, current = false;
+        char gens[1100];
+        int n = snprintf(gens, sizeof(gens), "%s/.generations", write->root);
+        struct stat st;
+        if (n > 0 && (size_t)n < sizeof(gens) &&
+            splay_has_file(write->root, ".d", &schema) == RAY_OK &&
+            splay_has_file(write->root, ".current", &current) == RAY_OK &&
+            !schema && !current) {
+#ifdef RAY_OS_WINDOWS
+            if (stat(gens, &st) == 0 && S_ISDIR(st.st_mode))
+#else
+            if (lstat(gens, &st) == 0 && S_ISDIR(st.st_mode))
+#endif
+                splay_remove_tree_best_effort(gens);
+            drop_created = true;
+        }
     }
     if (write->before) {
         ray_free_raw(write->before);
@@ -806,7 +1005,8 @@ ray_err_t ray_splay_write_finish(ray_splay_write_t* write, ray_err_t result,
     return result;
 }
 
-ray_err_t ray_splay_write_begin(const char* dir, ray_splay_write_t* write) {
+static ray_err_t splay_write_begin_impl(const char* dir, ray_splay_write_t* write,
+                                       bool force_staged) {
     memset(write, 0, sizeof(*write));
     write->lock = RAY_FD_INVALID;
     if (!dir || !*dir) return RAY_ERR_IO;
@@ -875,7 +1075,7 @@ ray_err_t ray_splay_write_begin(const char* dir, ray_splay_write_t* write) {
     err = splay_has_file(write->root, ".d", &schema);
     if (err == RAY_OK) err = splay_has_file(write->root, ".current", &current);
     if (err != RAY_OK) return ray_splay_write_finish(write, err, false);
-    write->staged = schema || current;
+    write->staged = force_staged || schema || current;
     if (!write->staged) {
         splay_snapshot_root(write);
         memcpy(write->dir, write->root, len + 1);
@@ -904,7 +1104,22 @@ ray_err_t ray_splay_write_begin(const char* dir, ray_splay_write_t* write) {
             return ray_splay_write_finish(write, RAY_ERR_IO, false);
         /* Never reuse an existing generation, including after PID reuse. */
     }
+    n = snprintf(path, sizeof(path), "%s/.lease", write->dir);
+    if (n < 0 || (size_t)n >= sizeof(path))
+        return ray_splay_write_finish(write, RAY_ERR_RANGE, false);
+    ray_fd_t lease_file = ray_file_open(path, RAY_OPEN_READ | RAY_OPEN_WRITE | RAY_OPEN_CREATE);
+    if (lease_file == RAY_FD_INVALID)
+        return ray_splay_write_finish(write, RAY_ERR_IO, false);
+    ray_file_close(lease_file);
     return RAY_OK;
+}
+
+ray_err_t ray_splay_write_begin(const char* dir, ray_splay_write_t* write) {
+    return splay_write_begin_impl(dir, write, false);
+}
+
+ray_err_t ray_splay_write_begin_staged(const char* dir, ray_splay_write_t* write) {
+    return splay_write_begin_impl(dir, write, true);
 }
 
 static ray_err_t splay_save_impl(ray_t* tbl, const char* dir,
