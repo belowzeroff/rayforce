@@ -1022,6 +1022,32 @@ static uint64_t stream_blocks(const char* target, const char* column) {
     return blocks;
 }
 
+/* A failed first write leaves nothing behind: not the partition it created,
+ * nor lock files or unpublished generations, killed writers' included. A
+ * failed rewrite keeps the published table. */
+static test_result_t failed_first_write_clears(void) {
+    ray_t* table = stream_table(100);
+    char part[128], dir[128], stale[192];
+    snprintf(part, sizeof(part), "%s/2024.01.05", root);
+    snprintf(dir, sizeof(dir), "%s/t", part);
+    ray_block_store_options_t options = {96, 1, false};
+    ray_block_table_writer_t* w = NULL;
+    TEST_ASSERT_EQ_I(ray_block_table_begin(dir, table, &options, &w), RAY_OK);
+    snprintf(stale, sizeof(stale), "%s/.generations/g-1-1-1", dir);
+    TEST_ASSERT_EQ_I(mkdir(stale, 0755), 0);   /* as a killed writer leaves it */
+    ray_block_table_abort(&w);
+    TEST_ASSERT_EQ_I(access(dir, F_OK), -1);
+    TEST_ASSERT_EQ_I(access(part, F_OK), -1);
+    TEST_ASSERT_EQ_I(ray_block_store_save(table, dir, &options), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_block_table_begin(dir, table, &options, &w), RAY_OK);
+    ray_block_table_abort(&w);
+    ray_block_scan_options_t read = {0, UINT64_MAX, 4096, 1u << 20, 1u << 20, 0};
+    const char* const cols[] = {"a"};
+    TEST_ASSERT_EQ_I(ray_block_scan_open(dir, cols, 1, &read, &scan), RAY_OK);
+    ray_release(table);
+    PASS();
+}
+
 static test_result_t store_stream_chunks(void) {
     const int64_t rows = 1000;
     ray_t* table = stream_table(rows);
@@ -1835,6 +1861,7 @@ const test_entry_t block_scan_entries[] = {
     {"block_scan/crash_publication", crash_publication, setup, teardown},
     {"block_scan/concurrent_readers", concurrent_readers, setup, teardown},
     {"block_scan/scan_during_write", scan_during_write, setup, teardown},
+    {"block_scan/failed_first_write_clears", failed_first_write_clears, setup, teardown},
     {"block_scan/publish_lock_permissions", publish_lock_permissions, setup, teardown},
     {"block_scan/auto_batch_rows", auto_batch_rows, setup, teardown},
     {"block_scan/auto_batch_raw_strings", auto_batch_raw_strings, setup, teardown},

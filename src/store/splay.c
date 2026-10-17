@@ -950,6 +950,29 @@ ray_err_t ray_splay_write_finish(ray_splay_write_t* write, ray_err_t result,
         else
             splay_clear_created(write);
     }
+    /* A failed staged write to a root that holds no table yet (no flat .d, no
+     * .current) leaves only lock files and unpublished generations, some
+     * perhaps from killed writers: nothing a reader can lease.  Clear them
+     * like a failed first write, so a partition this write created does not
+     * stay behind as a table that cannot be read. */
+    if (result != RAY_OK && write->staged && locked) {
+        bool schema = false, current = false;
+        char gens[1100];
+        int n = snprintf(gens, sizeof(gens), "%s/.generations", write->root);
+        struct stat st;
+        if (n > 0 && (size_t)n < sizeof(gens) &&
+            splay_has_file(write->root, ".d", &schema) == RAY_OK &&
+            splay_has_file(write->root, ".current", &current) == RAY_OK &&
+            !schema && !current) {
+#ifdef RAY_OS_WINDOWS
+            if (stat(gens, &st) == 0 && S_ISDIR(st.st_mode))
+#else
+            if (lstat(gens, &st) == 0 && S_ISDIR(st.st_mode))
+#endif
+                splay_remove_tree_best_effort(gens);
+            drop_created = true;
+        }
+    }
     if (write->before) {
         ray_free_raw(write->before);
         write->before = NULL;
