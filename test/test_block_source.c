@@ -1531,6 +1531,45 @@ static test_result_t block_defaults(void) {
 
 /* Existing loaders name the block format; materialize and splayed.set
  * options reach it explicitly. */
+/* A raw table rewritten into generations keeps its symbols in the root
+ * .sym; block scans, conversion and storage reports find them there. */
+static test_result_t raw_generation_symbols(void) {
+    char command[1024], dir[256], dest[256];
+    snprintf(dir, sizeof(dir), "%s/g", root);
+    snprintf(dest, sizeof(dest), "%s/g2", root);
+    ray_t* r = ray_eval_str("(set g (table [id sy] (list [1 2 3 4 5] ['a 'b 'a 'c 'b])))");
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r)); ray_release(r);
+    for (int i = 0; i < 2; i++) {
+        snprintf(command, sizeof(command), "(.db.splayed.set \"%s\" g)", dir);
+        r = ray_eval_str(command);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(r)); ray_release(r);
+    }
+    snprintf(command, sizeof(command), "%s/.current", dir);
+    TEST_ASSERT_EQ_I(access(command, F_OK), 0);
+    const char* clauses[] = {"i: id k: sy", "where: (== sy 'a) i: id k: sy"};
+    char source[256];
+    snprintf(source, sizeof(source), "(.db.block.scan \"%s\" 100000000)", dir);
+    for (unsigned c = 0; c < 2; c++) {
+        ray_t* expected = parted_select("g", clauses[c]);
+        ray_t* actual = parted_select(source, clauses[c]);
+        test_result_t tr = tables_equal(actual, expected);
+        ray_release(expected); ray_release(actual);
+        if (tr.status != TEST_PASS) return tr;
+    }
+    snprintf(command, sizeof(command), "(.db.storage.info \"%s\")", dir);
+    r = ray_eval_str(command);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r)); ray_release(r);
+    snprintf(command, sizeof(command), "(.db.block.convert \"%s\" \"%s\")", dir, dest);
+    r = ray_eval_str(command);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r)); ray_release(r);
+    snprintf(source, sizeof(source), "(.db.block.scan \"%s\" 100000000)", dest);
+    ray_t* expected = parted_select("g", clauses[1]);
+    ray_t* actual = parted_select(source, clauses[1]);
+    test_result_t tr = tables_equal(actual, expected);
+    ray_release(expected); ray_release(actual);
+    return tr;
+}
+
 static test_result_t splayed_integration(void) {
     fixture(300, false);   /* root holds a block generation of raw's rows */
     char command[512];
@@ -1651,6 +1690,7 @@ static test_result_t symbol_and_float_queries(void) {
 const test_entry_t block_source_entries[] = {
     {"block_source/symbol_and_float_queries", symbol_and_float_queries, setup, teardown},
     {"block_source/splayed_integration", splayed_integration, setup, teardown},
+    {"block_source/raw_generation_symbols", raw_generation_symbols, setup, teardown},
     {"block_source/block_defaults", block_defaults, setup, teardown},
     {"block_source/block_convert_parted", block_convert_parted, setup, teardown},
     {"block_source/string_arena_fallback", string_arena_fallback, setup, teardown},
