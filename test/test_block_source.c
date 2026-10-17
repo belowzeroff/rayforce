@@ -14,6 +14,7 @@
 #include "store/part.h"
 #include "io/csv.h"
 #include "core/runtime.h"
+#include "core/pool.h"
 #include "mem/heap.h"
 #include "ops/ops.h"
 #include <stdlib.h>
@@ -1314,6 +1315,43 @@ static test_result_t storage_info_verify(void) {
 
 /* Large reads decode their whole blocks on the pool; values and errors are
  * the same as serial decoding. */
+/* A cancelled pool skips decode tasks that have not started: a parallel
+ * read then reports the cancel instead of returning undecoded blocks. */
+static test_result_t parallel_decode_cancel(void) {
+    const int64_t rows = 1 << 18;
+    ray_t* v = ray_vec_new(RAY_I64, rows);
+    for (int64_t i = 0; i < rows; i++) ((int64_t*)ray_data(v))[i] = i * 7;
+    v->len = rows;
+    ray_t* t = ray_table_new(1);
+    t = ray_table_add_col(t, ray_sym_intern("v", 1), v);
+    ray_release(v);
+    ray_block_store_options_t store = {65536, 1, false};
+    TEST_ASSERT_EQ_I(ray_block_store_save(t, root, &store), RAY_OK);
+    ray_release(t);
+    char dir[1024], path[1100];
+    TEST_ASSERT_EQ_I(ray_splay_resolve_dir(root, dir, sizeof(dir)), RAY_OK);
+    snprintf(path, sizeof(path), "%s/v", dir);
+    ray_col_block_file_t* file = NULL;
+    TEST_ASSERT_EQ_I(ray_col_block_file_open(path, &file), RAY_OK);
+    const ray_col_block_reader_t* r = ray_col_block_file_reader(file);
+    size_t bytes = (size_t)rows * 8;
+    int64_t* out = malloc(bytes);
+    void* scratch = malloc(65536);
+    TEST_ASSERT_NOT_NULL(out); TEST_ASSERT_NOT_NULL(scratch);
+    (void)ray_pool_get();   /* a cancel reaches only a live pool */
+    ray_request_interrupt();
+    ray_err_t cancelled = ray_col_block_read_range(r, 0, (uint64_t)rows, out, bytes, scratch, 65536);
+    ray_clear_interrupt();
+    ray_err_t ok = ray_col_block_read_range(r, 0, (uint64_t)rows, out, bytes, scratch, 65536);
+    bool equal = ok == RAY_OK;
+    for (int64_t i = 0; equal && i < rows; i++) equal = out[i] == i * 7;
+    free(out); free(scratch);
+    ray_col_block_file_close(&file);
+    TEST_ASSERT_EQ_I(cancelled, RAY_ERR_CANCEL);
+    TEST_ASSERT_TRUE(equal);
+    PASS();
+}
+
 static test_result_t parallel_decode(void) {
     const int64_t rows = 1 << 20;
     ray_t* v = ray_vec_new(RAY_I64, rows);
@@ -1834,6 +1872,7 @@ const test_entry_t block_source_entries[] = {
     {"block_source/string_arena_fallback", string_arena_fallback, setup, teardown},
     {"block_source/storage_parted", storage_parted, setup, teardown},
     {"block_source/parallel_decode", parallel_decode, setup, teardown},
+    {"block_source/parallel_decode_cancel", parallel_decode_cancel, setup, teardown},
     {"block_source/storage_info_verify", storage_info_verify, setup, teardown},
     {"block_source/block_convert", block_convert, setup, teardown},
     {"block_source/csv_block", csv_block, setup, teardown},

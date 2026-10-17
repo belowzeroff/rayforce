@@ -342,6 +342,7 @@ typedef struct {
     uint64_t first, row;
     unsigned width;
     _Atomic int err;
+    _Atomic uint64_t done;  /* blocks decoded; a cancelled pool skips tasks */
 } range_run_t;
 
 static ray_err_t range_block(const range_run_t* run, uint64_t block) {
@@ -363,6 +364,7 @@ static void range_task(void* ctx, uint32_t worker, int64_t start, int64_t end) {
                                                     memory_order_relaxed, memory_order_relaxed);
             return;
         }
+        atomic_fetch_add_explicit(&run->done, 1, memory_order_relaxed);
     }
 }
 
@@ -372,12 +374,15 @@ static void range_task(void* ctx, uint32_t worker, int64_t start, int64_t end) {
 
 static ray_err_t range_whole(const ray_col_block_reader_t* r, uint64_t first, uint64_t end,
                              uint8_t* output, uint64_t row, unsigned width, size_t bytes) {
-    range_run_t run = {r, output, first, row, width, RAY_OK};
+    range_run_t run = {r, output, first, row, width, RAY_OK, 0};
     ray_pool_t* pool = ray_pool_get();
     if (end - first >= 2 && bytes >= RANGE_PARALLEL_BYTES &&
         ray_pool_par_dispatch_ok(pool, (int64_t)(end - first), 2)) {
         ray_pool_dispatch_n(pool, range_task, &run, (uint32_t)(end - first));
-        return (ray_err_t)atomic_load(&run.err);
+        ray_err_t err = (ray_err_t)atomic_load(&run.err);
+        /* Blocks a cancel skipped were never written: not data. */
+        if (!err && atomic_load(&run.done) != end - first) err = RAY_ERR_CANCEL;
+        return err;
     }
     for (uint64_t b = first; b < end; b++) {
         ray_err_t err = range_block(&run, b);
@@ -409,6 +414,7 @@ typedef struct {
     const size_t* offsets;
     uint64_t first;
     _Atomic int err;
+    _Atomic uint64_t done;
 } arena_run_t;
 
 static ray_err_t arena_block(const arena_run_t* run, uint64_t i) {
@@ -429,6 +435,7 @@ static void arena_task(void* ctx, uint32_t worker, int64_t start, int64_t end) {
                                                     memory_order_relaxed, memory_order_relaxed);
             return;
         }
+        atomic_fetch_add_explicit(&run->done, 1, memory_order_relaxed);
     }
 }
 
@@ -449,11 +456,12 @@ ray_err_t ray_col_block_decode_arena(const ray_col_block_reader_t* r, uint64_t s
     for (uint64_t i = 0; i < n; i++)
         offsets[i + 1] = offsets[i] +
             (size_t)get_le(r->data + r->directory + (first + i) * RAY_COL_BLOCK_ENTRY + 28, 4);
-    arena_run_t run = {r, arena, offsets, first, RAY_OK};
+    arena_run_t run = {r, arena, offsets, first, RAY_OK, 0};
     ray_pool_t* pool = ray_pool_get();
     if (n >= 2 && bytes >= RANGE_PARALLEL_BYTES && ray_pool_par_dispatch_ok(pool, (int64_t)n, 2)) {
         ray_pool_dispatch_n(pool, arena_task, &run, (uint32_t)n);
         err = (ray_err_t)atomic_load(&run.err);
+        if (!err && atomic_load(&run.done) != n) err = RAY_ERR_CANCEL;
     } else {
         for (uint64_t i = 0; !err && i < n; i++) err = arena_block(&run, i);
     }

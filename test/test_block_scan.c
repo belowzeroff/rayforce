@@ -1048,6 +1048,30 @@ static test_result_t failed_first_write_clears(void) {
     PASS();
 }
 
+/* A cancel after the last append publishes nothing: the previous
+ * generation stays current. */
+static test_result_t cancel_before_finish(void) {
+    const int64_t rows = 1000;
+    ray_block_store_options_t store = {4096, 1, false};
+    ray_t* t = epoch_table(1, rows);
+    TEST_ASSERT_EQ_I(ray_block_store_save(t, root, &store), RAY_OK);
+    ray_release(t);
+    t = epoch_table(2, rows);
+    ray_block_table_writer_t* w = NULL;
+    TEST_ASSERT_EQ_I(ray_block_table_begin(root, t, &store, &w), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_block_table_append(w, t), RAY_OK);
+    ray_release(t);
+    ray_request_interrupt();
+    ray_err_t err = ray_block_table_finish(&w);
+    ray_clear_interrupt();
+    TEST_ASSERT_EQ_I(err, RAY_ERR_CANCEL);
+    TEST_ASSERT_TRUE(w == NULL);
+    int64_t e = 0;
+    TEST_ASSERT_EQ_I(epoch_read(rows, &e), 0);
+    TEST_ASSERT_EQ_I(e, 1);
+    PASS();
+}
+
 static test_result_t store_stream_chunks(void) {
     const int64_t rows = 1000;
     ray_t* table = stream_table(rows);
@@ -1862,6 +1886,7 @@ const test_entry_t block_scan_entries[] = {
     {"block_scan/concurrent_readers", concurrent_readers, setup, teardown},
     {"block_scan/scan_during_write", scan_during_write, setup, teardown},
     {"block_scan/failed_first_write_clears", failed_first_write_clears, setup, teardown},
+    {"block_scan/cancel_before_finish", cancel_before_finish, setup, teardown},
     {"block_scan/publish_lock_permissions", publish_lock_permissions, setup, teardown},
     {"block_scan/auto_batch_rows", auto_batch_rows, setup, teardown},
     {"block_scan/auto_batch_raw_strings", auto_batch_raw_strings, setup, teardown},

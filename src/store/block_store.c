@@ -304,6 +304,9 @@ ray_err_t ray_block_table_finish(ray_block_table_writer_t** writer) {
     if (!writer || !*writer) return RAY_ERR_DOMAIN;
     ray_block_table_writer_t* w = *writer;
     if (w->failed) { ray_block_table_abort(writer); return RAY_ERR_DOMAIN; }
+    /* A cancel that arrived after the last append publishes nothing, and
+     * nothing is flushed to the generation's dictionary either. */
+    if (ray_interrupted()) { ray_block_table_abort(writer); return RAY_ERR_CANCEL; }
     bool durable = w->options.durable;
     ray_err_t err = RAY_OK;
     uint64_t sym_count = 0;

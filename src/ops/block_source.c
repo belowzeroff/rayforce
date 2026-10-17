@@ -14,6 +14,7 @@
 #include "core/pool.h"
 #include <stdio.h>
 #include <sys/stat.h>
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -686,6 +687,7 @@ typedef struct {
     const uint32_t* gids;
     uint64_t rows;
     uint32_t chunk_rows;
+    _Atomic uint64_t done;  /* chunks accumulated; a cancelled pool skips tasks */
 } aggregate_batch_t;
 
 static void aggregate_chunk(const aggregate_batch_t* b, uint32_t worker, uint64_t chunk) {
@@ -704,7 +706,11 @@ static void aggregate_chunk(const aggregate_batch_t* b, uint32_t worker, uint64_
 }
 
 static void aggregate_task(void* ctx, uint32_t worker, int64_t start, int64_t end) {
-    for (int64_t i = start; i < end; i++) aggregate_chunk(ctx, worker, (uint64_t)i);
+    aggregate_batch_t* work = ctx;
+    for (int64_t i = start; i < end; i++) {
+        aggregate_chunk(work, worker, (uint64_t)i);
+        atomic_fetch_add_explicit(&work->done, 1, memory_order_relaxed);
+    }
 }
 
 static ray_t* aggregate_result(ray_block_query_t* cursor, const aggregate_t* const* kinds,
@@ -814,13 +820,17 @@ static ray_t* aggregate_result(ray_block_query_t* cursor, const aggregate_t* con
         }
         for (size_t a = 0; a < count; a++) cols[a] = ray_table_get_col_idx(batch, (int64_t)positions[a]);
         /* The group-id workspace stays one chunk, whatever the input batch. */
-        aggregate_batch_t work = {states, slots, count, cols, gids, rows, chunk_rows};
+        aggregate_batch_t work = {states, slots, count, cols, gids, rows, chunk_rows, 0};
         uint64_t chunks = (rows + chunk_rows - 1) / chunk_rows;
-        if (slots && chunks >= 2 && ray_pool_par_dispatch_ok(pool, (int64_t)chunks, 2))
+        bool skipped = false;
+        if (slots && chunks >= 2 && ray_pool_par_dispatch_ok(pool, (int64_t)chunks, 2)) {
             ray_pool_dispatch_n(pool, aggregate_task, &work, (uint32_t)chunks);
-        else
+            skipped = atomic_load(&work.done) != chunks;
+        } else
             for (uint64_t c = 0; c < chunks; c++) aggregate_chunk(&work, 0, c);
         ray_release(batch);
+        /* Chunks a cancel skipped are missing from the states. */
+        if (skipped) { result = ray_error("cancel", "block aggregate interrupted"); goto done; }
     }
     for (uint32_t w = 1; slots && w < workers; w++)
         for (size_t a = 0; a < count; a++)
