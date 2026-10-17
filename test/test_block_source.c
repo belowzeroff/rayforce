@@ -1691,6 +1691,69 @@ static test_result_t golden_columns_equal(ray_t* actual, ray_t* expected) {
     PASS();
 }
 
+/* Zone maps of every integer and temporal type prune only what cannot
+ * match: block queries over many small zoned blocks equal a row filter. */
+static int64_t zone_value(ray_t* col, int64_t i) {
+    switch (col->type) {
+    case RAY_BOOL: case RAY_U8: return ((uint8_t*)ray_data(col))[i];
+    case RAY_I16: return ((int16_t*)ray_data(col))[i];
+    case RAY_I32: case RAY_DATE: case RAY_TIME: return ((int32_t*)ray_data(col))[i];
+    default: return ((int64_t*)ray_data(col))[i];
+    }
+}
+
+static test_result_t zone_types_parity(void) {
+    ray_t* t = golden_table();
+    ray_block_store_options_t store = {32, 0, false};
+    TEST_ASSERT_EQ_I(ray_block_store_save(t, root, &store), RAY_OK);
+    static const char* const columns[] = {"b", "u", "h", "i", "l", "d", "tm", "p"};
+    const uint16_t ops[] = {OP_EQ, OP_NE, OP_LT, OP_LE, OP_GT, OP_GE};
+    const char* const output[] = {"l"};
+    ray_t* ids = ray_table_get_col(t, ray_sym_intern("l", 1));
+    ray_block_scan_options_t read = {0, UINT64_MAX, 5, 1u << 20, 1u << 20, 0};
+    for (unsigned c = 0; c < sizeof(columns) / sizeof(*columns); c++) {
+        ray_t* col = ray_table_get_col(t, ray_sym_intern(columns[c], strlen(columns[c])));
+        for (int64_t probe = 3; probe < 16; probe += 6)
+        for (unsigned o = 0; o < 6; o++) {
+            int64_t v = zone_value(col, probe);
+            ray_t* atom = ray_i64(v);
+            atom->type = (int8_t)-col->type;
+            ray_block_predicate_t pred = {columns[c], ops[o], atom};
+            ray_block_query_t* q = NULL;
+            TEST_ASSERT_EQ_I(ray_block_query_open(root, output, 1, &pred, 1, &read, &q), RAY_OK);
+            int64_t row = 0, seen = 0;
+            for (ray_t* b; (b = ray_block_query_next(q)); ray_release(b)) {
+                TEST_ASSERT_FALSE(RAY_IS_ERR(b));
+                const int64_t* got = ray_data(ray_table_get_col_idx(b, 0));
+                for (int64_t k = 0; k < ray_table_nrows(b); k++, seen++) {
+                    for (;;) {
+                        TEST_ASSERT_TRUE(row < col->len);
+                        int64_t x = zone_value(col, row);
+                        bool match = ops[o] == OP_EQ ? x == v : ops[o] == OP_NE ? x != v :
+                            ops[o] == OP_LT ? x < v : ops[o] == OP_LE ? x <= v :
+                            ops[o] == OP_GT ? x > v : x >= v;
+                        row++;
+                        if (match) break;
+                    }
+                    TEST_ASSERT_EQ_I(got[k], ((int64_t*)ray_data(ids))[row - 1]);
+                }
+            }
+            int64_t expected = 0;
+            for (int64_t i = 0; i < col->len; i++) {
+                int64_t x = zone_value(col, i);
+                expected += ops[o] == OP_EQ ? x == v : ops[o] == OP_NE ? x != v :
+                    ops[o] == OP_LT ? x < v : ops[o] == OP_LE ? x <= v :
+                    ops[o] == OP_GT ? x > v : x >= v;
+            }
+            TEST_ASSERT_EQ_I(seen, expected);
+            ray_block_query_close(&q);
+            ray_release(atom);
+        }
+    }
+    ray_release(t);
+    PASS();
+}
+
 static test_result_t golden_files(void) {
     ray_t* expected = golden_table();
     const char* out = getenv("RAY_WRITE_GOLDEN");
@@ -1869,6 +1932,7 @@ const test_entry_t block_source_entries[] = {
     {"block_source/symbol_and_float_queries", symbol_and_float_queries, setup, teardown},
     {"block_source/splayed_integration", splayed_integration, setup, teardown},
     {"block_source/golden_files", golden_files, setup, teardown},
+    {"block_source/zone_types_parity", zone_types_parity, setup, teardown},
     {"block_source/raw_generation_symbols", raw_generation_symbols, setup, teardown},
     {"block_source/block_defaults", block_defaults, setup, teardown},
     {"block_source/block_convert_parted", block_convert_parted, setup, teardown},
