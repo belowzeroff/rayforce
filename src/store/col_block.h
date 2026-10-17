@@ -1,0 +1,230 @@
+/* Copyright (c) 2026 Anton Kundenko. MIT license; see LICENSE. */
+#ifndef RAY_COL_BLOCK_H
+#define RAY_COL_BLOCK_H
+
+#include <rayforce.h>
+#include <stdio.h>
+
+#define RAY_COL_BLOCK_MAX (64u * 1024u * 1024u)
+#define RAY_COL_BLOCK_HEADER 128u
+#define RAY_COL_BLOCK_ENTRY 64u
+#define RAY_COL_BLOCK_FOOTER 32u
+/* Required-feature bits (header bytes 100..103) this reader implements. A
+ * file setting any other bit, or a block using an unknown codec, encoding or
+ * zone flag, opens as RAY_ERR_NYI: it needs a newer reader. Optional-feature
+ * bits (bytes 104..107) mark metadata older readers ignore, kept in the
+ * reserved header bytes 108..127 and entry bytes 35..39, which are zero when
+ * no optional bit is set. This writer sets none. */
+#define RAY_COL_BLOCK_FEATURES 0u
+
+/* Experimental major-2 block container. No semantic attrs or external indexes.
+ * Integer and temporal blocks may carry CRC-protected min/max zone metadata.
+ * STR blocks contain repeated [u32 byte length, bytes], with zero length
+ * representing the canonical empty/null string. No runtime descriptors persist.
+ * SYM payloads are uint64 positions in a generation-local dictionary, bound
+ * by count and file CRC. They are never process-local symbol identifiers.
+ * Payload is little-endian; callers supply native values on little-endian
+ * hosts only. The mapped bytes must remain immutable and alive until the
+ * reader is discarded. Opening checks all metadata, not payload CRCs; an
+ * uncompressed block must carry equal payload and decoded CRCs. */
+/* One decoded block kept for reuse; block is UINT64_MAX when empty. */
+typedef struct ray_col_block_cache_s {
+    uint8_t* data;
+    uint64_t block;
+} ray_col_block_cache_t;
+
+typedef struct {
+    const uint8_t* data;
+    size_t size;
+    uint64_t rows, blocks, directory, generation;
+    uint32_t block_bytes;
+    uint8_t type;
+    uint64_t sym_count;
+    uint32_t sym_crc;
+    /* Optional bit per block whose checksums already passed over these
+     * immutable bytes; read skips them again. NULL checks every read. */
+    uint8_t* verified;
+    /* Optional block_bytes buffer (allocated on first use) holding the last
+     * partially read fixed-width block, so consecutive ranges inside one
+     * block decode it once. Outside scratch budgets. NULL disables reuse.
+     * Not synchronized: read_range on one reader with a cache must not run
+     * concurrently. Pool workers use ray_col_block_read, which skips it. */
+    ray_col_block_cache_t* cache;
+} ray_col_block_reader_t;
+
+typedef enum {
+    RAY_COL_BLOCK_EQ, RAY_COL_BLOCK_NE, RAY_COL_BLOCK_LT,
+    RAY_COL_BLOCK_LE, RAY_COL_BLOCK_GT, RAY_COL_BLOCK_GE
+} ray_col_block_cmp_t;
+
+ray_err_t ray_col_block_open(ray_col_block_reader_t* reader,
+                             const void* data, size_t size);
+/* Decode exactly one block into caller-owned output. No allocations.
+ * Output must not overlap the mapped bytes. On error output may be partially
+ * written; row outputs change only on success. Reader must come from open. */
+ray_err_t ray_col_block_read(const ray_col_block_reader_t* reader, uint64_t block,
+                             void* output, size_t capacity,
+                             uint64_t* row_start, uint64_t* row_count);
+
+/* Range [start, start + count). Empty ranges at EOF are valid. Fixed width:
+ * exact output bytes and scratch for partial boundary blocks. STR: minimum
+ * descriptor bytes (16 per row), scratch for the largest selected block;
+ * payload_size below adds the exact pool bytes by decoding selected blocks.
+ * No allocation
+ * or payload access. All APIs require an unchanged reader returned by open. */
+ray_err_t ray_col_block_range_size(const ray_col_block_reader_t* reader,
+                                  uint64_t start, uint64_t count,
+                                  size_t* output_bytes, size_t* scratch_bytes);
+/* Directory totals, from metadata only. */
+typedef struct {
+    uint64_t blocks, snappy_blocks, zoned_blocks;
+    uint64_t stored_bytes, decoded_bytes; /* block payloads, before/after codec */
+} ray_col_block_summary_t;
+ray_err_t ray_col_block_summary(const ray_col_block_reader_t* reader,
+                                ray_col_block_summary_t* out);
+/* Full check of every block in order, ignoring reader->verified: payload CRC, codec, decoded CRC, STR
+ * framing, SYM positions below sym_count, and zone statistics recomputed from
+ * the decoded rows (directory CRCs guard against accidents, not rewrites). scratch must hold block_bytes.
+ * On corrupt, *bad_block (optional) is the first failing block. */
+ray_err_t ray_col_block_verify(const ray_col_block_reader_t* reader,
+                               void* scratch, size_t scratch_capacity,
+                               uint64_t* bad_block);
+/* Half-open block interval covering a row range; empty ranges return [0,0). */
+ray_err_t ray_col_block_range_blocks(const ray_col_block_reader_t* reader,
+                                    uint64_t start, uint64_t count,
+                                    uint64_t* first, uint64_t* end);
+/* Conservative integer/temporal zone-map probe. true means decode may be
+ * needed; false proves that no row in the range can satisfy the comparison.
+ * Legacy entries and unsupported types always return true. */
+ray_err_t ray_col_block_range_may_match(const ray_col_block_reader_t* reader,
+                                       uint64_t start, uint64_t count,
+                                       ray_col_block_cmp_t op, int64_t value,
+                                       bool value_is_null, bool* may_match);
+/* Exact native payload (STR descriptors + pooled bytes, fixed width otherwise).
+ * STR validates/decodes selected blocks with caller scratch, without allocation.
+ * Pool > UINT32_MAX returns range, matching the native STR representation. */
+ray_err_t ray_col_block_payload_size(const ray_col_block_reader_t* reader,
+                                    uint64_t start, uint64_t count,
+                                    void* scratch, size_t scratch_capacity,
+                                    size_t* payload_bytes);
+/* Buffers must not overlap each other or the mapping. Capacities are checked
+ * before any output write. CRC/decode errors may leave partial output.
+ * Fixed-width only; STR uses materialization below. */
+/* Sum of decoded sizes of the blocks covering a range, from the directory. */
+ray_err_t ray_col_block_range_decoded(const ray_col_block_reader_t* reader, uint64_t start,
+                                     uint64_t count, size_t* bytes);
+/* Decode every block covering a range, whole and in order, into one arena of
+ * at least range_decoded bytes; in parallel on the native pool when large. */
+ray_err_t ray_col_block_decode_arena(const ray_col_block_reader_t* reader, uint64_t start,
+                                    uint64_t count, uint8_t* arena, size_t capacity);
+/* STR from a decode_arena of the same range, without decoding again:
+ * payload_size_arena measures it, materialize_str_arena fills from it. */
+/* select (optional, a byte per range row) keeps only marked rows, in order. */
+ray_err_t ray_col_block_payload_size_arena(const ray_col_block_reader_t* reader,
+                                          uint64_t start, uint64_t count,
+                                          const uint8_t* arena, const uint8_t* select,
+                                          size_t* payload_bytes);
+ray_t* ray_col_block_materialize_str_arena(const ray_col_block_reader_t* reader,
+                                          uint64_t start, uint64_t count,
+                                          const uint8_t* select, size_t measured_bytes,
+                                          const uint8_t* arena);
+/* Whole blocks of a large range decode in parallel on the native pool when
+ * called outside a pool dispatch; partial boundary blocks decode serially. */
+ray_err_t ray_col_block_read_range(const ray_col_block_reader_t* reader,
+                                  uint64_t start, uint64_t count,
+                                  void* output, size_t capacity,
+                                  void* scratch, size_t scratch_capacity);
+/* Explicit native-vector adapter; requires initialized runtime heap. Limit
+ * applies to logical output payload, NOT allocator rounding/header or RSS.
+ * Scratch is caller-owned and separately bounded. No implicit full-column
+ * materialization, mapping ownership, or change to existing load/mmap APIs. */
+ray_t* ray_col_block_materialize(const ray_col_block_reader_t* reader,
+                                uint64_t start, uint64_t count,
+                                size_t payload_limit, void* scratch,
+                                size_t scratch_capacity);
+/* SYM requires an explicitly supplied dictionary already verified against
+ * sym_crc by the caller. Decoded positions are bounds checked. Output retains
+ * the domain; its vocabulary allocation is outside the batch payload budget.
+ * The ordinary materialize/load_range APIs reject SYM without a domain. */
+ray_t* ray_col_block_materialize_dom(const ray_col_block_reader_t* reader,
+                                    uint64_t start, uint64_t count,
+                                    size_t payload_limit, void* scratch,
+                                    size_t scratch_capacity,
+                                    struct ray_sym_domain_s* domain);
+/* STR-only second pass after payload_size on the same immutable range.
+ * measured_bytes includes descriptors and pool; caller checks its budget.
+ * A mismatched size returns an error without publishing a partial vector. */
+ray_t* ray_col_block_materialize_str(const ray_col_block_reader_t* reader,
+                                    uint64_t start, uint64_t count,
+                                    size_t measured_bytes, void* scratch,
+                                    size_t scratch_capacity);
+
+/* Owning file handle. Open requires *out == NULL; failures leave it NULL.
+ * Its reader remembers verified blocks (see reader->verified), so a block
+ * decoded again through the same handle is not checksummed again.
+ * Close clears the caller's pointer and accepts NULL. The borrowed reader is
+ * valid until close; do not copy it past the handle lifetime or mutate it.
+ * Uses the platform file mapper. The inode must remain immutable: this is NOT
+ * a generation lease or protection against concurrent in-place truncation.
+ * Callers synchronize close with all reads. No runtime heap is needed here. */
+typedef struct ray_col_block_file_s ray_col_block_file_t;
+ray_err_t ray_col_block_file_open(const char* path, ray_col_block_file_t** out);
+const ray_col_block_reader_t* ray_col_block_file_reader(const ray_col_block_file_t* file);
+void ray_col_block_file_close(ray_col_block_file_t** file);
+
+/* Explicit major-2-only path load, with owned output. Opens/maps once and
+ * always closes before returning, including on errors. Budgets cover logical
+ * output payload and scratch separately, not mappings/allocator overhead/RSS.
+ * Requires initialized runtime heap. Legacy files return a version error;
+ * existing raw load/mmap dispatch is deliberately unchanged. */
+ray_t* ray_col_block_load_range(const char* path, uint64_t start, uint64_t count,
+                               size_t payload_limit, size_t scratch_limit);
+
+typedef struct {
+    FILE *output, *directory;
+    void* scratch;
+    uint64_t rows, blocks, offset, generation;
+    uint32_t block_bytes;
+    uint8_t type, codec;
+    ray_err_t error;
+    uint64_t sym_count;
+    uint32_t sym_crc;
+    uint64_t sym_used; /* one past the largest SYM position appended */
+} ray_col_block_writer_t;
+
+/* output must be a new, empty, seekable binary file. Caller owns output and
+ * publication (fsync/rename); this API never publishes files. Do not access
+ * output independently while a writer is active. codec: 0 raw,
+ * 1 Snappy with raw fallback. Memory is bounded by Snappy bound(block_bytes)
+ * plus workspace, independent of row count; directory is spooled to tmpfile.
+ * Each append ends its last block; partial blocks are not buffered across calls.
+ * Begin only on an inactive writer. Finish always releases writer resources;
+ * abort is also valid after failed begin/finish. Failed output must be discarded. */
+ray_err_t ray_col_block_begin(ray_col_block_writer_t* writer, FILE* output,
+                              uint8_t type, uint32_t block_bytes,
+                              uint8_t codec, uint64_t generation);
+/* SYM-only variant; count includes the reserved empty symbol at position 0.
+ * Dictionary bytes must be persisted before publishing the column. */
+ray_err_t ray_col_block_begin_sym(ray_col_block_writer_t* writer, FILE* output,
+                                  uint32_t block_bytes, uint8_t codec,
+                                  uint64_t generation, uint64_t sym_count,
+                                  uint32_t sym_crc);
+ray_err_t ray_col_block_append(ray_col_block_writer_t* writer,
+                               const void* values, uint64_t rows);
+/* SYM only, before finish: replace the dictionary identity given to begin_sym,
+ * for a writer that streams positions while its dictionary still grows (begin
+ * with the INT64_MAX bound). Every appended position must fall below count. */
+ray_err_t ray_col_block_set_sym(ray_col_block_writer_t* writer,
+                                uint64_t sym_count, uint32_t sym_crc);
+/* Append one pre-encoded STR block. Validates lengths and exact consumption;
+ * encoded_size <= block_bytes. Each string stays in a single block. */
+ray_err_t ray_col_block_append_str(ray_col_block_writer_t* writer,
+                                   const void* encoded, size_t encoded_size,
+                                   uint64_t rows);
+/* Native STR adapter. Uses one block buffer; caller retains the stable vector.
+ * A single string larger than block_bytes - 4 returns range. */
+ray_err_t ray_col_block_append_str_vec(ray_col_block_writer_t* writer, ray_t* strings);
+ray_err_t ray_col_block_finish(ray_col_block_writer_t* writer);
+void ray_col_block_abort(ray_col_block_writer_t* writer);
+
+#endif

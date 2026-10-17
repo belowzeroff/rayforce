@@ -1629,7 +1629,15 @@ static ray_t* col_validate_mapped(const char* path, col_mapped_t* out) {
      * the runtime `order` to its correct value, so reading the version out
      * of `order` here does not leak into the live block order. */
     if (ray_col_check_format(hdr) != RAY_OK) {
+        /* A compressed block column (major 2, "RAYHDB2" at 32) is a format
+         * these loaders never read; say how to read it. */
+        bool block = mapped_size >= 40 && ((const uint8_t*)ptr)[17] == 2 &&
+                     !memcmp((const uint8_t*)ptr + 32, "RAYHDB2", 8);
         ray_vm_unmap_file(ptr, mapped_size);
+        if (block)
+            return ray_error("version", "col %s: compressed block column; read it with "
+                             ".db.block.scan or .db.block.parted, or load it with "
+                             "(.db.splayed.get dir {materialize: bytes})", path);
         return ray_error("version", "col %s: bad format version", path);
     }
 
