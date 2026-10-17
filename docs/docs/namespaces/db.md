@@ -19,6 +19,12 @@ The `get` builtins memory-map every column file — load is constant-time regard
 | [`.db.parted.get`](#db-parted-get) | variadic | — | Load a partitioned table by name from a db root. |
 | [`.db.parted.tables`](#db-parted-tables) | variadic | — | List the table names available under a parted db root. |
 | [`.db.parted.fill`](#db-parted-fill) | variadic | restricted | Fill missing tables across a parted db's partitions. |
+| [`.db.block.set`](../storage/block.md#writing) | variadic | restricted | Save a table as a compressed block table (experimental). |
+| [`.db.block.scan`](../storage/block.md#reading) | variadic | restricted | Scan descriptor of one block table for `select`. |
+| [`.db.block.parted`](../storage/block.md#reading) | variadic | restricted | Scan descriptor of a partitioned database of block and raw tables. |
+| [`.db.block.convert`](../storage/block.md#converting-existing-data) | variadic | restricted | Rewrite a raw or block table as a block table elsewhere. |
+| [`.db.storage.info`](../storage/block.md#inspecting-and-verifying) | variadic | restricted | Per-column storage format, codec and sizes, from metadata. |
+| [`.db.storage.verify`](../storage/block.md#inspecting-and-verifying) | variadic | restricted | Decode and check every block of a table. |
 
 ## `.db.splayed.set` { #db-splayed-set }
 
@@ -184,3 +190,4 @@ The filled copies are empty, so aggregate results across the db are unchanged �
 
 - [`.csv.splayed`](csv.md#csv-splayed) / [`.csv.parted`](csv.md#csv-parted) — stream CSV directly into splayed / parted layouts.
 - [Columnar Storage](../storage/index.md) — file format, mmap semantics, symbol-table persistence.
+- [Compressed Block Tables](../storage/block.md) — compressed generations, scans, conversion and verification.

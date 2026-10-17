@@ -68,7 +68,8 @@ Generated from `src/lang/eval.c` in this checkout. The categorized reference bel
 `update`, `insert`, `upsert`, `left-join`, `inner-join`, `full-join`, `anti-join`, `window-join`, `window-join1`,
 `asof-join`, `println`, `show`, `format`, `read-csv`, `write-csv`, `.csv.read`, `.csv.splayed`, `.csv.parted`,
 `.csv.write`, `resolve`, `timeit`, `enlist`, `map-left`, `map-right`, `.db.splayed.set`, `.db.splayed.get`,
-`.db.parted.get`, `.db.parted.tables`, `.db.parted.fill`, `alter`, `print`, `.sys.gc`, `.mem.objsize`, `.mem.ts`, `.sys.timeit`,
+`.db.parted.get`, `.db.parted.tables`, `.db.parted.fill`, `.db.block.set`, `.db.block.scan`, `.db.block.parted`,
+`.db.block.convert`, `.db.storage.info`, `.db.storage.verify`, `.csv.block`, `.parquet.block`, `alter`, `print`, `.sys.gc`, `.mem.objsize`, `.mem.ts`, `.sys.timeit`,
 `.sys.env`, `.sys.args`, `.ipc.open`, `.ipc.handle`, `.repl.disconnect`, `.log.open`, `.log.roll`,
 `.log.snapshot`, `.log.sync`, `.log.close`, `.log.purge`, `quote`, `return`, `.time.now`, `.time.timer.set`,
 `fold-left`, `fold-while`, `fold-right`, `scan-left`, `scan-right`, `del`, `.sys.build`, `.sys.mem`, `.sys.prof`,
@@ -712,6 +713,14 @@ Persistent columnar storage — splayed (one file per column) and partitioned ta
 | `.db.parted.get` | variadic | — | Load partitioned table from root directory | `(.db.parted.get "db" 'trades)` |
 | `.db.parted.tables` | variadic | — | List table names under a parted root (from the most recent partition) | `(.db.parted.tables "db")` |
 | `.db.parted.fill` | variadic | restricted | Backfill missing tables across a parted db's partitions | `(.db.parted.fill "db")` |
+| `.db.block.set` | variadic | restricted | Save a table as a compressed block table (experimental) | `(.db.block.set "db/t" t {block-bytes: 65536 codec: snappy})` |
+| `.db.block.scan` | variadic | restricted | Block table scan descriptor for `select` | `(select {from: (.db.block.scan "db/t" 100000000) p: px})` |
+| `.db.block.parted` | variadic | restricted | Partitioned block scan descriptor | `(.db.block.parted "db" 'trades 100000000)` |
+| `.db.block.convert` | variadic | restricted | Rewrite a raw or block table as a block table | `(.db.block.convert "raw/t" "blk/t" {block-bytes: 65536 codec: snappy} {immutable: true})` |
+| `.db.storage.info` | variadic | restricted | Per-column storage format and sizes | `(.db.storage.info "db/t")` |
+| `.db.storage.verify` | variadic | restricted | Decode and check every block | `(.db.storage.verify "db/t")` |
+| `.csv.block` | variadic | restricted | Stream a CSV file into a block table | `(.csv.block "t.csv" "db/t" {block-bytes: 65536 codec: snappy})` |
+| `.parquet.block` | variadic | restricted | Stream a Parquet file into a block table | `(.parquet.block "t.parquet" "db/t" {block-bytes: 65536 codec: snappy})` |
 
 ```lisp
 ; Save and reload a splayed table
