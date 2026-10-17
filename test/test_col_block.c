@@ -1,6 +1,7 @@
 /* Copyright (c) 2026 Anton Kundenko. MIT license; see LICENSE. */
 #define _POSIX_C_SOURCE 200809L
 #include "test.h"
+#include "golden_table.h"
 #include "store/col_block.h"
 #include "store/col.h"
 #include "core/crc32.h"
@@ -714,25 +715,45 @@ static test_result_t summary_and_verify(void) {
     PASS();
 }
 
-static test_result_t crc32_paths(void) {
-    static uint8_t data[70000];
-    uint32_t x = 2463534242u;
-    for (size_t i = 0; i < sizeof(data); i++) {
-        x ^= x << 13; x ^= x >> 17; x ^= x << 5;
-        data[i] = (uint8_t)x;
+/* The golden files decode column by column through the container reader
+ * alone: every value of every type, both codecs. See golden_table.h. */
+static test_result_t golden_columns(void) {
+    ray_t* expected = golden_table();
+    const char* dirs[] = {"test/data/col_block/none", "test/data/col_block/snappy"};
+    static uint8_t scratch[1 << 16];
+    test_result_t result = {TEST_PASS, NULL};
+    for (unsigned d = 0; d < 2 && result.status == TEST_PASS; d++) {
+        char sym[256];
+        snprintf(sym, sizeof(sym), "%s/.sym", dirs[d]);
+        ray_sym_domain_t* dom = ray_sym_domain_open(sym);
+        TEST_ASSERT_NOT_NULL(dom);
+        for (int64_t c = 0; c < ray_table_ncols(expected) && result.status == TEST_PASS; c++) {
+            ray_t* name = ray_sym_str(ray_table_col_name(expected, c));
+            char path[256];
+            snprintf(path, sizeof(path), "%s/%.*s", dirs[d], (int)ray_str_len(name), ray_str_ptr(name));
+            ray_col_block_file_t* f = NULL;
+            TEST_ASSERT_EQ_I(ray_col_block_file_open(path, &f), RAY_OK);
+            const ray_col_block_reader_t* r = ray_col_block_file_reader(f);
+            ray_t* got;
+            if (r->type == RAY_STR) {
+                size_t bytes = 0;
+                TEST_ASSERT_EQ_I(ray_col_block_payload_size(r, 0, r->rows, scratch, sizeof(scratch), &bytes), RAY_OK);
+                got = ray_col_block_materialize_str(r, 0, r->rows, bytes, scratch, sizeof(scratch));
+            } else
+                got = ray_col_block_materialize_dom(r, 0, r->rows, (size_t)1 << 20, scratch,
+                                                    sizeof(scratch), r->type == RAY_SYM ? dom : NULL);
+            result = golden_column_equal(got, ray_table_get_col_idx(expected, c));
+            if (got && !RAY_IS_ERR(got)) ray_release(got);
+            ray_col_block_file_close(&f);
+        }
+        ray_sym_domain_release(dom);
     }
-    TEST_ASSERT_EQ_I(ray_crc32(0, "123456789", 9), 0xCBF43926u);
-    for (size_t n = 0; n <= 400; n++)
-        for (size_t off = 0; off < 16; off += 5)
-            for (uint32_t seed = 0; seed < 3; seed++)
-                TEST_ASSERT_EQ_I(ray_crc32(seed * 0x9E3779B9u, data + off, n),
-                                 ray_crc32_portable(seed * 0x9E3779B9u, data + off, n));
-    const size_t big[] = {4096, 65536, 65537, 69999};
-    for (unsigned i = 0; i < 4; i++)
-        TEST_ASSERT_EQ_I(ray_crc32(0, data + 1, big[i]), ray_crc32_portable(0, data + 1, big[i]));
-    /* Chaining a split buffer equals one pass. */
-    uint32_t whole = ray_crc32(0, data, 10000);
-    TEST_ASSERT_EQ_I(ray_crc32(ray_crc32(0, data, 1234), data + 1234, 10000 - 1234), whole);
+    ray_release(expected);
+    if (result.status != TEST_PASS) return result;
+    /* A required feature bit this reader lacks: a newer file. */
+    ray_col_block_file_t* f = NULL;
+    TEST_ASSERT_EQ_I(ray_col_block_file_open("test/data/col_block/newer/l", &f), RAY_ERR_NYI);
+    TEST_ASSERT_TRUE(f == NULL);
     PASS();
 }
 
@@ -785,7 +806,7 @@ static test_result_t newer_features(void) {
 
 const test_entry_t col_block_entries[] = {
     {"col_block/newer_features", newer_features, setup, teardown},
-    {"col_block/crc32_paths", crc32_paths, setup, teardown},
+    {"col_block/golden_columns", golden_columns, setup, teardown},
     {"col_block/summary_and_verify", summary_and_verify, setup, teardown},
     {"col_block/strings", strings, setup, teardown},
     {"col_block/symbols", symbols, setup, teardown},

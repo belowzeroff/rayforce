@@ -209,31 +209,36 @@ A bit-packing codec failed its gate on realistic data (size 0.62, timestamps
 
 ## Proposed PR split
 
-Each PR builds and passes the full suite on its own; later PRs only add.
+Five code PRs and one for benchmarks, each a branch on the previous one that
+builds and passes the full suite on its own; later PRs only add.
 
 1. **Snappy**: extract the Parquet decoder into `src/core/snappy.c`, add the
    encoder and fast loop; `test_snappy`, `fuzz_snappy`, reference oracle
-   script. No format or behaviour change.
+   script. No format or behaviour change. This RFC goes with it.
 2. **CRC-32 fold** (independent of 1): PCLMULQDQ folding behind
    `__builtin_cpu_supports("pclmul")`/`sse4.1`, table version as fallback and
-   as `ray_crc32_portable`; cross-test against it. Touches every CRC user, so
-   it is reviewed on its own.
-3. **Container**: `col_block*.c` reader/writer including STR framing and
-   SYM dictionary fields, `nyi` for newer files, raw loader `version` error;
-   `test_col_block`, `fuzz_col_block` with seeds, nightly entries. Commits
-   small golden major-2 files (each fixed-width type, STR, SYM, a zoned block,
-   a file with a feature bit) with a test that they read back, that a raw
-   major-0 fixture still loads, and that the feature-bit file is `nyi`.
-4. **Publication and leases**: `splay.c` leases and GC, `block_store.c`
-   atomic streaming writer, `.publish.lock`; crash, concurrent-reader and
-   scan-during-write tests. The PR states its one raw change: staged
-   publications take `.publish.lock`.
-5. **Scan and select**: `block_scan.c`, `block_query.c`, scan builtins,
-   partitions, zone maps, budgets, parallel decode and aggregates.
-6. **Writers and conversion**: CSV/Parquet block sinks, convert, `.db.block.set`,
-   `.db.splayed.set/get` integration.
-7. **Operations**: info/verify, user docs, benchmarks and results.
+   as `ray_crc32_portable`; cross-test `parquet/crc32_paths`. Touches every
+   CRC user, so it is reviewed on its own.
+3. **Container**: `col_block*.c` reader/writer including STR framing and SYM
+   dictionary fields, optional and required features, `nyi` for newer files,
+   the raw loader's `version` error; `test_col_block` with the golden files
+   of `test/data/col_block` read column by column, `fuzz_col_block` with
+   seeds, nightly entries.
+4. **Publication, writer and scan**: `.publish.lock` and leases in
+   `splay.c`, `block_store.c` (atomic streaming writer, conversion),
+   `block_scan.c` and `block_sym.c`; `test_block_scan` with crash,
+   concurrent-reader and scan-during-write tests. The PR states its one raw
+   change: staged publications take `.publish.lock`; and that a failed first
+   write no longer follows links (also proposed to `dev` on its own).
+5. **Queries, builtins and operations**: `block_query.c`, `block_source.c`,
+   the `.db.block.*` and `.db.storage.*` builtins, `.db.splayed.set/get`
+   integration, CSV and Parquet block sinks, user documentation;
+   `test_block_query`, `test_block_source`. Commits go in order: query engine,
+   builtins, importers, documentation.
+6. **Benchmarks**: `bench/block_hdb` scripts and results; no code.
 
-The test files (`test_block_scan.c`, `test_block_source.c`) are split along
-the same lines when the PRs are cut. Cutting starts after the branch is
-rebased on current `dev` and gate 6 is repeated there.
+The RFC first proposed seven code PRs. Scan builtins, conversion and
+storage reports share `block_source.c` and `system.c` and are only testable
+from Rayfall together with a writer builtin, so splitting them would mean
+artificial intermediate states; they form PR 5. Cutting starts after the
+branch is rebased on current `dev` and gate 6 passes there in a quiet window.

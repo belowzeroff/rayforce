@@ -3630,7 +3630,32 @@ static test_result_t test_pq_worker_messages(void) {
     TEST_ASSERT_EQ_I(bad, 0);
     PASS();
 }
+/* The folded CRC-32 equals the table version at every length, alignment and
+ * seed, and chains across split buffers. */
+static test_result_t test_crc32_paths(void) {
+    static uint8_t data[70000];
+    uint32_t x = 2463534242u;
+    for (size_t i = 0; i < sizeof(data); i++) {
+        x ^= x << 13; x ^= x >> 17; x ^= x << 5;
+        data[i] = (uint8_t)x;
+    }
+    TEST_ASSERT_EQ_I(ray_crc32(0, "123456789", 9), 0xCBF43926u);
+    for (size_t n = 0; n <= 400; n++)
+        for (size_t off = 0; off < 16; off += 5)
+            for (uint32_t seed = 0; seed < 3; seed++)
+                TEST_ASSERT_EQ_I(ray_crc32(seed * 0x9E3779B9u, data + off, n),
+                                 ray_crc32_portable(seed * 0x9E3779B9u, data + off, n));
+    const size_t big[] = {4096, 65536, 65537, 69999};
+    for (unsigned i = 0; i < 4; i++)
+        TEST_ASSERT_EQ_I(ray_crc32(0, data + 1, big[i]), ray_crc32_portable(0, data + 1, big[i]));
+    /* Chaining a split buffer equals one pass. */
+    uint32_t whole = ray_crc32(0, data, 10000);
+    TEST_ASSERT_EQ_I(ray_crc32(ray_crc32(0, data, 1234), data + 1234, 10000 - 1234), whole);
+    PASS();
+}
+
 const test_entry_t parquet_entries[] = {
+    {"parquet/crc32_paths",test_crc32_paths,NULL,NULL},
     {"parquet/sk4_grouped_message",test_pq_sk4_grouped_message,pq_setup,pq_teardown},
     {"parquet/worker_messages",test_pq_worker_messages,pq_lang_setup,pq_lang_teardown},
     {"parquet/sk4_unsure_small_text",test_pq_sk4_unsure_small_text,pq_setup,pq_teardown},
