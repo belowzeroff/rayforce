@@ -1793,13 +1793,13 @@ static test_result_t query_admission(void) {
     pred.opcode = OP_ADD;
     TEST_ASSERT_EQ_I(ray_block_query_open(root, output, 1, &pred, 1, &read, &query), RAY_ERR_NYI);
     pred.opcode = OP_EQ; pred.column = "y";
-    TEST_ASSERT_EQ_I(ray_block_query_open(root, output, 1, &pred, 1, &read, &query), RAY_ERR_TYPE);
+    TEST_ASSERT_EQ_I(ray_block_query_open(root, output, 1, &pred, 1, &read, &query), RAY_ERR_NYI);
     pred.column = "missing";
     TEST_ASSERT_EQ_I(ray_block_query_open(root, output, 1, &pred, 1, &read, &query), RAY_ERR_SCHEMA);
     pred.column = "../x";
     TEST_ASSERT_EQ_I(ray_block_query_open(root, output, 1, &pred, 1, &read, &query), RAY_ERR_DOMAIN);
     pred.column = "x"; atom->type = -RAY_F64;
-    TEST_ASSERT_EQ_I(ray_block_query_open(root, output, 1, &pred, 1, &read, &query), RAY_ERR_TYPE);
+    TEST_ASSERT_EQ_I(ray_block_query_open(root, output, 1, &pred, 1, &read, &query), RAY_ERR_NYI);
     atom->type = -RAY_I64;
     TEST_ASSERT_TRUE(query == NULL); TEST_ASSERT_EQ_I(mapped(), baseline);
     TEST_ASSERT_EQ_I(ray_block_query_open(root, output, 1, &pred, 1, &read, &query), RAY_OK);

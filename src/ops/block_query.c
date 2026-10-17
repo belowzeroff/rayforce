@@ -110,7 +110,8 @@ ray_err_t ray_block_query_open_source(const char* root, const ray_block_scan_sou
     for (size_t i = 0; i < n_predicates; i++) {
         if (!query_name_safe(predicates[i].column)) return RAY_ERR_DOMAIN;
         if (!query_opcode_admitted(predicates[i].opcode)) return RAY_ERR_NYI;
-        if (!query_atom_admitted(predicates[i].value)) return RAY_ERR_TYPE;
+        /* Unsupported, not wrong: native select may accept these. */
+        if (!query_atom_admitted(predicates[i].value)) return RAY_ERR_NYI;
         if (!query_pair_admitted(predicates[i].opcode, predicates[i].value)) return RAY_ERR_NYI;
     }
     ray_block_query_t* q = calloc(1, sizeof(*q));
@@ -148,7 +149,8 @@ ray_err_t ray_block_query_open_source(const char* root, const ray_block_scan_sou
     for (size_t i = 0; !err && i < n_predicates; i++) {
         ray_t* col = ray_table_get_col(schema,
             ray_sym_intern(q->predicates[i].column, strlen(q->predicates[i].column)));
-        if (!col || col->type != -q->predicates[i].value->type) err = RAY_ERR_TYPE;
+        if (!col) err = RAY_ERR_SCHEMA;
+        else if (col->type != -q->predicates[i].value->type) err = RAY_ERR_NYI;
     }
     for (size_t i = 0; !err && i < n_predicates; i++) {
         uint64_t g = ray_block_scan_zone_rows(q->scan, q->predicates[i].scan_index);
@@ -552,7 +554,8 @@ ray_err_t ray_block_query_open_parted(const char* root, const char* table, bool 
     for (size_t i = 0; i < n_predicates; i++) {
         if (!query_name_safe(predicates[i].column)) return RAY_ERR_DOMAIN;
         if (!query_opcode_admitted(predicates[i].opcode)) return RAY_ERR_NYI;
-        if (!query_atom_admitted(predicates[i].value)) return RAY_ERR_TYPE;
+        /* Unsupported, not wrong: native select may accept these. */
+        if (!query_atom_admitted(predicates[i].value)) return RAY_ERR_NYI;
         if (!query_pair_admitted(predicates[i].opcode, predicates[i].value)) return RAY_ERR_NYI;
     }
     block_parted_t* p = calloc(1, sizeof(*p));
@@ -611,7 +614,7 @@ ray_err_t ray_block_query_open_parted(const char* root, const char* table, bool 
             p->n_predicates++;
             continue;
         }
-        if (v->type != -p->key_type) { err = RAY_ERR_TYPE; break; }
+        if (v->type != -p->key_type) { err = RAY_ERR_NYI; break; }
         if (RAY_ATOM_IS_NULL(v)) { err = RAY_ERR_NYI; break; }
         p->keys[p->n_keys++] = (key_predicate_t){predicates[i].opcode, query_atom_value(v)};
     }
