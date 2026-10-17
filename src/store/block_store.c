@@ -292,7 +292,12 @@ ray_err_t ray_block_table_append(ray_block_table_writer_t* w, ray_t* chunk) {
         store_column_t* c = &w->columns[i];
         ray_t* col = ray_table_get_col_idx(chunk, i);
         if (c->type == RAY_STR) err = store_strings(c, col, w->options.block_bytes);
-        else if (c->type == RAY_SYM) err = store_symbols_chunk(w, c, col, w->options.block_bytes);
+        else if (c->type == RAY_SYM) {
+            /* The cache keys on a domain pointer: a domain freed after the
+             * last chunk can come back at the same address. */
+            c->last_source = -1;
+            err = store_symbols_chunk(w, c, col, w->options.block_bytes);
+        }
         else err = store_fixed(c, ray_data(col), rows, w->options.block_bytes);
     }
     if (err) { w->failed = true; return err; }

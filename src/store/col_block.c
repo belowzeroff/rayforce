@@ -592,7 +592,7 @@ static ray_err_t append_block(ray_col_block_writer_t* w, const uint8_t* p,
         uint8_t* compressed = (uint8_t*)(workspace + 1);
         size_t n = ray_snappy_compress(p, bytes, compressed,
             ray_snappy_compress_bound(w->block_bytes), workspace);
-        if (!n) return w->error = RAY_ERR_CORRUPT;
+        if (!n) return w->error = RAY_ERR_DOMAIN;   /* bound or workspace misuse */
         if (n < bytes) { stored = n; payload = compressed; codec = 1; }
     }
     /* Reserve space for this entry and footer before advancing the file. */

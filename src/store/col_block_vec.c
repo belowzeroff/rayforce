@@ -13,7 +13,7 @@ static ray_t* block_error(ray_err_t err) {
     case RAY_ERR_IO: return ray_error("io", "cannot map block column file");
     case RAY_ERR_VERSION: return ray_error("version", "expected major-2 block column");
     case RAY_ERR_OOM: return ray_error("oom", "cannot allocate block column workspace");
-    case RAY_ERR_NYI: return ray_error("nyi", "block columns require a little-endian host");
+    case RAY_ERR_NYI: return ray_error("nyi", "block column needs a newer reader or a little-endian host");
     default: return ray_error("corrupt", "invalid column block payload");
     }
 }

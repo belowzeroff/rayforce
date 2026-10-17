@@ -124,7 +124,10 @@ ray_err_t ray_block_query_open_source(const char* root, const ray_block_scan_sou
         memcpy(p->column, predicates[i].column, column_len + 1);
         p->opcode = predicates[i].opcode;
         p->value = ray_i64(0);
-        if (!p->value || RAY_IS_ERR(p->value)) { err = RAY_ERR_OOM; break; }
+        if (!p->value || RAY_IS_ERR(p->value)) {
+            if (p->value) ray_error_free(p->value);
+            p->value = NULL; err = RAY_ERR_OOM; break;
+        }
         /* Admitted atoms contain only inline scalar data, never pointers. */
         p->value->type = predicates[i].value->type;
         memcpy(&p->value->i64, &predicates[i].value->i64, sizeof(int64_t));
@@ -606,7 +609,10 @@ ray_err_t ray_block_query_open_parted(const char* root, const char* table, bool 
             memcpy(d->column, predicates[i].column, strlen(predicates[i].column) + 1);
             d->opcode = predicates[i].opcode;
             d->value = ray_i64(0);
-            if (!d->value || RAY_IS_ERR(d->value)) { d->value = NULL; err = RAY_ERR_OOM; break; }
+            if (!d->value || RAY_IS_ERR(d->value)) {
+                if (d->value) ray_error_free(d->value);
+                d->value = NULL; err = RAY_ERR_OOM; break;
+            }
             /* Admitted atoms contain only inline scalar data, never pointers. */
             d->value->type = v->type;
             memcpy(&d->value->i64, &v->i64, sizeof(int64_t));
@@ -739,6 +745,14 @@ static ray_t* parted_next(ray_block_query_t* q) {
             int64_t partition = p->next++;
             ray_err_t err = parted_open_partition(p, partition, p->data_names, p->n_data,
                                                   true, &p->current);
+            /* The first partition admitted these predicates: if this one
+             * opens without them, its filter columns have another type. */
+            if (err == RAY_ERR_NYI && p->n_predicates) {
+                ray_block_query_t* probe = NULL;
+                if (!parted_open_partition(p, partition, p->data_names, p->n_data, false, &probe))
+                    err = RAY_ERR_SCHEMA;
+                ray_block_query_close(&probe);
+            }
             if (!err) err = parted_check_schema(p, p->current);
             if (err) {
                 ray_block_query_close(&p->current);

@@ -86,12 +86,12 @@ Block tables are read with `select` over a scan descriptor:
 
 The supported `select` is deliberately narrow; anything else fails with `nyi` instead of materializing the source:
 
-- Outputs are either bare columns (with aliases) or only global aggregates: `count` of any column, `sum` and `avg` of integers and `F64`, `min` and `max` of integers, `F64`, booleans and temporals, with the native engine's null and NaN semantics.
+- Outputs are either bare columns (with aliases) or only global aggregates: `count` of any column, `sum` and `avg` of integers and `F64`, `min` and `max` of integers, `F64`, booleans and temporals, with the native engine's null and NaN semantics. A query with `avg` reads at most 2^31−1 rows (nulls included) and fails with `limit` beyond that; split it by a partition or time predicate.
 - `where` is a conjunction (`and`) of `==`, `!=`, `<`, `<=`, `>`, `>=` between a column and a literal of the same integer, boolean or temporal type, or `==` and `!=` between a `SYM` column and a symbol literal (`'AAPL`). Symbol filters read every block; only integer and temporal columns have zone maps.
 - No `by`, `take`, `asc`, `desc`, string or float predicates, or ordering of symbols; they fail with `nyi` rather than materializing the source.
 - As with `.db.parted.get` selects, a column missing from some partitions of a partitioned table fails (`schema`) instead of reading as nulls.
 
-A partitioned scan adds the virtual key column `date` (for `YYYY.MM.DD` partitions) or `part`. It can be projected, aggregated and compared; comparisons on it skip partitions before their files are opened. Partitions are listed once and read one at a time, each under its own lease, so there is no snapshot across partitions. The first partition defines the column schema, as for `.db.parted.get`. Symbols from different partitions are returned in the runtime symbol table.
+A partitioned scan adds the virtual key column `date` (for `YYYY.MM.DD` partitions) or `part`. It can be projected, aggregated and compared; comparisons on it skip partitions before their files are opened. Partitions are listed once and read one at a time, each under its own lease, so there is no snapshot across partitions. The first partition defines the column schema, as for `.db.parted.get`, but later partitions are checked more strictly: their columns must be the first partition's, in its order (a partition may end early), and every column read must have the same type; anything else, including a filter column of another type, fails with `schema`. Symbols from different partitions are returned in the runtime symbol table.
 
 ```lisp
 (set trades (.db.block.parted "/tmp/rayforce-block-doc" 'trades 100000000))

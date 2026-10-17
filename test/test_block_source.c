@@ -912,6 +912,9 @@ static test_result_t parted_rejections(void) {
     TEST_ASSERT_TRUE(RAY_IS_ERR(r)); TEST_ASSERT_STR_EQ(ray_err_code(r), "schema"); ray_release(r);
     r = parted_select(source, "where: (< date 2024.01.03) i: id v: x");
     TEST_ASSERT_FALSE(RAY_IS_ERR(r)); TEST_ASSERT_EQ_I(ray_table_nrows(r), 80); ray_release(r);
+    /* The same for a filter column only: partitions disagree, not nyi. */
+    r = parted_select(source, "where: (> x 1) i: id");
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r)); TEST_ASSERT_STR_EQ(ray_err_code(r), "schema"); ray_release(r);
     const char* invalid[] = {
         "d: date",                                  /* no stored column */
         "where: (== date 1) i: id",                 /* key literal type */

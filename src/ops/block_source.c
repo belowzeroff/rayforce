@@ -99,6 +99,13 @@ static const char* table_name(ray_t* s) {
     return p && *p != '.' && !strchr(p, '/') && !strchr(p, '\\') && strlen(p) <= 255 ? p : NULL;
 }
 
+/* Error objects are not reference counted: ray_release ignores them. */
+static void drop(ray_t* v) {
+    if (!v) return;
+    if (RAY_IS_ERR(v)) ray_error_free(v);
+    else ray_release(v);
+}
+
 static ray_t* descriptor(const char* const* fields, ray_t** args, int64_t n) {
     int64_t names[4];
     for (int64_t i = 0; i < n; i++) {
@@ -108,7 +115,7 @@ static ray_t* descriptor(const char* const* fields, ray_t** args, int64_t n) {
     ray_t* keys = ray_vec_from_raw(RAY_SYM, names, n);
     ray_t* vals = ray_list_new(n);
     if (!keys || RAY_IS_ERR(keys) || !vals || RAY_IS_ERR(vals)) {
-        ray_release(keys); ray_release(vals); return ray_error("oom", NULL);
+        drop(keys); drop(vals); return ray_error("oom", NULL);
     }
     for (int64_t i = 0; i < n; i++) { ray_retain(args[i]); ((ray_t**)ray_data(vals))[i] = args[i]; }
     vals->len = n;
@@ -389,9 +396,7 @@ static ray_t* convert_settings(ray_t* t, const ray_block_store_options_t* o, int
     ray_t* codec = ray_sym_vec_new(RAY_SYM_W64, rows);
     ray_t* bytes = ray_vec_new(RAY_I64, rows);
     if (!t || RAY_IS_ERR(t) || !codec || RAY_IS_ERR(codec) || !bytes || RAY_IS_ERR(bytes)) {
-        if (t && !RAY_IS_ERR(t)) ray_release(t);
-        if (codec && !RAY_IS_ERR(codec)) ray_release(codec);
-        if (bytes && !RAY_IS_ERR(bytes)) ray_release(bytes);
+        drop(t); drop(codec); drop(bytes);
         return ray_error("oom", NULL);
     }
     int64_t name = o->codec ? ray_sym_intern("snappy", 6) : ray_sym_intern("none", 4);
@@ -456,7 +461,11 @@ static ray_t* convert_parted(ray_t** args, int64_t n) {
         if (np && !RAY_IS_ERR(np)) parts = np;
         ray_t* nr = np && !RAY_IS_ERR(np) ? ray_vec_append_raw(rows, &value, 1) : NULL;
         if (nr && !RAY_IS_ERR(nr)) rows = nr;
-        else result = ray_error("oom", NULL);
+        else {
+            if (RAY_IS_ERR(np)) drop(np);
+            drop(nr);
+            result = ray_error("oom", NULL);
+        }
     }
     ray_parted_dirs_free(dirs, count);
     if (result) { ray_release(parts); ray_release(rows); return result; }
@@ -978,8 +987,12 @@ ray_t* ray_block_materialize(const char* dir, const ray_block_scan_source_t* sou
     }
     if (!result) {
         result = ray_table_new((int64_t)count);
-        for (size_t c = 0; result && !RAY_IS_ERR(result) && c < count; c++)
+        for (size_t c = 0; result && !RAY_IS_ERR(result) && c < count; c++) {
+            /* Every row in file order: a raw column stays sorted. Block
+             * columns never carry the attribute. */
+            vectors[c]->attrs |= ray_block_scan_column_attrs(scan, c) & RAY_ATTR_SORTED;
             result = ray_table_add_col(result, ray_table_col_name(schema, (int64_t)c), vectors[c]);
+        }
         if (!result) result = ray_error("oom", NULL);
     }
     for (size_t c = 0; vectors && c < count; c++) ray_release(vectors[c]);
